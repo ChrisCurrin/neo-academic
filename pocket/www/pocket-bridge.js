@@ -174,7 +174,7 @@
         for (const name of await listDir('')) {
           if (!String(name).startsWith('book-')) continue;
           const m = await readJSONFile(p(name, 'book.json'), null);
-          if (m && m.id) out.push({ id: m.id, title: m.title || 'Untitled', author: m.author || '', modified: m.modified || '' });
+          if (m && m.id) out.push({ id: m.id, title: m.title || 'Untitled', author: m.author || '', modified: m.modified || '', kind: m.kind || '' });
         }
       } catch { /* an empty list is honest enough */ }
       return out;
@@ -222,7 +222,9 @@
     },
 
     /* ---------- chapters ---------- */
-    // {chId: mtime}: lets app.js re-read only what changed on disk
+    // {chId: mtime and size}: lets app.js re-read only what changed on disk
+    // (the size too: Syncthing and iCloud keep the other device's mtime, and
+    // two saves in the same second must not look alike)
     chapterStamps: async (bookId) => {
       const out = {};
       try {
@@ -230,7 +232,7 @@
         const ls = await FS().readdir(at(p(bookId, 'chapters')));
         for (const f of ls.files || []) {
           const name = (f && f.name) || String(f);
-          if (name.endsWith('.html')) out[name.slice(0, -5)] = (f && f.mtime) || 0;
+          if (name.endsWith('.html')) out[name.slice(0, -5)] = ((f && f.mtime) || 0) + ':' + ((f && f.size) || 0);
         }
       } catch { /* no chapters yet */ }
       return out;
@@ -374,10 +376,34 @@
     });
   }
 
+  // Android: whatever shows around the page (the camera cutout band on a
+  // Samsung, the status bar when a swipe peeks it) takes the page's own
+  // color — night, paper or light — instead of the phone's white
+  if (!isIOS()) {
+    let bars = null;
+    try { bars = window.Capacitor.registerPlugin('NeoBars'); } catch { /* older shell */ }
+    const tellBars = () => {
+      if (!bars) return;
+      const bg = (el) => getComputedStyle(el).backgroundColor;
+      let c = bg(document.body);
+      if (!c || c === 'transparent' || /rgba\(.*,\s*0\)$/.test(c)) c = bg(document.documentElement);
+      bars.set({ color: c }).catch(() => { /* an older APK without the plugin */ });
+    };
+    document.addEventListener('DOMContentLoaded', () => {
+      tellBars();
+      // after a theme change, once any color transition has settled
+      new MutationObserver(() => { tellBars(); setTimeout(tellBars, 450); })
+        .observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    });
+  }
+
   // The keyboard's height becomes a CSS variable, and Pocket's own bar and
   // panes sit above it (pocket.css). iOS is told nothing about resizing;
   // its own attempts left a black band behind when the keyboard went away.
+  // Android shrinks the window for its keyboard by itself, so there the
+  // variable stays 0: lifting the page again left a keyboard-sized gap (#142).
   document.addEventListener('DOMContentLoaded', () => {
+    if (!isIOS()) return;
     try {
       const K = window.Capacitor.Plugins.Keyboard;
       if (!K) return;

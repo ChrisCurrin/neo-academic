@@ -39,7 +39,7 @@
 #nav-pane.open { transform: translateX(0); }
 
 /* desktop-only powers stay out of sight */
-#import-btn, #zoom-control, #dragstrip, #side-pin { display: none !important; }
+#import-btn, #zoom-control, #dragstrip, #side-pin, #nav-pin { display: none !important; }
 :root { --kb: 0px; } /* the on-screen keyboard's height, from pocket-bridge.js */
 #nav-pane, #side-pane { bottom: calc(52px + var(--kb)); }
 
@@ -68,9 +68,43 @@ body { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none
 #counters { display: none !important; }
 #bottombar { display: flex; align-items: center; }
 #bottombar button, #tabs .tab { line-height: 1; }
-#back-to-shelf { font-size: 15px; padding: 0 10px; }
+#back-to-shelf { font-size: 15px; padding: 0 10px; white-space: nowrap; }
+/* A phone is narrower than the four tabs: they scroll sideways in their own
+   strip, so ☰, Shelf and ⋯ (Format and the Night/Paper page) stay on screen.
+   Before, the tabs pushed ⋯ off the right edge on a phone. */
+#tabs { min-width: 0; overflow-x: auto; justify-content: safe center; scrollbar-width: none; }
+#tabs::-webkit-scrollbar { display: none; }
+#tabs .tab { flex: none; }
+@media (max-width: 600px) {
+  #bottombar { gap: 6px; padding: 0 6px; }
+  .tab { padding: 12px 10px; }
+  .tab.darlings { margin-left: 6px; }
+  /* and the ⋯ sheet's rows wrap rather than run off the edge */
+  .pm-label { flex-basis: 100px; }
+  .pm-seg { flex-wrap: wrap; }
+}
 
 /* a long shelf on a tablet: each cover paints on its own, and the shadows
    are lighter work for the compositor */
 .book { contain: layout paint; box-shadow: 2px 3px 6px rgba(0,0,0,0.4); }
 .book:hover, .new-book:hover { transform: none; }
+
+/* Light: the ☰ and ⋯ buttons and the ⋯ sheet in the light room */
+body.light #pocket-chapters, body.light #pocket-more { color: #6a665e; }
+body.light #pocket-menu { background: rgba(60, 55, 45, 0.28); }
+body.light #pocket-menu-sheet { background: #fbfaf8; border-color: #dcd7ce; color: #2b2926; }
+body.light .pm-row { border-bottom-color: #ebe7e0; }
+body.light .pm-label { color: #6a665e; }
+body.light .pm-seg button, body.light .pm-actions button { background: #fff; border-color: #d6d1c7; color: #2b2926; }
+body.light .pm-seg button.on { background: #f3ead6; border-color: #b89a5c; color: #5c4418; }
+body.light .book { box-shadow: 2px 3px 6px rgba(0,0,0,0.2); }
+
+/* the + between the Chapters pane's boxes: no pointer to wake it, so it
+   stays faintly there, and small (not a 40px tap target) */
+.nav-gap .ng-plus { opacity: 0.45; pointer-events: auto; min-height: 0; width: 26px; height: 26px; margin: -13px 0 0 -13px; line-height: 23px; }
+.nav-gap::before { display: none; }
+
+/* The Chapters pane is for hopping on Pocket: a chapter's note shows but
+   isn't written here (the Outline is where it's written), and an empty one
+   takes no room */
+.nav-note.nav-note-ro:empty { display: none; }

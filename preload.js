@@ -38,7 +38,6 @@ contextBridge.exposeInMainWorld('neo', {
   fullscreenEscape: () => ipcRenderer.invoke('fullscreen:escape'),
   fullscreenToggle: () => ipcRenderer.invoke('fullscreen:toggle'),
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
-  downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
   spellCheckWords: (words) => ipcRenderer.invoke('spell:check', words),
   spellSuggest: (word) => ipcRenderer.invoke('spell:suggest', word),
@@ -49,6 +48,8 @@ contextBridge.exposeInMainWorld('neo', {
 
   poetryState: (on) => ipcRenderer.send('poetry:state', on),
   typewriterState: (st) => ipcRenderer.send('typewriter:state', st),
+  vimState: (on) => ipcRenderer.send('vim:state', on),
+  uiZoomState: (z) => ipcRenderer.send('uizoom:state', z),
   // interface language, fetched once before the page's scripts run
   i18n: ipcRenderer.sendSync('i18n:get'),
   reloadForLanguage: () => ipcRenderer.invoke('i18n:reload'),

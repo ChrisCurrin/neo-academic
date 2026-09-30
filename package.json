@@ -1,12 +1,14 @@
 {
   "name": "neo",
   "productName": "NEO",
-  "version": "0.9.1",
+  "version": "1.2.2",
   "description": "A word processor for authors. Distraction-free by default.",
   "homepage": "https://github.com/hughhowey/neo",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test:spellcheck": "node --test scripts/spellcheck.test.js",
+    "test:dashes": "node --test scripts/dashes.test.js",
     "package": "electron-builder --mac",
     "package:win": "electron-builder --win",
     "package:linux": "electron-builder --linux",
@@ -84,6 +86,24 @@
       "oneClick": true,
       "deleteAppDataOnUninstall": false
     },
+    "asarUnpack": [
+      "node_modules/dictionary-ro/**",
+      "node_modules/dictionary-pt/**"
+    ],
+    "extraResources": [
+      {
+        "from": "licenses/dictionary-ro",
+        "to": "app.asar.unpacked/node_modules/dictionary-ro"
+      },
+      {
+        "from": "licenses/dictionary-pt",
+        "to": "app.asar.unpacked/node_modules/dictionary-pt"
+      },
+      {
+        "from": "licenses/hunspell",
+        "to": "licenses/hunspell"
+      }
+    ],
     "files": [
       "**/*",
       "!pocket/**",
@@ -92,7 +112,10 @@
       "!*.md",
       "!.github/**",
       "!scripts/**",
-      "!locales/_template.json"
+      "!licenses/**",
+      "!locales/_template.json",
+      "!node_modules/koffi/build/koffi/{freebsd,linux,musl,openbsd,win32}_*/**",
+      "!node_modules/koffi/{src,vendor,doc}/**"
     ]
   },
   "author": "Hugh Howey",
@@ -102,6 +125,7 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
+    "@farscrl/hunspell-wasm": "1.0.1",
     "dictionary-de": "^3.0.0",
     "dictionary-en-au": "^3.0.0",
     "dictionary-en-ca": "^3.0.0",
@@ -111,9 +135,12 @@
     "dictionary-fr": "^3.0.0",
     "dictionary-nl": "^2.0.0",
     "dictionary-pl": "^2.0.0",
+    "dictionary-pt": "4.0.0",
+    "dictionary-ro": "3.0.0",
+    "dictionary-ru": "^3.0.0",
     "electron-updater": "^6.3.9",
     "jszip": "^3.10.1",
-    "nspell": "^2.1.5"
+    "koffi": "2.16.3"
   },
   "allowScripts": {
     "electron@33.4.11": true

@@ -73,6 +73,10 @@
     <!-- Left hover zone: chapter navigation -->
     <div id="nav-hotzone"></div>
     <nav id="nav-pane">
+      <div id="nav-head">
+        <span>Chapters</span>
+        <button id="nav-pin" title="Keep this pane open" aria-label="Keep this pane open" aria-pressed="false">&#9737;</button>
+      </div>
       <div id="nav-list"></div>
       <button id="nav-add" title="Add a chapter at the end">+ Chapter</button>
     </nav>
@@ -212,7 +216,7 @@
           choices.map((f) => `<button class="${fonts.body === f ? 'on' : ''}" data-msg='${JSON.stringify({ type: 'bodyFont', value: f })}' style="font-family:${f}">${f}</button>`).join('') + '</span></div>' +
         seg('Text size', [[-1, 'Smaller'], [0, 'Reset'], [1, 'Larger']], null, (v) => ({ type: 'fontSize', value: v })) +
         seg('Drop cap', [['literary', 'Literary'], ['fantasy', 'Fantasy'], ['scifi', 'Sci-Fi'], ['none', 'Off']], fonts.dropcap || 'literary', (v) => ({ type: 'dropCap', value: v })) +
-        seg('Page', [['night', 'Night'], ['paper', 'Paper']], lib.pageTheme || 'night', (v) => ({ type: 'pageTheme', value: v })) +
+        seg('Page', [['night', 'Night'], ['paper', 'Paper'], ['light', 'Light']], lib.pageTheme || 'night', (v) => ({ type: 'pageTheme', value: v })) +
         seg('Focus mode', [['off', 'Off'], ['paragraph', 'Paragraph'], ['sentence', 'Sentence']], focusNow, (v) => ({ type: 'focus', value: v })) +
         tick('Typewriter scrolling', st.typewriter, { type: 'typewriter' }) +
         tick('Poetry paragraph  ⇧Enter', st.poetry, { type: 'poetry' }) +

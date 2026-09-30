@@ -51,6 +51,7 @@ function collect() {
     if (/\sdata-i18n-title\b/.test(attrs) && attr('title')) add(decodeHtml(attr('title')), 'index.html');
     if (/\sdata-i18n-placeholder\b/.test(attrs) && attr('placeholder')) add(decodeHtml(attr('placeholder')), 'index.html');
     if (/\sdata-i18n-ph\b/.test(attrs) && attr('data-ph')) add(decodeHtml(attr('data-ph')), 'index.html');
+    if (attr('data-i18n-label')) add(decodeHtml(attr('data-i18n-label')), 'index.html');
   }
   return keys;
 }
