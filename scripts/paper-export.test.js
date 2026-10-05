@@ -167,3 +167,78 @@ test('figure layout: placement, both columns, wrapped text and panels, as LaTeX 
   const doc = X.docx(m).find((f) => f.path === 'word/document.xml').content;
   assert.match(doc, /Figure 4\. <\/w:t><\/w:r><w:bookmarkEnd w:id="\d+"\/><w:r><w:t xml:space="preserve">Both<\/w:t><\/w:r><w:r><w:t xml:space="preserve"> <\/w:t><\/w:r><w:r><w:rPr><w:b\/><\/w:rPr><w:t xml:space="preserve">\(a\) <\/w:t>/);
 });
+
+// every XML part well-formed, by xmllint (macOS and most Linux have it)
+const { execFileSync } = require('node:child_process');
+const xmllint = (() => { try { execFileSync('xmllint', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+function wellFormed(entries) {
+  if (!xmllint) return;
+  for (const e of entries) {
+    if (e.base64 || !/\.(xml|rels|xhtml|opf)$/.test(e.path)) continue;
+    try { execFileSync('xmllint', ['--noout', '-'], { input: e.content, stdio: ['pipe', 'ignore', 'pipe'] }); }
+    catch (err) { assert.fail(`${e.path} is not well-formed XML: ${String(err.stderr)}`); }
+  }
+}
+
+test('Word: maths as Word equations (OMML) when MathML is there, and every part well-formed', () => {
+  const m = model();
+  m.blocks[1].runs.push({ math: 'x^2', mml: '<math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>' });
+  m.blocks[6].mml = '<math display="block"><mi>a</mi><mo>=</mo><mi>b</mi></math>';
+  const files = X.docx(m);
+  const doc = files.find((f) => f.path === 'word/document.xml').content;
+  assert.match(doc, /xmlns:m="http:\/\/schemas\.openxmlformats\.org\/officeDocument\/2006\/math"/);
+  assert.match(doc, /<m:oMath><m:sSup><m:e><m:r><m:t xml:space="preserve">x<\/m:t><\/m:r><\/m:e><m:sup>/);
+  assert.match(doc, /<w:bookmarkStart w:id="\d+" w:name="_eq_ef56"\/><m:oMathPara><m:oMathParaPr><m:jc m:val="center"\/><\/m:oMathParaPr><m:oMath>.*<\/m:oMath><\/m:oMathPara><w:bookmarkEnd w:id="\d+"\/><\/w:p><\/w:tc><w:tc>.*\(1\)<\/w:t>/, 'a display equation, numbered on the right');
+  wellFormed(files);
+});
+
+test('Word follows the journal: its page, two columns after the front matter, its words and numbers', () => {
+  const m = { ...model(), journal: require('../paper/journals.js').get('ieee') };
+  const files = X.docx(m);
+  const doc = files.find((f) => f.path === 'word/document.xml').content;
+  assert.match(doc, /<w:sectPr><w:type w:val="continuous"\/><w:pgSz w:w="12240" w:h="15840"\/><w:pgMar w:top="1080" w:right="900" w:bottom="1080" w:left="900"[^>]*\/><w:cols w:num="1"/, 'the front matter in one column');
+  assert.match(doc, /<w:cols w:num="2" w:space="288"\/><\/w:sectPr><\/w:body>/, 'the paper in two');
+  assert.match(doc, /<w:t xml:space="preserve">I\.<\/w:t><\/w:r><w:r><w:tab\/><\/w:r><w:r><w:t xml:space="preserve">INTRODUCTION<\/w:t>/);
+  assert.match(doc, /TABLE I\. /);
+  assert.match(doc, /Fig\. 1\. /);
+  assert.match(doc, /Index Terms: /);
+  assert.match(files.find((f) => f.path === 'word/styles.xml').content, /w:ascii="Times New Roman"[^>]*\/><w:sz w:val="20"\/>/);
+  wellFormed(files);
+});
+
+test('one Markdown file: the references in its front matter, the pictures inside it', () => {
+  const m = model();
+  m.references = [{ id: 'smith2020', type: 'article-journal', title: 'T', author: [{ family: 'Smith' }] }];
+  const md = X.markdown(m);
+  assert.doesNotMatch(md, /bibliography:/);
+  assert.match(md, /references:\n {2}- \{"id":"smith2020","type":"article-journal","title":"T","author":\[\{"family":"Smith"\}\]\}\n/);
+  assert.match(md, /!\[Rates\]\(data:image\/png;base64,AAAA\)\{#fig:cd34 width=50%\}/);
+  assert.doesNotMatch(md, /csl: /, 'no style file to point at');
+});
+
+test('plain text: headings underlined, citations as set, maths as TeX, a table in columns, the references', () => {
+  const s = X.text(model());
+  assert.match(s, /^Balance & control in 100% of cortex\n\nAda Lovelace \[1\]\*, Charles Babbage \[2\]\n\[1\] University of London/);
+  assert.match(s, /ABSTRACT\n\nWe ask \$x_1\$\./);
+  assert.match(s, /1 Introduction\n=+\n/);
+  assert.match(s, /\(Smith, 2020, p\. 4\), as Figure 1 and\nEquation \(1\) show\.|\(Smith, 2020, p\. 4\), as Figure 1 and Equation \(1\)\s+show\./);
+  assert.match(s, /\[Figure 1: Rates\]/);
+  assert.match(s, /Layer {2}Rate\n-{5} {2}-{4}\nL5 {5}7\.9/);
+  assert.match(s, /REFERENCES\n\nSmith, J\. \(2020\)\. T\./);
+});
+
+test('EPUB 3: mimetype first and stored, the paper as XHTML, its pictures as files, every part well-formed', () => {
+  const m = model();
+  m.blocks[6].svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1ex" height="1ex"><path d="M0 0"/></svg>';
+  const files = X.epub(m, { uuid: 'urn:uuid:test', modified: '2026-01-01T00:00:00Z' });
+  assert.deepEqual(files[0], { path: 'mimetype', content: 'application/epub+zip', store: true });
+  const page = files.find((f) => f.path === 'OEBPS/paper.xhtml').content;
+  assert.match(page, /<img src="images\/figure-cd34\.png" alt="A plot"\/>/);
+  assert.match(page, /<h2 id="sec-ab12"><span class="num">1<\/span> Introduction<\/h2>/);
+  const opf = files.find((f) => f.path === 'OEBPS/content.opf').content;
+  assert.match(opf, /<item id="paper" href="paper\.xhtml" media-type="application\/xhtml\+xml" properties="svg"\/>/);
+  assert.match(opf, /<item id="img0" href="images\/figure-cd34\.png" media-type="image\/png"\/>/);
+  assert.match(files.find((f) => f.path === 'OEBPS/nav.xhtml').content, /<a href="paper\.xhtml#sec-ab12">Introduction<\/a>/);
+  assert.ok(files.some((f) => f.path === 'OEBPS/images/figure-cd34.png' && f.base64));
+  wellFormed(files);
+});

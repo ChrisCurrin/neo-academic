@@ -443,13 +443,13 @@ test('a numeric style numbers by first citation', async () => {
 
 test('every way out', async () => {
   const JSZip = require('jszip');
-  for (const format of ['pdf', 'html', 'docx', 'latex', 'pandoc', 'bib']) {
+  for (const format of ['pdf', 'html', 'docx', 'latex', 'pandoc', 'md', 'txt', 'epub', 'bib']) {
     await js(`paperExport(${JSON.stringify(format)})`);
     await tick(300);
   }
-  for (let i = 0; i < 50 && fs.readdirSync(OUT).length < 6; i++) await tick(200);
+  for (let i = 0; i < 60 && fs.readdirSync(OUT).length < 9; i++) await tick(200);
   const files = fs.readdirSync(OUT).sort();
-  assert.deepEqual(files.map((f) => path.extname(f)).sort(), ['.bib', '.docx', '.html', '.pdf', '.zip', '.zip']);
+  assert.deepEqual(files.map((f) => path.extname(f)).sort(), ['.bib', '.docx', '.epub', '.html', '.md', '.pdf', '.txt', '.zip', '.zip']);
   const html = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.html'))), 'utf8');
   assert.match(html, /<h1 class="title">Inhibition in cortical circuits<\/h1>/);
   assert.match(html, /\(Doe, 2019; Smith et al\., 2020\)/);
@@ -475,6 +475,46 @@ test('every way out', async () => {
   const doc = await docx.file('word/document.xml').async('string');
   assert.match(doc, /Neural dynamics of inhibition/);
   assert.ok(Object.keys(docx.files).filter((f) => f.startsWith('word/media/')).length >= 3, 'the figure and the maths are pictures in Word');
+  // Word's own equations, not pictures, and a file macOS's reader takes
+  assert.match(doc, /<m:oMath>/, 'the maths is a Word equation');
+  const { execFileSync } = require('child_process');
+  const has = (cmd) => { try { execFileSync('which', [cmd], { stdio: 'ignore' }); return true; } catch { return false; } };
+  const docxPath = path.join(OUT, files.find((f) => f.endsWith('.docx')));
+  if (has('textutil')) {
+    const words = execFileSync('textutil', ['-convert', 'txt', '-stdout', docxPath]).toString();
+    assert.match(words, /Inhibition in cortical circuits/);
+    assert.match(words, /Figure 1\. Firing rates across layers/);
+  }
+  const xmlOk = async (zip, test) => {
+    if (!has('xmllint')) return;
+    for (const name of Object.keys(zip.files).filter(test)) {
+      execFileSync('xmllint', ['--noout', '-'], { input: await zip.file(name).async('string') });
+    }
+  };
+  await xmlOk(docx, (n) => /\.(xml|rels)$/.test(n));
+  // EPUB: well-formed, the pictures inside it
+  const ep = await JSZip.loadAsync(fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.epub')))));
+  assert.equal(Object.keys(ep.files)[0], 'mimetype');
+  assert.match(await ep.file('OEBPS/paper.xhtml').async('string'), /<img src="images\/figure-\w+\.png"/);
+  await xmlOk(ep, (n) => /\.(xml|xhtml|opf)$/.test(n));
+  // one Markdown file, references and pictures inside; plain text
+  const mdOne = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.md'))), 'utf8');
+  assert.match(mdOne, /references:\n {2}- \{"[^\n]*"smith2020neural"/);
+  assert.match(mdOne, /\]\(data:image\/png;base64,/);
+  const txt = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.txt'))), 'utf8');
+  assert.match(txt, /^Inhibition in cortical circuits\n/);
+  assert.match(txt, /\$E \\approx I\$/);
+  // the LaTeX compiles, where there's a TeX to compile it with
+  if (has('tectonic')) {
+    const dir = path.join(tmp, 'tex');
+    for (const [name, f] of Object.entries(latex.files)) {
+      if (f.dir) continue;
+      fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+      fs.writeFileSync(path.join(dir, name), await f.async('nodebuffer'));
+    }
+    execFileSync('tectonic', ['-X', 'compile', 'paper.tex'], { cwd: dir, stdio: 'ignore' });
+    assert.ok(fs.existsSync(path.join(dir, 'paper.pdf')), 'paper.tex compiles');
+  }
   if (SHOTS) for (const f of files) fs.copyFileSync(path.join(OUT, f), path.join(SHOTS, f));
 });
 

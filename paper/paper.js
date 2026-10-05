@@ -2851,10 +2851,14 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
   const citeHtmlOf = (n) => (aside ? aside.text.get(n) : paper.citeText.get(n)) || n.innerHTML;
   paperRenumber();
   const m = paperMeta();
+  // maths as an SVG drawing (pages, PDF), MathML (Word's own equations) and,
+  // where Word or LaTeX can't use those, a PNG
   const mathRun = async (tex, display) => {
     const svg = mathReady() ? texSvg(tex, display) : null;
     const svgText = svg ? new XMLSerializer().serializeToString(svg) : '';
-    return { svg: svgText, png: png && svgText ? await svgToPng(svgText) : null };
+    let mml = '';
+    try { if (mathReady() && window.MathJax.tex2mml) mml = window.MathJax.tex2mml(tex, { display }); } catch { /* the picture will do */ }
+    return { svg: svgText, mml, png: png && svgText ? await svgToPng(svgText) : null };
   };
   const runsOf = async (node, fmt = {}) => {
     const out = [];
@@ -2966,6 +2970,12 @@ async function paperExport(format) {
     if (format === 'bib') {
       if (!paper.refs.length) { toast(t('This paper has no references yet')); return; }
       payload = { format: 'bib', defaultName: name, content: NeoReferences.toBibtex(paper.refs) };
+    } else if (format === 'md' || format === 'txt') {
+      const model = await paperModel();
+      payload = { format, defaultName: name, content: format === 'md' ? NeoPaperExport.markdown(model) : NeoPaperExport.text(model) };
+    } else if (format === 'epub') {
+      const model = await paperModel({ png: true });
+      payload = { format: 'epub', defaultName: name, zipEntries: NeoPaperExport.epub(model, { uuid: 'urn:neo:' + book.id }) };
     } else if (format === 'latex' || format === 'pandoc') {
       const model = await paperModel({ png: true });
       payload = { format: 'zip', defaultName: name + (format === 'latex' ? '-latex' : '-markdown'), zipEntries: format === 'latex' ? NeoPaperExport.latex(model) : NeoPaperExport.pandoc(model) };
@@ -2976,7 +2986,7 @@ async function paperExport(format) {
       const model = await paperModel();
       payload = { format, defaultName: name, content: NeoPaperExport.html(model, { print: format === 'pdf' }), print: format === 'pdf' ? 'paper' : undefined };
     } else {
-      toast(t('A paper exports as PDF, Word, LaTeX, Markdown or a web page'));
+      toast(t('A paper exports as PDF, Word, LaTeX, Markdown, EPUB, plain text or a web page'));
       return;
     }
     clearTimeout(note);

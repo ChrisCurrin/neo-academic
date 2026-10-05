@@ -1826,8 +1826,11 @@ function buildMenu() {
             { label: 'PDF (.pdf)', click: () => sendToWindow({ type: 'export', format: 'pdf' }) },
             { label: 'Word (.docx)', click: () => sendToWindow({ type: 'export', format: 'docx' }) },
             { label: t('LaTeX for Overleaf (.zip)'), click: () => sendToWindow({ type: 'export', format: 'latex' }) },
-            { label: t('Markdown for Pandoc (.zip)'), click: () => sendToWindow({ type: 'export', format: 'pandoc' }) },
+            { label: 'Markdown (.md)', click: () => sendToWindow({ type: 'export', format: 'md' }) },
+            { label: t('Markdown for Pandoc, with Files (.zip)'), click: () => sendToWindow({ type: 'export', format: 'pandoc' }) },
             { label: t('Web Page (.html)'), click: () => sendToWindow({ type: 'export', format: 'html' }) },
+            { label: 'EPUB (.epub)', click: () => sendToWindow({ type: 'export', format: 'epub' }) },
+            { label: t('Plain Text (.txt)'), click: () => sendToWindow({ type: 'export', format: 'txt' }) },
             { type: 'separator' },
             { label: t('References as BibTeX (.bib)'), click: () => sendToWindow({ type: 'export', format: 'bib' }) }
           ] : scriptState.on ? [

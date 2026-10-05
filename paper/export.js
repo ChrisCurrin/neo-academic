@@ -31,6 +31,29 @@
   'use strict';
 
   const Journals = () => root.NeoJournals || (typeof require === 'function' ? require('./journals.js') : null);
+  const Omml = () => root.NeoOmml || (typeof require === 'function' ? require('./omml.js') : null);
+  // CSS lengths (in, mm, pt) as Word's twentieths of a point
+  const twips = (v) => {
+    const m = /^([\d.]+)(in|mm|cm|pt)?$/.exec(String(v).trim());
+    if (!m) return 1440;
+    return Math.round(+m[1] * ({ in: 1440, mm: 56.6929, cm: 566.929, pt: 20 }[m[2] || 'in']));
+  };
+  // a journal's page in Word: size and margins (CSS shorthand, top right bottom left)
+  function wordPage(j) {
+    const sizes = { letter: [12240, 15840], a4: [11906, 16838] };
+    let [w, h] = sizes.letter;
+    if (j) {
+      const p = String(j.page).toLowerCase();
+      if (sizes[p]) [w, h] = sizes[p];
+      else { const d = p.split(/\s+/).map(twips); if (d.length === 2) [w, h] = d; }
+    }
+    const mg = (j ? String(j.margin) : '1in').split(/\s+/).map(twips);
+    const [top, right = top, bottom = top, left = right] = mg;
+    return { w, h, top, right, bottom, left };
+  }
+  // the first face in a journal's stack that Word is sure to have
+  const WORD_FONTS = ['Times New Roman', 'Georgia', 'Arial', 'Helvetica', 'Palatino', 'Cambria', 'Calibri'];
+  const wordFont = (stack) => String(stack || '').split(',').map((f) => f.replace(/["']/g, '').trim()).find((f) => WORD_FONTS.includes(f)) || 'Times New Roman';
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   // markup gone, entities read (citeproc writes &#38; &#60; and friends)
   const plain = (html) => String(html).replace(/<[^>]+>/g, '')
@@ -370,7 +393,9 @@ Quarto reads the same file (rename it paper.qmd).
       return '';
     }).join('');
   }
-  function html(m, { print = false } = {}) {
+  // print: for the PDF. src(pic): where a picture is (a data: URL unless
+  // given). bodyOnly: the page's body, for EPUB.
+  function html(m, { print = false, src = null, bodyOnly = false } = {}) {
     const font = m.font || 'Georgia, "Times New Roman", serif';
     // a journal sets the page, the numbers and the words of the captions
     const j = m.journal || null;
@@ -398,7 +423,7 @@ Quarto reads the same file (rename it paper.qmd).
       else if (b.type === 'para') { const s = htmlRuns(b.runs); if (runsText(b.runs).trim() || /<(img|svg)/.test(s)) body.push(`<p${b.flush ? ' class="flush"' : ''}>${s}</p>`); }
       else if (b.type === 'equation') body.push(`<div class="eq" id="${esc(b.id)}"><span class="eq-body">${b.svg || esc(b.tex)}</span><span class="eq-num">(${esc(b.num)})</span></div>`);
       else if (b.type === 'figure') {
-        const img = (p) => (p.base64 ? `<img src="data:${p.mime};base64,${p.base64}" alt="${esc(p.alt || '')}">` : '');
+        const img = (p) => (p.base64 ? `<img src="${src ? esc(src(p)) : `data:${p.mime};base64,${p.base64}`}" alt="${esc(p.alt || '')}">` : '');
         const pics = pictures(b);
         const inner = pics.length > 1
           ? `<div class="panels">${pics.map((p, i) => `<div class="panel">${img(p)}<div class="subcap"><b>(${panelLetter(i)})</b> ${htmlRuns(p.sub)}</div></div>`).join('')}</div>`
@@ -468,6 +493,7 @@ th, td { padding: .25em .7em; text-align: left; vertical-align: top; }
 .references.numeric .csl-entry { display: flex; gap: .6em; }
 .references .csl-left-margin { min-width: 2.2em; }
 .references .csl-right-inline { flex: 1; }`;
+    if (bodyOnly) return body.join('\n');
     const style = j ? J.css(j, { double: m.double }) : css;
     return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -476,6 +502,165 @@ th, td { padding: .25em .7em; text-align: left; vertical-align: top; }
 ${body.join('\n')}
 </body></html>
 `;
+  }
+
+  // ---------------------------------------------------------------------
+  // One Markdown file: the references in its front matter (Pandoc reads them
+  // there), the pictures in it as data URLs. Opens anywhere; pandoc
+  // --citeproc sets it in full.
+  // ---------------------------------------------------------------------
+  function markdown(m) {
+    const files = pandoc({ ...m, style: { ...m.style, xml: '' } });
+    let md = files.find((f) => f.path === 'paper.md').content;
+    const refs = (m.references || []).map((r) => '  - ' + JSON.stringify(r)).join('\n');
+    md = md.replace('bibliography: references.bib\n', refs ? `references:\n${refs}\n` : '');
+    for (const p of m.blocks.filter((b) => b.type === 'figure').flatMap(pictures)) {
+      if (!p.base64) continue;
+      const data = p.png && p.mime === 'image/svg+xml' ? `data:image/png;base64,${p.png.base64}` : `data:${p.mime};base64,${p.base64}`;
+      md = md.split('](' + figName(p) + ')').join('](' + data + ')');
+    }
+    return md;
+  }
+
+  // ---------------------------------------------------------------------
+  // Plain text: the words, the citations as set, maths as TeX
+  // ---------------------------------------------------------------------
+  function wrap(s, width = 78) {
+    const out = [];
+    for (const para of String(s).split('\n')) {
+      let line = '';
+      for (const word of para.split(/ +/)) {
+        if (line && (line + ' ' + word).length > width) { out.push(line); line = word; } else line = line ? line + ' ' + word : word;
+      }
+      out.push(line);
+    }
+    return out.join('\n');
+  }
+  function textRuns(runs) {
+    return (runs || []).map((r) => (r.text !== undefined ? r.text : r.cite ? plain(r.html || '') : r.xref ? r.label : r.math !== undefined ? `$${r.math}$` : '')).join('');
+  }
+  function text(m) {
+    const j = m.journal || null;
+    const J = j ? Journals() : null;
+    const out = [];
+    out.push(m.title || '');
+    if (m.subtitle) out.push(m.subtitle);
+    out.push('');
+    if (m.authors.length) {
+      const many = m.affiliations.length > 1;
+      out.push(m.authors.map((a) => a.name + (many && a.affiliations.length ? ' [' + a.affiliations.map((n) => n + 1).join(',') + ']' : '') + (a.corresponding ? '*' : '')).join(', '));
+      m.affiliations.forEach((f, i) => out.push((many ? `[${i + 1}] ` : '') + f));
+      const corr = m.authors.find((a) => a.corresponding && a.email);
+      if (corr) out.push('* ' + corr.email);
+      out.push('');
+    }
+    if (m.abstract && m.abstract.length) out.push('ABSTRACT', '', ...m.abstract.map((p) => wrap(textRuns(p)) + '\n'));
+    if (m.keywords && m.keywords.length) out.push('Keywords: ' + m.keywords.join(', '), '');
+    const num = (b) => (m.numbered === false ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    for (const b of m.blocks) {
+      if (b.type === 'heading') { const h = (num(b) ? num(b) + ' ' : '') + textRuns(b.runs); out.push('', h, (b.level === 1 ? '=' : '-').repeat(Math.min(78, h.length)), ''); }
+      else if (b.type === 'para') { const s = textRuns(b.runs).trim(); if (s) out.push(wrap(s), ''); }
+      else if (b.type === 'equation') out.push(`    ${b.tex.replace(/\n/g, '\n    ')}    (${b.num})`, '');
+      else if (b.type === 'figure') {
+        const subs = pictures(b).length > 1 ? ' ' + pictures(b).map((p, i) => `(${panelLetter(i)}) ${textRuns(p.sub)}`).join(' ') : '';
+        out.push(wrap(`[Figure ${b.num}: ${textRuns(b.caption)}${subs}]`), '');
+      } else if (b.type === 'table') {
+        out.push(wrap(`Table ${b.num}. ${textRuns(b.caption)}`), '');
+        const cells = b.rows.map((r) => r.map((c) => textRuns(c).replace(/\s+/g, ' ').trim()));
+        const widths = [];
+        for (const r of cells) r.forEach((c, k) => { widths[k] = Math.max(widths[k] || 0, c.length); });
+        cells.forEach((r, i) => {
+          out.push(r.map((c, k) => c.padEnd(widths[k])).join('  ').trimEnd());
+          if (i === 0 && b.header) out.push(widths.map((w) => '-'.repeat(w)).join('  '));
+        });
+        out.push('');
+      }
+    }
+    const bib = m.bibliography;
+    if (bib && bib.entries.length) {
+      out.push('', 'REFERENCES', '');
+      for (const e of bib.entries) out.push(wrap(plain(e.html.replace(/<div class="csl-left-margin">([\s\S]*?)<\/div>/, '$1 ')).replace(/\s+/g, ' ').trim()), '');
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+  }
+
+  // ---------------------------------------------------------------------
+  // EPUB 3: the paper as one reflowing page, its pictures beside it
+  // ---------------------------------------------------------------------
+  function epub(m, { uuid = 'urn:neo:' + Date.now().toString(36), modified = new Date().toISOString().replace(/\.\d+Z$/, 'Z') } = {}) {
+    const pics = m.blocks.filter((b) => b.type === 'figure').flatMap(pictures).filter((p) => p.base64);
+    const imgPath = (p) => 'images/' + (p.png && p.mime === 'image/svg+xml' ? p.name.replace(/\.svg$/, '.png') : p.name);
+    // XHTML: every element closed, no HTML-only entities
+    const xhtml = (s) => s.replace(/<(img|br|hr|col|input|meta|link)\b([^>]*?)\/?>/g, '<$1$2/>').replace(/&nbsp;/g, '&#160;');
+    const body = xhtml(html({ ...m, journal: null }, { src: imgPath, bodyOnly: true }));
+    const title = esc(m.title || 'Paper');
+    const css = `body { font-family: serif; line-height: 1.5; margin: 0 1em; }
+header { text-align: center; margin: 2em 0 1.5em; } h1.title { font-size: 1.5em; margin: 0 0 .4em; }
+.subtitle { font-style: italic; } .authors { margin: .5em 0 .2em; } .affils { font-size: .85em; }
+.abstract { margin: 1em 0; } .abstract h2 { font-size: 1em; } .abstract p { text-indent: 0; }
+.keywords { text-indent: 0; font-size: .9em; }
+h2 { font-size: 1.2em; margin: 1.6em 0 .5em; } h3 { font-size: 1.05em; margin: 1.2em 0 .4em; } h4 { font-size: 1em; font-style: italic; }
+p { margin: 0; text-indent: 1.2em; } h2 + p, h3 + p, h4 + p, figure + p, div.eq + p { text-indent: 0; }
+.eq { text-align: center; margin: .8em 0; } .eq-num { float: right; }
+figure { margin: 1.2em 0; text-align: center; } figure img { max-width: 100%; }
+figure .panels { display: flex; gap: 3%; } figure .panel { flex: 1; } figure .panel img { width: 100%; }
+figcaption, .subcap { text-align: left; font-size: .9em; }
+table { border-collapse: collapse; margin: 0 auto; border-top: 1px solid; border-bottom: 1px solid; font-size: .9em; }
+th { border-bottom: 1px solid; } th, td { padding: .2em .5em; text-align: left; }
+.references .entry { margin-bottom: .5em; font-size: .9em; }
+a { color: inherit; text-decoration: none; }`;
+    const page = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">
+<head><meta charset="utf-8"/><title>${title}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+${body}
+</body></html>`;
+    const heads = m.blocks.filter((b) => b.type === 'heading' && b.level === 1);
+    const nav = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">
+<head><meta charset="utf-8"/><title>${title}</title></head>
+<body><nav epub:type="toc" id="toc"><h1>${title}</h1><ol>
+<li><a href="paper.xhtml">${title}</a></li>
+${heads.map((h) => `<li><a href="paper.xhtml#${esc(h.id)}">${esc(runsText(h.runs))}</a></li>`).join('\n')}
+</ol></nav></body></html>`;
+    const mime = (p) => (p.png && p.mime === 'image/svg+xml' ? 'image/png' : p.mime);
+    const opf = `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="id">${esc(uuid)}</dc:identifier>
+<dc:title>${title}</dc:title>
+${m.authors.map((a) => `<dc:creator>${esc(a.name)}</dc:creator>`).join('\n')}
+<dc:language>en</dc:language>
+<meta property="dcterms:modified">${modified}</meta>
+</metadata>
+<manifest>
+<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+<item id="paper" href="paper.xhtml" media-type="application/xhtml+xml"${/<svg/.test(body) ? ' properties="svg"' : ''}/>
+<item id="css" href="style.css" media-type="text/css"/>
+${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item id="img${i}" href="${esc(imgPath(p))}" media-type="${mime(p)}"/>`).join('\n')}
+</manifest>
+<spine><itemref idref="paper"/></spine>
+</package>`;
+    const entries = [
+      { path: 'mimetype', content: 'application/epub+zip', store: true },
+      { path: 'META-INF/container.xml', content: `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>` },
+      { path: 'OEBPS/content.opf', content: opf },
+      { path: 'OEBPS/nav.xhtml', content: nav },
+      { path: 'OEBPS/paper.xhtml', content: page },
+      { path: 'OEBPS/style.css', content: css }
+    ];
+    const seen = new Set();
+    for (const p of pics) {
+      if (seen.has(imgPath(p))) continue;
+      seen.add(imgPath(p));
+      entries.push({ path: 'OEBPS/' + imgPath(p), content: p.png && p.mime === 'image/svg+xml' ? p.png.base64 : p.base64, base64: true });
+    }
+    return entries;
   }
 
   // ---------------------------------------------------------------------
@@ -503,6 +688,18 @@ ${body.join('\n')}
   }
 
   function docx(m) {
+    const j = m.journal || null;
+    const J = j ? Journals() : null;
+    const page = wordPage(j);
+    const figWord = j ? j.captions.figure : 'Figure';
+    const tabWord = j ? j.captions.table : 'Table';
+    const capSep = j ? j.captions.sep : '.';
+    const hnum = (b) => (m.numbered === false ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    // the width text runs in (a column's, in two): for equation tabs and pictures
+    const cols = j ? j.columns : 1;
+    const gap = cols > 1 ? twips(j.gap || '0.25in') : 0;
+    const textW = Math.round((page.w - page.left - page.right - gap * (cols - 1)) / cols);
+    const textPx = textW / 15;
     const media = [];
     const rels = [];
     const addImage = (base64, ext) => {
@@ -533,6 +730,9 @@ ${body.join('\n')}
       if (r.cite) return htmlToRuns(r.html || '').map(run).join('');
       if (r.xref) return r.kind ? `<w:hyperlink w:anchor="${xml(bm(r.xref))}">${run({ text: r.label })}</w:hyperlink>` : run({ text: r.label || '' });
       if (r.math !== undefined) {
+        // an equation Word can edit; a picture of it only when it can't be one
+        const omml = r.mml ? Omml().fromMathml(r.mml) : null;
+        if (omml) return omml;
         if (r.png) return drawing(addImage(r.png.base64, 'png'), r.png.w / 2, r.png.h / 2, r.math, -(r.png.depth || 0) * 1.5);
         return run({ text: r.math, i: true });
       }
@@ -560,23 +760,41 @@ ${body.join('\n')}
       body.push(para('AbstractHeading', run({ text: 'Abstract' })));
       for (const p of m.abstract) body.push(para('Abstract', runsXml(p)));
     }
-    if (m.keywords && m.keywords.length) body.push(para('Keywords', run({ text: 'Keywords: ', b: true }) + run({ text: m.keywords.join(', ') })));
+    if (m.keywords && m.keywords.length && (!j || j.keywords)) body.push(para('Keywords', run({ text: (j ? j.keywords : 'Keywords') + ': ', b: true }) + run({ text: m.keywords.join(', ') })));
+    const sect = (cols, last) => `<w:sectPr>${last ? '<w:footerReference w:type="default" r:id="rIdFooter"/>' : ''}<w:type w:val="continuous"/><w:pgSz w:w="${page.w}" w:h="${page.h}"/><w:pgMar w:top="${page.top}" w:right="${page.right}" w:bottom="${page.bottom}" w:left="${page.left}" w:header="567" w:footer="567" w:gutter="0"/>${last ? '<w:pgNumType w:start="1"/>' : ''}<w:cols w:num="${cols}" w:space="${twips(j && j.gap ? j.gap : '0.25in')}"/></w:sectPr>`;
+    // two columns: the title, authors and abstract span the page, the paper runs in columns
+    if (j && j.columns > 1) body.push(`<w:p><w:pPr>${sect(1, false)}</w:pPr></w:p>`);
     let afterBlock = true;
     for (const b of m.blocks) {
       if (b.type === 'heading') {
-        body.push(para('Heading' + b.level, mark(b.id, (m.numbered !== false && b.num ? run({ text: b.num + '\t' }) : '') + runsXml(b.runs))));
+        body.push(para('Heading' + b.level, mark(b.id, (hnum(b) ? run({ text: hnum(b) + '\t' }) : '') + runsXml((j && j.headings.upper && b.level === 1) ? b.runs.map((r) => (r.text !== undefined ? { ...r, text: r.text.toUpperCase() } : r)) : b.runs))));
         afterBlock = true;
       } else if (b.type === 'para') {
         if (!runsText(b.runs).trim() && !b.runs.some((r) => r.math !== undefined)) continue;
         body.push(para(afterBlock || b.flush ? 'FirstParagraph' : 'BodyText', runsXml(b.runs)));
         afterBlock = false;
       } else if (b.type === 'equation') {
-        const pic = b.png ? drawing(addImage(b.png.base64, 'png'), b.png.w / 2, b.png.h / 2, b.tex) : run({ text: b.tex, i: true });
-        body.push(para('Equation', mark(b.id, `<w:r><w:tab/></w:r>${pic}<w:r><w:tab/></w:r>${run({ text: `(${b.num})` })}`)));
+        const omml = b.mml ? Omml().fromMathml(b.mml) : null;
+        if (omml) {
+          // a display equation with its number: Word's usual way, a row of three
+          // borderless cells (room, the equation as a display, the number), so
+          // the equation is set full size and centred and the number sits right
+          const side = Math.round(textW * 0.12);
+          const cell = (w, inner, jc) => `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/><w:vAlign w:val="center"/></w:tcPr><w:p><w:pPr><w:pStyle w:val="EquationCell"/><w:jc w:val="${jc}"/></w:pPr>${inner}</w:p></w:tc>`;
+          body.push(`<w:tbl><w:tblPr><w:tblW w:w="${textW}" w:type="dxa"/><w:tblLayout w:type="fixed"/><w:tblCellMar><w:left w:w="0" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr>`
+            + `<w:tblGrid><w:gridCol w:w="${side}"/><w:gridCol w:w="${textW - 2 * side}"/><w:gridCol w:w="${side}"/></w:tblGrid><w:tr>`
+            + cell(side, '', 'left')
+            + cell(textW - 2 * side, mark(b.id, `<m:oMathPara><m:oMathParaPr><m:jc m:val="center"/></m:oMathParaPr>${omml}</m:oMathPara>`), 'center')
+            + cell(side, run({ text: `(${b.num})` }), 'right')
+            + '</w:tr></w:tbl>');
+        } else {
+          const pic = b.png ? drawing(addImage(b.png.base64, 'png'), b.png.w / 2, b.png.h / 2, b.tex) : run({ text: b.tex, i: true });
+          body.push(para('Equation', mark(b.id, `<w:r><w:tab/></w:r>${pic}<w:r><w:tab/></w:r>${run({ text: `(${b.num})` })}`)));
+        }
         afterBlock = true;
       } else if (b.type === 'figure') {
         const pics = pictures(b);
-        const room = (6.0 * 96 * (b.width ? b.width / 100 : 1)) / pics.length - (pics.length > 1 ? 8 : 0);
+        const room = ((b.span && cols > 1 ? textPx * cols : textPx) * (b.width ? b.width / 100 : 1)) / pics.length - (pics.length > 1 ? 8 : 0);
         const art = pics.map((p) => {
           const src = p.png || (p.base64 && p.mime !== 'image/svg+xml' ? { base64: p.base64, w: p.w, h: p.h } : null);
           if (!src) return '';
@@ -587,10 +805,11 @@ ${body.join('\n')}
         }).filter(Boolean);
         if (art.length) body.push(para('Figure', art.join(run({ text: '  ' }))));
         const subs = pics.length > 1 ? pics.map((p, i) => run({ text: `(${panelLetter(i)}) `, b: true }) + runsXml(p.sub) + run({ text: ' ' })).join('') : '';
-        body.push(para('Caption', mark(b.id, run({ text: `Figure ${b.num}. `, b: true })) + runsXml(b.caption) + (subs ? run({ text: ' ' }) + subs : '')));
+        body.push(para('Caption', mark(b.id, run({ text: `${figWord} ${b.num}${capSep} `, b: true })) + runsXml(b.caption) + (subs ? run({ text: ' ' }) + subs : '')));
         afterBlock = true;
       } else if (b.type === 'table') {
-        body.push(para('TableCaption', mark(b.id, run({ text: `Table ${b.num}. `, b: true })) + runsXml(b.caption)));
+        const tnum = tabWord === 'TABLE' && j && j.headings.numbering === 'roman' ? J.headingNumber(j, b.num, 1).replace(/\.$/, '') : b.num;
+        body.push(para('TableCaption', mark(b.id, run({ text: `${tabWord} ${tnum}${capSep} `, b: true })) + runsXml(b.caption)));
         const cols = Math.max(1, ...b.rows.map((r) => r.length));
         const rows = b.rows.map((r, i) => {
           const head = i === 0 && b.header;
@@ -610,14 +829,15 @@ ${body.join('\n')}
       for (const e of bib.entries) body.push(para(bib.numeric ? 'BibliographyNumbered' : 'Bibliography', mark('ref-' + e.id, htmlToRuns(e.html).map(run).join(''))));
     }
     const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
-<w:body>${body.join('\n')}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/><w:pgNumType w:start="1"/><w:footerReference w:type="default" r:id="rIdFooter"/></w:sectPr></w:body></w:document>`;
-    const font = (m.font || 'Times New Roman').split(',')[0].replace(/["']/g, '').trim() || 'Times New Roman';
-    const line = m.double ? 480 : 360;
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+<w:body>${body.join('\n')}${sect(j ? j.columns : 1, true)}</w:body></w:document>`;
+    const font = j ? wordFont(j.font) : (m.font || 'Times New Roman').split(',')[0].replace(/["']/g, '').trim() || 'Times New Roman';
+    const line = m.double ? 480 : j ? Math.round(240 * j.leading) : 360;
+    const size = j ? Math.round(parseFloat(j.size) * 2) : 24;
     const style = (id, name, ppr, rpr, extra = '') => `<w:style w:type="paragraph" w:styleId="${id}"><w:name w:val="${name}"/>${extra}<w:pPr>${ppr}</w:pPr><w:rPr>${rpr}</w:rPr></w:style>`;
     const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${xml(font)}" w:hAnsi="${xml(font)}" w:cs="${xml(font)}" w:eastAsia="${xml(font)}"/><w:sz w:val="24"/><w:szCs w:val="24"/><w:lang w:val="en-US"/></w:rPr></w:rPrDefault>
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${xml(font)}" w:hAnsi="${xml(font)}" w:cs="${xml(font)}" w:eastAsia="${xml(font)}"/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/><w:lang w:val="en-US"/></w:rPr></w:rPrDefault>
 <w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="${line}" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
 ${style('Normal', 'Normal', '', '', '<w:qFormat/>')}
 ${style('BodyText', 'Body Text', '<w:ind w:firstLine="360"/>', '', '<w:basedOn w:val="Normal"/><w:qFormat/>')}
@@ -632,7 +852,8 @@ ${style('Keywords', 'Keywords', '<w:ind w:left="720" w:right="720"/><w:spacing w
 ${style('Heading1', 'heading 1', '<w:keepNext/><w:spacing w:before="360" w:after="120"/><w:outlineLvl w:val="0"/><w:tabs><w:tab w:val="left" w:pos="567"/></w:tabs>', '<w:b/><w:sz w:val="28"/>', '<w:basedOn w:val="Normal"/><w:next w:val="FirstParagraph"/><w:qFormat/>')}
 ${style('Heading2', 'heading 2', '<w:keepNext/><w:spacing w:before="240" w:after="80"/><w:outlineLvl w:val="1"/><w:tabs><w:tab w:val="left" w:pos="567"/></w:tabs>', '<w:b/><w:sz w:val="24"/>', '<w:basedOn w:val="Normal"/><w:next w:val="FirstParagraph"/><w:qFormat/>')}
 ${style('Heading3', 'heading 3', '<w:keepNext/><w:spacing w:before="200" w:after="60"/><w:outlineLvl w:val="2"/><w:tabs><w:tab w:val="left" w:pos="567"/></w:tabs>', '<w:b/><w:i/>', '<w:basedOn w:val="Normal"/><w:next w:val="FirstParagraph"/><w:qFormat/>')}
-${style('Equation', 'Equation', '<w:tabs><w:tab w:val="center" w:pos="4680"/><w:tab w:val="right" w:pos="9360"/></w:tabs><w:spacing w:before="120" w:after="120"/>', '')}
+${style('Equation', 'Equation', `<w:tabs><w:tab w:val="center" w:pos="${Math.round(textW / 2)}"/><w:tab w:val="right" w:pos="${textW}"/></w:tabs><w:spacing w:before="120" w:after="120"/>`, '')}
+${style('EquationCell', 'Equation (numbered)', '<w:spacing w:before="80" w:after="80" w:line="240" w:lineRule="auto"/>', '', '<w:basedOn w:val="Normal"/>')}
 ${style('Figure', 'Figure', '<w:jc w:val="center"/><w:keepNext/><w:spacing w:before="240" w:line="240" w:lineRule="auto"/>', '')}
 ${style('Caption', 'caption', '<w:spacing w:before="80" w:after="240" w:line="276" w:lineRule="auto"/>', '<w:sz w:val="20"/>', '<w:basedOn w:val="Normal"/><w:qFormat/>')}
 ${style('TableCaption', 'Table Caption', '<w:keepNext/><w:spacing w:before="240" w:after="80" w:line="276" w:lineRule="auto"/>', '<w:sz w:val="20"/>', '<w:basedOn w:val="Caption"/>')}
@@ -679,5 +900,5 @@ ${rels.join('\n')}
     ];
   }
 
-  return { latex, pandoc, html, docx, crossId, runsText, htmlToRuns, texEsc };
+  return { latex, pandoc, markdown, text, epub, html, docx, crossId, runsText, htmlToRuns, texEsc };
 });
