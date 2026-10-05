@@ -10,6 +10,7 @@
     "test:spellcheck": "node --test scripts/spellcheck.test.js",
     "test:dashes": "node --test scripts/dashes.test.js",
     "test:words": "electron scripts/words.e2e.js",
+    "test:paper": "electron scripts/paper.e2e.js",
     "test": "node --test \"scripts/*.test.js\"",
     "test:coverage": "node --test --experimental-test-coverage \"scripts/*.test.js\"",
     "lint": "oxlint",
@@ -134,10 +135,12 @@
   "devDependencies": {
     "electron": "^43.0.0",
     "electron-builder": "^26.15.3",
+    "linkedom": "^0.18.12",
     "oxlint": "^1.86.0"
   },
   "dependencies": {
     "@farscrl/hunspell-wasm": "1.0.1",
+    "citeproc": "^2.4.63",
     "dictionary-de": "^3.0.0",
     "dictionary-el": "^4.0.0",
     "dictionary-en-au": "^3.0.0",
@@ -153,7 +156,8 @@
     "dictionary-ru": "^3.0.0",
     "electron-updater": "^6.3.9",
     "jszip": "^3.10.1",
-    "koffi": "2.16.3"
+    "koffi": "2.16.3",
+    "mathjax-full": "^3.2.2"
   },
   "allowScripts": {
     "electron@33.4.11": true

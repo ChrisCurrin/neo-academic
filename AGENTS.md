@@ -14,6 +14,18 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before adding a feature. The product is 
 - Do not save UI decoration into chapter HTML. Search highlights, spellcheck underlines, and focus dimming use the CSS Highlight API so they stay out of the file.
 - Do not rewrite a chapter that has not changed. Libraries are synced with iCloud and Syncthing. A timer that writes every chapter on an interval will fight the other device.
 
+## Papers
+
+A book whose `book.json` says `"format": "paper"` is an academic paper. Right-click (long-press) a shelf's + for New Paper. The feature lives in `paper/`: `paper.js` (the editor: title page, headings, citations, maths, figures, tables, the pane, menus, export glue), `library.js` (the References tab), and three plain modules the tests load in node: `references.js` (BibTeX, RIS and CSL JSON in; BibTeX out; DOIs; keys; the @ picker's ranking), `cite.js` (citeproc-js and the CSL styles in `paper/csl`) and `export.js` (LaTeX, Pandoc Markdown, HTML and Word from a plain model of the paper). `app.js` calls in at a handful of hooks, each guarded by `isPaper()`.
+
+- Like a script, the paper is one chapter, so selection runs through it. Headings are `<p class="h1|h2|h3" data-id="sec-…">`; there are no *** breaks and Enter never splits a chapter.
+- Citations, cross-references and inline maths are uneditable spans (`.cite` with `data-cite` JSON, `.xref` with `data-ref`, `.math` holding its TeX); a display equation is `<p class="eq">` holding its TeX. Figures and tables are `<figure class="fig|tbl">` with editable captions and cells. The text inside each is saved, so a chapter file reads sensibly on its own.
+- Numbers (`data-num`), a figure's `blob:` picture and `data-missing` are runtime only; `captureBody` strips them through `paperStrip`. Maths is drawn into a shadow root, which `innerHTML` never serializes.
+- The engine's `insertHTML` puts an uneditable span outside its paragraph at a line's end, so `placeAtom` inserts them by hand, snapshots the structure first and sends ⌘Z to the structural undo. `stripJunkSpans` leaves `.cite`, `.xref` and `.math` alone.
+- References are `references.json` (CSL JSON, the citation key as `id`). Figures are `figure-<id>.<ext>` and a writer's own style is `style.csl`, all in the book folder, read and written through `paper:read` and `paper:write`, which accept only those names. A linked reference file's path lives in `book.paper.bibFile`; `paper:linked` reads only the path stored there. `paper:lookup` sends a DOI to doi.org, only when the writer asks.
+- MathJax (`mathjax-full`) and citeproc-js load the first time a paper opens. citeproc is CPAL/AGPL; see `licenses/citeproc`. Styles and locales are CC BY-SA (`licenses/csl`).
+- `scripts/paper-*.test.js` test the plain modules; `npm run test:paper` drives a paper end to end in Electron (`NEO_SHOTS=<folder>` saves screenshots of each step).
+
 ## Where the code is
 
 | File | Role |
@@ -29,6 +41,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before adding a feature. The product is 
 | `spell-worker.js` | Hunspell WASM, forked with `utilityProcess`. Messages: `load`, `check`, `suggest`, `add` |
 | `spell-ro.js` | Romanian diacritics, used by the worker. Does not alter the manuscript |
 | `locales/<code>.json` | One language. Regional files (`fr-CA.json`) hold only the strings that differ |
+| `paper/` | Papers: see Papers above |
 | `pocket/` | Capacitor shell. It does not contain its own editor |
 
 `app.js` section banners look like `/*  SAVING  */`. Start there: bookshelf, bound shelves, editor open, typing, poetry, screenplays, placeholders, nav, tabs, outline, outline cards, darlings, counters, saving, refresh, structural undo, find, import, spellcheck, focus, goals, export.
@@ -125,7 +138,7 @@ node scripts/i18n.js template
 node scripts/i18n.js check fr
 ```
 
-`scripts/i18n.js` only scans `app.js`, `main.js`, `covers.js`, and `index.html`. A new string in another file will not enter the template until that list includes it.
+`scripts/i18n.js` only scans `app.js`, `main.js`, `covers.js`, `paper/paper.js`, `paper/library.js`, and `index.html`. A new string in another file will not enter the template until that list includes it.
 
 Details, plural forms, and regional fallback (`fr-CA` → `fr` → English) are in [TRANSLATING.md](TRANSLATING.md). Quotation marks follow the spellcheck language (`QUOTE_STYLES` in `app.js`). Import chapter detection is `CHAPTER_WORDS` in `main.js`. Cover small-words are `CONNECTORS` in `covers.js`.
 
@@ -135,7 +148,7 @@ Italian has no spellcheck dictionary: the only Hunspell package on npm is GPL-3.
 
 `pocket/` is a Capacitor app that runs the desktop editor. Its bridge (`pocket/www/pocket-bridge.js`) implements `window.neo` against the phone's library folder. Android shares `Documents/NEO Library` via sync. iOS uses the app folder, optionally iCloud, with `LibraryHome.swift` locating that folder.
 
-`scripts/pocket-www.js` (run by CI, and by hand before a local build) copies `app.js`, `covers.js`, `styles.css`, `i18n.js`, `fonts/`, `locales/`, Hunspell's browser build, and the `SPELL_LANGUAGES` dictionaries from `main.js` into `pocket/www/`. Pocket's checker is `pocket/www/pocket-spell.js`, a module worker with the same messages as `spell-worker.js`. A change to those files changes Pocket. Pocket-only behavior belongs in `pocket-bridge.js` or the native projects, not behind a desktop-only branch scattered through `app.js`.
+`scripts/pocket-www.js` (run by CI, and by hand before a local build) copies `app.js`, `covers.js`, `styles.css`, `i18n.js`, `fonts/`, `locales/`, `paper/` with MathJax and citeproc-js, Hunspell's browser build, and the `SPELL_LANGUAGES` dictionaries from `main.js` into `pocket/www/`. Pocket's checker is `pocket/www/pocket-spell.js`, a module worker with the same messages as `spell-worker.js`. A change to those files changes Pocket. Pocket-only behavior belongs in `pocket-bridge.js` or the native projects, not behind a desktop-only branch scattered through `app.js`.
 
 ## Commands
 
@@ -147,6 +160,7 @@ npm run test:coverage      # node --test --experimental-test-coverage scripts/*.
 npm run lint               # oxlint, Electron's standard-style JavaScript rules
 npm run test:spellcheck    # node --test scripts/spellcheck.test.js
 npm run test:dashes        # node --test scripts/dashes.test.js
+npm run test:paper         # a paper written and exported end to end, in Electron
 npm run bundle             # Hugh: brings in the newest .bundle from ~/Downloads and pushes main
 npm run release            # Hugh: next version (x.y.9 → x.(y+1).0), commit, push, tag (npm run release -- 2.0.0 for another)
 npm run package:mac        # macOS build; npm run package calls this

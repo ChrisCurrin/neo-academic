@@ -663,6 +663,84 @@ ipcMain.handle('cover:remove', (_e, bookId) => {
   return true;
 });
 
+// ---------------------------------------------------------------------------
+// Papers. A paper's figures and the citation style a writer brought in live
+// in its folder beside the chapters (figure-<id>.png, style.csl); the styles
+// NEO ships live in paper/csl. A DOI is looked up only when the writer asks,
+// and only the DOI leaves the machine.
+const PAPER_FILE = /^(?:figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)|style\.csl)$/;
+function paperFile(bookId, name) {
+  name = libName(name);
+  if (!PAPER_FILE.test(name)) throw new Error('Not a paper file: ' + name);
+  return path.join(bookDir(bookId), name);
+}
+ipcMain.handle('paper:read', (_e, bookId, name) => {
+  const file = paperFile(bookId, name);
+  return fs.existsSync(file) ? fs.readFileSync(file).toString('base64') : null;
+});
+ipcMain.handle('paper:write', (_e, bookId, name, base64) => {
+  writeFileDurable(paperFile(bookId, name), Buffer.from(String(base64), 'base64'));
+  return true;
+});
+ipcMain.handle('paper:asset', (_e, name) => {
+  if (!/^[\w-]+\.(?:csl|xml)$/.test(name)) throw new Error('Not a citation style: ' + name);
+  return fs.readFileSync(path.join(__dirname, 'paper', 'csl', name), 'utf8');
+});
+ipcMain.handle('paper:lookup', async (_e, doi) => {
+  doi = String(doi || '').trim();
+  if (!/^10\.\d{4,9}\/\S+$/.test(doi)) throw new Error('Not a DOI: ' + doi);
+  const { net } = require('electron');
+  let res;
+  try {
+    res = await net.fetch('https://doi.org/' + encodeURI(doi).replace(/#/g, '%23'), {
+      headers: { Accept: 'application/vnd.citationstyles.csl+json' }
+    });
+  } catch (err) {
+    throw new Error('No connection to doi.org (' + ((err && err.message) || err) + ')');
+  }
+  if (res.status === 404) throw new Error('doi.org has no record of ' + doi);
+  if (!res.ok) throw new Error('doi.org answered ' + res.status);
+  return res.json();
+});
+// A reference file the writer keeps elsewhere (Zotero's Better BibTeX
+// keeps one up to date). Which file, for which paper, is this computer's
+// own business: it's kept in userData, written only when the writer picks
+// the file here, and only a file picked that way is ever read. (book.json
+// syncs; a path in it could name any file on the other machine.)
+const LINKS_FILE = () => path.join(app.getPath('userData'), 'paper-links.json');
+const readLinks = () => readJSON(LINKS_FILE(), {}) || {};
+ipcMain.handle('paper:link', async (_e, bookId) => {
+  bookId = libName(bookId);
+  const win = BrowserWindow.getFocusedWindow();
+  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    properties: ['openFile'],
+    filters: [{ name: 'References', extensions: ['bib', 'json', 'ris'] }]
+  });
+  if (canceled || !filePaths[0]) return null;
+  const file = filePaths[0];
+  const links = readLinks();
+  links[bookId] = file;
+  writeFileDurable(LINKS_FILE(), JSON.stringify(links, null, 2));
+  return { path: file, text: fs.readFileSync(file, 'utf8'), mtime: fs.statSync(file).mtimeMs };
+});
+ipcMain.handle('paper:unlink', (_e, bookId) => {
+  const links = readLinks();
+  delete links[libName(bookId)];
+  writeFileDurable(LINKS_FILE(), JSON.stringify(links, null, 2));
+  return true;
+});
+ipcMain.handle('paper:linked', (_e, bookId, since) => {
+  const file = readLinks()[libName(bookId)];
+  if (!file || typeof file !== 'string') return null;
+  try {
+    const mtime = fs.statSync(file).mtimeMs;
+    if (mtime === since) return { path: file, mtime, same: true };
+    return { path: file, mtime, text: fs.readFileSync(file, 'utf8') };
+  } catch {
+    return { path: file, missing: true };
+  }
+});
+
 ipcMain.handle('cover:read', (_e, bookId, fname) => {
   try {
     if (!/^(cover|art)-\d+\.(png|jpg|webp)$/.test(fname)) return null;
@@ -1592,6 +1670,19 @@ ipcMain.on('script:state', (_e, st) => {
   scriptState = next;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
+// A paper's menus: Insert, its citation style, its heading levels
+const NeoCite = require('./paper/cite.js');
+let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false };
+ipcMain.on('paper:state', (_e, st) => {
+  st = st || {};
+  const next = {
+    on: !!st.on, style: typeof st.style === 'string' ? st.style : null, custom: typeof st.custom === 'string' ? st.custom : '',
+    heading: ['h1', 'h2', 'h3'].includes(st.heading) ? st.heading : '', numbered: st.numbered !== false, double: !!st.double, linked: !!st.linked
+  };
+  if (JSON.stringify(next) === JSON.stringify(paperState)) return;
+  paperState = next;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
 let typewriterState = false;
 ipcMain.on('poetry:state', (_e, on) => {
   on = !!on;
@@ -1690,7 +1781,15 @@ function buildMenu() {
       submenu: [
         {
           label: t('Export'),
-          submenu: scriptState.on ? [
+          submenu: paperState.on ? [
+            { label: 'PDF (.pdf)', click: () => sendToWindow({ type: 'export', format: 'pdf' }) },
+            { label: 'Word (.docx)', click: () => sendToWindow({ type: 'export', format: 'docx' }) },
+            { label: t('LaTeX for Overleaf (.zip)'), click: () => sendToWindow({ type: 'export', format: 'latex' }) },
+            { label: t('Markdown for Pandoc (.zip)'), click: () => sendToWindow({ type: 'export', format: 'pandoc' }) },
+            { label: t('Web Page (.html)'), click: () => sendToWindow({ type: 'export', format: 'html' }) },
+            { type: 'separator' },
+            { label: t('References as BibTeX (.bib)'), click: () => sendToWindow({ type: 'export', format: 'bib' }) }
+          ] : scriptState.on ? [
             { label: 'PDF (.pdf)', click: () => sendToWindow({ type: 'export', format: 'pdf' }) },
             { label: 'Fountain (.fountain)', click: () => sendToWindow({ type: 'export', format: 'fountain' }) },
             { label: 'Final Draft (.fdx)', click: () => sendToWindow({ type: 'export', format: 'fdx' }) }
@@ -1737,6 +1836,12 @@ function buildMenu() {
           accelerator: 'CmdOrCtrl+Shift+I',
           click: () => sendToWindow({ type: 'import' })
         },
+        ...(paperState.on ? [
+          { label: t('Import References…'), click: () => sendToWindow({ type: 'paper', command: 'importReferences' }) },
+          paperState.linked
+            ? { label: t('Unlink Reference Library'), click: () => sendToWindow({ type: 'paper', command: 'unlinkLibrary' }) }
+            : { label: t('Link Reference Library…'), click: () => sendToWindow({ type: 'paper', command: 'linkLibrary' }) }
+        ] : []),
         { label: t('Reshelve a Book…'), click: () => sendToWindow({ type: 'reshelve' }) },
         { label: t('Library Folder…'), click: () => { chooseLibraryFolder().catch((err) => logError('library folder', err)); } },
         { type: 'separator' },
@@ -1792,8 +1897,25 @@ function buildMenu() {
             { label: t('Other Font…'), click: () => sendToWindow({ type: 'bodyFontPick' }) }
           ]
         },
+        ...(paperState.on ? [
+          {
+            label: t('Citation Style'),
+            submenu: [
+              ...NeoCite.STYLES.map((st) => ({
+                label: st.title, type: 'radio', checked: paperState.style === st.id,
+                click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
+              })),
+              ...(paperState.custom ? [{ label: paperState.custom, type: 'radio', checked: paperState.style === 'custom', click: () => sendToWindow({ type: 'paper', command: 'style', value: 'custom' }) }] : []),
+              { type: 'separator' },
+              { label: t('Other Style (.csl)…'), click: () => sendToWindow({ type: 'paper', command: 'styleFile' }) }
+            ]
+          },
+          { label: t('Numbered Headings'), type: 'checkbox', checked: paperState.numbered, click: () => sendToWindow({ type: 'paper', command: 'numbered' }) },
+          { label: t('Double Spacing'), type: 'checkbox', checked: paperState.double, click: () => sendToWindow({ type: 'paper', command: 'double' }) },
+          { type: 'separator' }
+        ] : []),
         {
-          visible: !scriptState.on,
+          visible: !scriptState.on && !paperState.on,
           label: t('Drop Cap Style'),
           submenu: [
             { label: t('Literary'), type: 'radio', checked: viewState.dropCap === 'literary', click: () => sendToWindow({ type: 'dropCap', value: 'literary' }) },
@@ -1839,15 +1961,21 @@ function buildMenu() {
           checked: scriptState.element === value,
           click: () => sendToWindow({ type: 'scriptElement', value })
         })) : []),
+        ...(paperState.on ? [
+          [t('Section Heading'), 'h1', '1'], [t('Subsection Heading'), 'h2', '2'], [t('Subsubsection Heading'), 'h3', '3'], [t('Body Text'), '', '0']
+        ].map(([label, value, key]) => ({
+          label, accelerator: 'CmdOrCtrl+Alt+' + key, type: 'radio', checked: paperState.heading === value,
+          click: () => sendToWindow({ type: 'paper', command: 'heading', value })
+        })) : []),
         {
-          visible: !scriptState.on,
+          visible: !scriptState.on && !paperState.on,
           label: t('Flush Paragraph') + '\t' + (isMac ? '⇧Enter' : 'Shift+Enter'),
           type: 'checkbox',
           checked: flushState,
           click: () => sendToWindow({ type: 'flush' })
         },
         {
-          visible: !scriptState.on,
+          visible: !scriptState.on && !paperState.on,
           label: t('Poetry Paragraph') + '\t' + (isMac ? '⇧⌘Enter' : 'Ctrl+Shift+Enter'),
           type: 'checkbox',
           checked: poetryState,
@@ -1935,6 +2063,17 @@ function buildMenu() {
         }
       ]
     },
+    ...(paperState.on ? [{
+      label: t('Insert'),
+      submenu: [
+        { label: t('Citation…'), accelerator: 'CmdOrCtrl+Shift+K', click: () => sendToWindow({ type: 'paper', command: 'cite' }) },
+        { label: t('Cross-Reference…'), click: () => sendToWindow({ type: 'paper', command: 'xref' }) },
+        { type: 'separator' },
+        { label: t('Equation'), accelerator: 'CmdOrCtrl+Shift+M', click: () => sendToWindow({ type: 'paper', command: 'equation' }) },
+        { label: t('Figure…'), click: () => sendToWindow({ type: 'paper', command: 'figure' }) },
+        { label: t('Table'), click: () => sendToWindow({ type: 'paper', command: 'table' }) }
+      ]
+    }] : []),
     {
       role: 'windowMenu',
       label: t('Window'),

@@ -259,6 +259,29 @@
     readJSON: (bookId, name, fallback) => readJSONFile(p(bookId, name + '.json'), fallback),
     writeJSON: async (bookId, name, data) => { await writeJSONFile(p(bookId, name + '.json'), data); return true; },
 
+    /* ---------- a paper's figures and style; DOIs looked up ---------- */
+    paperRead: async (bookId, name) => {
+      if (!/^(?:figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)|style\.csl)$/.test(name)) throw new Error('Not a paper file: ' + name);
+      try { await ready; return (await FS().readFile(at(p(bookId, name)))).data; } catch { return null; }
+    },
+    paperWrite: async (bookId, name, base64) => {
+      if (!/^(?:figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)|style\.csl)$/.test(name)) throw new Error('Not a paper file: ' + name);
+      await ready;
+      await FS().writeFile({ ...at(p(bookId, name)), data: base64, recursive: true });
+      return true;
+    },
+    // Crossref answers a web view directly; arXiv's DOIs are DataCite's
+    paperLookup: async (doi) => {
+      const datacite = /^10\.48550\//.test(doi);
+      const url = datacite
+        ? 'https://api.datacite.org/application/vnd.citationstyles.csl+json/' + encodeURIComponent(doi)
+        : 'https://api.crossref.org/works/' + encodeURIComponent(doi) + '/transform/application/vnd.citationstyles.csl+json';
+      const res = await fetch(url);
+      if (res.status === 404) throw new Error('No record of ' + doi);
+      if (!res.ok) throw new Error('The lookup answered ' + res.status);
+      return res.json();
+    },
+
     /* ---------- API keys & painting: desktop only ---------- */
     hasSecret: async () => false,
     setSecret: async () => false,

@@ -1,0 +1,2520 @@
+/* NEO — papers
+ *
+ * A paper is a book whose book.json says "format": "paper" (right-click a
+ * shelf's + for New Paper). It is written the way NEO writes everything —
+ * one page, nothing in the way — with what an academic manuscript needs on
+ * top: a title page with authors, abstract and keywords; numbered section
+ * headings (# , ## , ### or ⌥⌘1–3); citations typed with @ and set in a
+ * real citation style; $maths$; figures dropped or pasted in; tables pasted
+ * from a spreadsheet; cross-references that keep their numbers; and the
+ * reference list, made from what is cited.
+ *
+ * In the chapter's HTML (plain, readable, saved as it is):
+ *   <p class="h1|h2|h3" data-id="sec-…">Heading</p>
+ *   <span class="cite" contenteditable="false" data-cite='[{"id":"smith2020","locator":"4"}]'>(Smith, 2020, p. 4)</span>
+ *   <span class="xref" contenteditable="false" data-ref="fig-…">Figure 2</span>
+ *   <span class="math" contenteditable="false">E = mc^2</span>          (TeX)
+ *   <p class="eq" contenteditable="false" data-id="eq-…">\int_0^1 f</p>  (TeX)
+ *   <figure class="fig" contenteditable="false" data-id="fig-…" data-src="figure-….png"><img alt="…"><figcaption contenteditable="true">…</figcaption></figure>
+ *   <figure class="tbl" contenteditable="false" data-id="tab-…"><figcaption contenteditable="true">…</figcaption><table>…</table></figure>
+ * Numbers, the drawn maths (in a shadow root, which is never serialized)
+ * and a figure's picture are put on at runtime and never saved.
+ *
+ * The references live in references.json (CSL JSON); see paper/references.js
+ * for reading and writing them, paper/cite.js for setting them in a style,
+ * paper/library.js for the References tab and paper/export.js for the ways
+ * out. Loaded after app.js, whose globals it uses.
+ */
+
+'use strict';
+
+const PAPER_SEL = '.cite, .xref, .math, .eq, .fig, .tbl, .h1, .h2, .h3';
+const paper = {
+  refs: [],            // the paper's references (CSL JSON), as on disk
+  refsSaved: '',       // what references.json held when last read or written
+  proc: null,          // the citeproc processor for the current style
+  procStyle: null,     // …and which style it was built for
+  styleXml: {},        // style XML by id ('custom' is the paper's style.csl)
+  locales: null,
+  figures: new Map(),  // figure file name → Promise of a blob: URL
+  bibliography: null,  // the last reference list, for exports
+  citeText: new Map(), // rendered citation by node, for exports
+  linkedStamp: null,   // the linked reference file's last-modified time…
+  linkedPath: null,    // …and where it is, on this computer (main.js keeps it)
+  ready: null          // the scripts a paper needs, loading
+};
+
+const paperMeta = () => {
+  book.paper = book.paper || {};
+  return book.paper;
+};
+const paperId = (prefix) => prefix + '-' + Math.random().toString(36).slice(2, 10);
+const paperBodies = () => [...document.querySelectorAll('#chapters .chapter-body')];
+
+/* ------------------------------------------------------------------ */
+/*  The scripts a paper needs, fetched the first time one opens       */
+/* ------------------------------------------------------------------ */
+
+function paperScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Couldn’t load ' + src));
+    document.head.appendChild(s);
+  });
+}
+// node_modules on the desktop; Pocket carries copies (scripts/pocket-www.js)
+const PAPER_VENDOR = IS_POCKET
+  ? { mathjax: 'paper/vendor/tex-svg-full.js', citeproc: 'paper/vendor/citeproc.js' }
+  : { mathjax: 'node_modules/mathjax-full/es5/tex-svg-full.js', citeproc: 'node_modules/citeproc/citeproc_commonjs.js' };
+
+function paperLoad() {
+  if (paper.ready) return paper.ready;
+  window.MathJax = {
+    startup: { typeset: false },
+    tex: { packages: { '[+]': ['ams', 'newcommand', 'boldsymbol', 'mathtools', 'physics', 'cancel', 'color', 'braket'] } },
+    svg: { fontCache: 'none' },
+    options: { enableMenu: false }
+  };
+  // citeproc is a CommonJS file: it ends by setting module.exports, so it
+  // gets a module to set while it loads, and the global CSL stays behind
+  const citeproc = (async () => {
+    window.module = { exports: {} };
+    try { await paperScript(PAPER_VENDOR.citeproc); } finally { delete window.module; }
+  })();
+  const mathjax = paperScript(PAPER_VENDOR.mathjax).then(() => window.MathJax.startup.promise);
+  paper.ready = Promise.all([citeproc, mathjax]).catch((err) => {
+    window.neo.logError('paper load: ' + (err && err.stack || err));
+    paper.ready = null;
+    throw err;
+  });
+  return paper.ready;
+}
+const mathReady = () => !!(window.MathJax && window.MathJax.tex2svg);
+
+async function paperAsset(name) {
+  if (window.neo.paperAsset) return window.neo.paperAsset(name);
+  const res = await fetch('paper/csl/' + name);
+  if (!res.ok) throw new Error('Couldn’t read ' + name);
+  return res.text();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Opening a paper                                                   */
+/* ------------------------------------------------------------------ */
+
+// From openBook, before the chapters are drawn
+async function paperOpen() {
+  if (!isPaper()) return;
+  const m = paperMeta();
+  if (!m.style) m.style = NeoCite.DEFAULT_STYLE;
+  paper.refs = await window.neo.readJSON(book.id, 'references', []);
+  if (!Array.isArray(paper.refs)) paper.refs = [];
+  paper.refsSaved = JSON.stringify(paper.refs);
+  paper.proc = null;
+  paper.procStyle = null;
+  paper.citeText = new Map();
+  paper.linkedStamp = null;
+  paper.linkedPath = null;
+  // a paper's own pictures and style are its own: nothing carries over from the last one
+  for (const url of paper.figures.values()) url.then((u) => { if (u) URL.revokeObjectURL(u); });
+  paper.figures = new Map();
+  delete paper.styleXml.custom;
+  paper.bibliography = null;
+  closePaperPop();
+  pickerClose();
+  paperLoad().then(() => { if (isPaper()) { paperHydrate(); paperCiteNow(); } }).catch(() => {
+    toast(t('The maths and citation styles didn’t load. Restart NEO to try again.'), 8000);
+  });
+  paperRefreshLinked();
+}
+
+// The look of the editor for a paper, or back to a book's (from openBook,
+// beside spEditorMode)
+function paperEditorMode() {
+  const on = isPaper();
+  closePaperPop();
+  pickerClose();
+  $('#paper').classList.toggle('paper-mode', on);
+  $('#editor-view').classList.toggle('paper-mode', on);
+  $('#nav-pane').classList.toggle('paper', on);
+  document.body.classList.toggle('paper-double', on && !!paperMeta().double);
+  document.body.classList.toggle('paper-unnumbered', on && paperMeta().numbered === false);
+  const tabM = $('.tab[data-tab="manuscript"]');
+  if (tabM && on) setText(tabM, t('Paper'));
+  const tabO = $('.tab[data-tab="outline"]');
+  if (tabO) tabO.hidden = on; // a paper's outline is its headings, in the pane
+  paperTab(on);
+  paperTitlePage(on);
+  paperRefsBlock(on);
+  if (on) setText($('#nav-head span'), t('Sections'));
+  // the words the page draws itself, in the writer's language
+  const words = { '--paper-fig-word': t('Figure'), '--paper-tab-word': t('Table'), '--paper-caption-ph': t('Add a caption') };
+  for (const [k, v] of Object.entries(words)) $('#paper').style.setProperty(k, JSON.stringify(v));
+  const add = $('#nav-add');
+  if (add && on) add.hidden = true;
+  paperReportState();
+}
+
+// The References tab stands where the Outline does
+function paperTab(on) {
+  let tab = $('.tab[data-tab="references"]');
+  if (!tab && on) {
+    tab = document.createElement('div');
+    tab.className = 'tab';
+    tab.setAttribute('role', 'tab');
+    tab.tabIndex = 0;
+    tab.dataset.tab = 'references';
+    tab.setAttribute('aria-selected', 'false');
+    $('.tab[data-tab="outline"]').after(tab);
+    tab.addEventListener('click', () => switchTab('references'));
+    tab.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); switchTab('references'); } });
+  }
+  if (tab) {
+    tab.hidden = !on;
+    setText(tab, t('References'));
+  }
+}
+
+// From renderChapters, once the bodies are on the page
+function paperRendered() {
+  for (const body of paperBodies()) {
+    body.classList.add('paper-body', 'no-cap');
+    // a heading's number, a figure's picture: put on at once, saved never
+    for (const p of body.querySelectorAll('p.h1, p.h2, p.h3, p.eq')) if (!p.dataset.id) p.dataset.id = paperId(p.classList.contains('eq') ? 'eq' : 'sec');
+  }
+  paperHydrate();
+  paperRenumber();
+  paperCiteSoon(0);
+}
+
+// What the page keeps only on screen (from captureBody)
+function paperStrip(html) {
+  return html.replace(/ (?:data-num|data-missing|data-state)="[^"]*"/g, '').replace(/ src="blob:[^"]*"/g, '');
+}
+
+// Everything a paper adds to the page gets its drawing, wherever it came
+// from: typed, pasted, undone, redrawn
+const paperWatch = new MutationObserver((records) => {
+  if (!book || !isPaper()) return;
+  let touched = false;
+  const hit = (n) => n.nodeType === 1 && (n.matches(PAPER_SEL) || n.querySelector(PAPER_SEL));
+  for (const r of records) {
+    for (const n of r.addedNodes) if (hit(n)) touched = true;
+    for (const n of r.removedNodes) if (hit(n)) touched = true;
+    if (touched) break;
+  }
+  if (!touched) return;
+  paperHydrate();
+  paperRenumberSoon();
+  paperCiteSoon();
+});
+paperWatch.observe($('#chapters'), { childList: true, subtree: true });
+
+function paperHydrate(root = $('#chapters')) {
+  if (!book || !isPaper()) return;
+  for (const n of root.querySelectorAll('.math, .eq')) drawMath(n);
+  for (const f of root.querySelectorAll('figure.fig')) loadFigure(f);
+  for (const c of root.querySelectorAll('.fig figcaption, .tbl figcaption, .tbl th, .tbl td')) {
+    if (c.getAttribute('contenteditable') !== 'true') c.setAttribute('contenteditable', 'true');
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  The title page: authors, abstract, keywords                       */
+/* ------------------------------------------------------------------ */
+
+function paperTitlePage(on) {
+  const page = $('#title-page');
+  page.classList.toggle('paper-title', on);
+  for (const id of ['tp-authors', 'tp-affils', 'tp-abstract-wrap', 'tp-keywords']) {
+    const old = document.getElementById(id);
+    if (old) old.remove();
+  }
+  if (!on) return;
+  const m = paperMeta();
+
+  const authors = document.createElement('div');
+  authors.id = 'tp-authors';
+  authors.tabIndex = 0;
+  authors.setAttribute('role', 'button');
+  authors.title = t('Click to edit the authors, their affiliations and ORCID iDs');
+  const affils = document.createElement('div');
+  affils.id = 'tp-affils';
+  $('#tp-subtitle').after(authors, affils);
+  const edit = () => paperEditAuthors();
+  authors.addEventListener('click', edit);
+  authors.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); edit(); } });
+  paperShowAuthors();
+
+  const wrap = document.createElement('section');
+  wrap.id = 'tp-abstract-wrap';
+  wrap.innerHTML = `<h2 class="tp-abstract-head"></h2><div id="tp-abstract" contenteditable="true" spellcheck="false" role="textbox" aria-multiline="true"></div><div class="tp-abstract-count" aria-hidden="true"></div>`;
+  wrap.querySelector('.tp-abstract-head').textContent = t('Abstract');
+  const abs = wrap.querySelector('#tp-abstract');
+  abs.setAttribute('aria-label', t('Abstract'));
+  abs.dataset.ph = t('What the paper asks, what it did, what it found');
+  abs.innerHTML = paperClean(m.abstract || '');
+  page.appendChild(wrap);
+  const count = () => {
+    const n = countWords(abs.innerText || '');
+    wrap.querySelector('.tp-abstract-count').textContent = n ? t('{n} words', { n }) : '';
+  };
+  count();
+  abs.addEventListener('input', () => {
+    if (abs.innerHTML === '<br>') abs.innerHTML = '';
+    m.abstract = paperClean(abs.innerHTML);
+    count();
+    scheduleMetaSave();
+  });
+  abs.addEventListener('keydown', (e) => paperMathKey(e, abs));
+  abs.addEventListener('click', (e) => { const n = e.target.closest('.math'); if (n) openMathEditor(n); });
+  for (const n of abs.querySelectorAll('.math')) drawMath(n);
+
+  const kw = document.createElement('div');
+  kw.id = 'tp-keywords';
+  kw.contentEditable = 'true';
+  kw.spellcheck = false;
+  kw.setAttribute('role', 'textbox');
+  kw.setAttribute('aria-label', t('Keywords'));
+  kw.dataset.ph = t('Keywords, separated by commas');
+  kw.dataset.label = t('Keywords');
+  kw.textContent = (m.keywords || []).join(', ');
+  page.appendChild(kw);
+  kw.addEventListener('input', () => {
+    m.keywords = kw.textContent.split(/[,;]/).map((k) => k.trim()).filter(Boolean);
+    scheduleMetaSave();
+  });
+  kw.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const body = paperBodies()[0];
+    if (body) focusChapterStart(body.closest('.chapter').dataset.id);
+  });
+}
+
+// Only what an abstract is made of: paragraphs, emphasis, sub/superscript, maths
+function paperClean(html) {
+  const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html').body.firstChild;
+  const out = (node) => [...node.childNodes].map((n) => {
+    if (n.nodeType === 3) return escHtml(n.data);
+    if (n.nodeType !== 1) return '';
+    const tag = n.tagName.toLowerCase();
+    if (n.classList.contains('math')) return `<span class="math" contenteditable="false">${escHtml(n.textContent)}</span>`;
+    if (['i', 'em'].includes(tag)) return `<i>${out(n)}</i>`;
+    if (['b', 'strong'].includes(tag)) return `<b>${out(n)}</b>`;
+    if (['sub', 'sup'].includes(tag)) return `<${tag}>${out(n)}</${tag}>`;
+    if (['p', 'div'].includes(tag)) return `<p>${out(n) || '<br>'}</p>`;
+    if (tag === 'br') return '<br>';
+    return out(n);
+  }).join('');
+  const html2 = out(doc);
+  return /<p>/.test(html2) || !html2 ? html2 : `<p>${html2}</p>`;
+}
+
+// Ada Lovelace¹ ✉, Charles Babbage²  —  ¹ University of London  ² Cambridge
+function paperAffiliations(authors) {
+  const list = [];
+  for (const a of authors) for (const f of a.affiliations || []) if (f && !list.includes(f)) list.push(f);
+  return list;
+}
+const SUPERSCRIPT = (n) => String(n).replace(/\d/g, (d) => '⁰¹²³⁴⁵⁶⁷⁸⁹'[d]);
+function paperShowAuthors() {
+  const el = $('#tp-authors');
+  if (!el) return;
+  const authors = paperMeta().authors || [];
+  const affils = paperAffiliations(authors);
+  el.innerHTML = '';
+  el.classList.toggle('empty', !authors.length);
+  if (!authors.length) {
+    el.textContent = t('Add authors');
+  } else {
+    authors.forEach((a, i) => {
+      if (i) el.append(', ');
+      const name = document.createElement('span');
+      name.className = 'tp-name';
+      name.textContent = a.name;
+      el.appendChild(name);
+      const marks = (a.affiliations || []).map((f) => affils.indexOf(f) + 1).filter((n) => n > 0);
+      if (affils.length > 1 && marks.length) {
+        const sup = document.createElement('sup');
+        sup.textContent = marks.join(',');
+        el.appendChild(sup);
+      }
+      if (a.corresponding) {
+        const sup = document.createElement('sup');
+        sup.className = 'tp-corr';
+        sup.textContent = '*';
+        sup.title = a.email || t('Corresponding author');
+        el.appendChild(sup);
+      }
+    });
+  }
+  const box = $('#tp-affils');
+  if (box) {
+    box.innerHTML = '';
+    affils.forEach((f, i) => {
+      const line = document.createElement('div');
+      line.textContent = (affils.length > 1 ? SUPERSCRIPT(i + 1) + ' ' : '') + f;
+      box.appendChild(line);
+    });
+    const corr = authors.find((a) => a.corresponding && a.email);
+    if (corr) {
+      const line = document.createElement('div');
+      line.className = 'tp-corr-line';
+      line.textContent = '* ' + t('Correspondence: {email}', { email: corr.email });
+      box.appendChild(line);
+    }
+  }
+  // the shelf shows the authors as the book's author
+  const names = authors.map((a) => a.name).filter(Boolean);
+  const shelfName = names.length > 2 ? names[0] + ' et al.' : names.join(' & ');
+  if (shelfName && book.author !== shelfName) { book.author = shelfName; scheduleMetaSave(); }
+}
+
+// The authors, one row each: name, affiliations, email, ORCID iD, and who
+// takes correspondence. Opened only when the writer clicks the author line.
+function paperEditAuthors() {
+  const m = paperMeta();
+  const rows = (m.authors && m.authors.length ? m.authors : [{ name: displayAuthor() || '', affiliations: [''], corresponding: true }])
+    .map((a) => ({ ...a, affiliations: [...(a.affiliations || [])] }));
+  const bd = document.createElement('div');
+  bd.className = 'modal-backdrop';
+  bd.innerHTML = `<div class="modal paper-authors" role="dialog" aria-modal="true">
+    <h2></h2><div class="pa-rows"></div>
+    <button class="pa-add btn-quiet" type="button"></button>
+    <datalist id="pa-affil-list"></datalist>
+    <div class="pa-foot"><button class="m-cancel btn-quiet" type="button"></button><button class="m-ok btn-gold" type="button"></button></div>
+  </div>`;
+  bd.querySelector('h2').textContent = t('Authors');
+  bd.querySelector('.pa-add').textContent = '+ ' + t('Add an author');
+  bd.querySelector('.m-cancel').textContent = t('Cancel');
+  bd.querySelector('.m-ok').textContent = t('Done');
+  const list = bd.querySelector('.pa-rows');
+  const known = () => {
+    const dl = bd.querySelector('#pa-affil-list');
+    dl.innerHTML = '';
+    for (const f of paperAffiliations(rows)) { const o = document.createElement('option'); o.value = f; dl.appendChild(o); }
+  };
+  const field = (cls, ph, value, onInput, type = 'text') => {
+    const input = document.createElement('input');
+    input.type = type;
+    input.className = cls;
+    input.placeholder = ph;
+    input.setAttribute('aria-label', ph);
+    input.value = value || '';
+    input.spellcheck = false;
+    input.addEventListener('input', () => onInput(input.value));
+    return input;
+  };
+  const draw = () => {
+    list.innerHTML = '';
+    rows.forEach((a, i) => {
+      const row = document.createElement('div');
+      row.className = 'pa-row';
+      const left = document.createElement('div');
+      left.className = 'pa-main';
+      left.appendChild(field('pa-name', t('Name'), a.name, (v) => { a.name = v; }));
+      a.affiliations.forEach((f, k) => {
+        const aff = field('pa-affil', t('Affiliation'), f, (v) => { a.affiliations[k] = v; known(); });
+        aff.setAttribute('list', 'pa-affil-list');
+        left.appendChild(aff);
+      });
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'pa-more';
+      more.textContent = '+ ' + t('another affiliation');
+      more.onclick = () => { a.affiliations.push(''); draw(); list.querySelectorAll('.pa-row')[i].querySelectorAll('.pa-affil')[a.affiliations.length - 1].focus(); };
+      left.appendChild(more);
+      const right = document.createElement('div');
+      right.className = 'pa-side';
+      right.appendChild(field('pa-email', t('Email'), a.email, (v) => { a.email = v; }, 'email'));
+      const orcid = field('pa-orcid', 'ORCID iD (0000-0000-0000-0000)', a.orcid, (v) => {
+        a.orcid = v.trim().replace(/^https?:\/\/orcid\.org\//i, '');
+        orcid.classList.toggle('bad', !!a.orcid && !validOrcid(a.orcid));
+      });
+      orcid.classList.toggle('bad', !!a.orcid && !validOrcid(a.orcid));
+      right.appendChild(orcid);
+      const corr = document.createElement('label');
+      corr.className = 'pa-corr';
+      corr.innerHTML = '<input type="checkbox"> <span></span>';
+      corr.querySelector('span').textContent = t('Corresponding author');
+      corr.querySelector('input').checked = !!a.corresponding;
+      corr.querySelector('input').onchange = (e) => { a.corresponding = e.target.checked; };
+      right.appendChild(corr);
+      const tools = document.createElement('div');
+      tools.className = 'pa-tools';
+      const btn = (label, title, fn, disabled) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.title = title;
+        b.setAttribute('aria-label', title);
+        b.disabled = !!disabled;
+        b.onclick = fn;
+        tools.appendChild(b);
+      };
+      btn('↑', t('Move up'), () => { rows.splice(i - 1, 0, rows.splice(i, 1)[0]); draw(); }, i === 0);
+      btn('↓', t('Move down'), () => { rows.splice(i + 1, 0, rows.splice(i, 1)[0]); draw(); }, i === rows.length - 1);
+      btn('×', t('Remove'), () => { rows.splice(i, 1); draw(); });
+      right.appendChild(tools);
+      row.append(left, right);
+      list.appendChild(row);
+    });
+    known();
+  };
+  draw();
+  document.body.appendChild(bd);
+  const first = bd.querySelector('.pa-name');
+  if (first) first.focus();
+  bd.querySelector('.pa-add').onclick = () => {
+    rows.push({ name: '', affiliations: [''] });
+    draw();
+    const names = bd.querySelectorAll('.pa-name');
+    names[names.length - 1].focus();
+  };
+  const close = () => bd.remove();
+  bd.querySelector('.m-cancel').onclick = close;
+  bd.querySelector('.m-ok').onclick = () => {
+    m.authors = rows.map((a) => ({
+      name: a.name.trim(),
+      affiliations: a.affiliations.map((f) => f.trim()).filter(Boolean),
+      ...(a.email && a.email.trim() ? { email: a.email.trim() } : {}),
+      ...(a.orcid && validOrcid(a.orcid) ? { orcid: a.orcid } : {}),
+      ...(a.corresponding ? { corresponding: true } : {})
+    })).filter((a) => a.name);
+    paperShowAuthors();
+    scheduleMetaSave();
+    close();
+  };
+  bd.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target.type !== 'checkbox') { e.preventDefault(); bd.querySelector('.m-ok').click(); }
+  });
+}
+// ORCID's own check digit (ISO 7064 11,2)
+function validOrcid(id) {
+  if (!/^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$/.test(id)) return false;
+  const digits = id.replace(/-/g, '');
+  let total = 0;
+  for (let i = 0; i < 15; i++) total = (total + +digits[i]) * 2;
+  const check = (12 - (total % 11)) % 11;
+  return digits[15] === (check === 10 ? 'X' : String(check));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Headings and numbers                                              */
+/* ------------------------------------------------------------------ */
+
+const HEADINGS = ['h1', 'h2', 'h3'];
+const headingOf = (p) => (p && p.classList ? HEADINGS.find((h) => p.classList.contains(h)) || '' : '');
+
+// ⌥⌘1–3 and the Format menu; '' is body text
+function paperSetHeading(level, body = null) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  let el = sel.anchorNode;
+  if (el && el.nodeType === 3) el = el.parentElement;
+  body = body || (el && el.closest && el.closest('.chapter-body'));
+  const p = el && el.closest && el.closest('p');
+  if (!body || !p || !body.contains(p) || p.classList.contains('eq')) return;
+  p.classList.remove(...HEADINGS, 'flush', 'poetry');
+  if (level) {
+    p.classList.add(level);
+    if (!p.dataset.id) p.dataset.id = paperId('sec');
+    p.removeAttribute('style');
+  } else {
+    delete p.dataset.id;
+  }
+  if (!p.getAttribute('class')) p.removeAttribute('class');
+  syncChapter(body, body.closest('.chapter').dataset.id);
+  paperRenumber();
+  paperReportState();
+}
+
+let paperRenumberTimer = null;
+function paperRenumberSoon() {
+  clearTimeout(paperRenumberTimer);
+  paperRenumberTimer = setTimeout(paperRenumber, 120);
+}
+
+// Headings 1, 1.1, 1.1.1; figures, tables and equations in order; and every
+// cross-reference set to the number its target has now
+function paperRenumber() {
+  if (!book || !isPaper()) return;
+  const numbered = paperMeta().numbered !== false;
+  const counts = [0, 0, 0];
+  const n = { fig: 0, tbl: 0, eq: 0 };
+  const targets = new Map();
+  const set = (el, v) => { if (el.dataset.num !== v) el.dataset.num = v; };
+  for (const el of document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3, #chapters figure.fig, #chapters figure.tbl, #chapters p.eq')) {
+    const level = HEADINGS.indexOf(headingOf(el));
+    if (level >= 0) {
+      counts[level]++;
+      for (let k = level + 1; k < 3; k++) counts[k] = 0;
+      const num = counts.slice(0, level + 1).map((c) => c || 1).join('.');
+      if (numbered) set(el, num); else if (el.dataset.num) delete el.dataset.num;
+      targets.set(el.dataset.id, { kind: 'sec', num, label: numbered ? t('Section {n}', { n: num }) : '“' + el.textContent.trim() + '”', el });
+      continue;
+    }
+    const kind = el.classList.contains('fig') ? 'fig' : el.classList.contains('tbl') ? 'tbl' : 'eq';
+    const num = String(++n[kind]);
+    set(el, num);
+    const cap = el.querySelector('figcaption');
+    if (cap) set(cap, num);
+    const label = kind === 'fig' ? t('Figure {n}', { n: num }) : kind === 'tbl' ? t('Table {n}', { n: num }) : t('Equation ({n})', { n: num });
+    targets.set(el.dataset.id, { kind, num, label, el });
+  }
+  paper.targets = targets;
+  for (const x of document.querySelectorAll('#chapters .xref')) {
+    const tgt = targets.get(x.dataset.ref);
+    const text = tgt ? tgt.label : '??';
+    if (x.textContent !== text) x.textContent = text;
+    if (tgt) x.removeAttribute('data-missing'); else x.setAttribute('data-missing', '');
+  }
+  if (currentTab === 'manuscript') scheduleNavRefresh();
+}
+
+// Everything that can be cross-referenced, for the @ picker
+function paperTargets() {
+  paperRenumber();
+  return [...(paper.targets || new Map()).entries()].map(([id, x]) => {
+    const cap = x.el.querySelector && x.el.querySelector('figcaption');
+    const text = x.kind === 'sec' ? x.el.textContent.trim() : x.kind === 'eq' ? x.el.textContent.trim() : (cap ? cap.textContent.trim() : '');
+    return { id, kind: x.kind, label: x.kind === 'sec' ? t('Section {n}', { n: x.num }) : x.label, text };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Typing in a paper                                                 */
+/* ------------------------------------------------------------------ */
+
+// From the chapter's keydown, ahead of NEO's own keys. true = handled.
+function paperKey(e, body, chId) {
+  if (pickerKey(e)) return true;
+  const inIsland = e.target !== body && e.target.closest && e.target.closest('figure');
+  if (inIsland) return figureKey(e, body, chId);
+  const cmd = e.metaKey || e.ctrlKey;
+  // ⌥⌘1–3, ⌥⌘0 (the menu has them too; this works where a menu can't reach)
+  if (cmd && e.altKey && !e.shiftKey && /^Digit[0-3]$/.test(e.code || '')) {
+    e.preventDefault();
+    paperSetHeading(['', 'h1', 'h2', 'h3'][+e.code.slice(5)], body);
+    return true;
+  }
+  // @ and $ typed with ⌥ (a German or Swedish Mac) or AltGr (Windows) are typing
+  if (typedChar(e) && e.key === '@') return pickerOpenOnAt(e, body);
+  if (paperMathKey(e, body)) return true;
+  if (cmd || e.altKey) return false;
+  if (e.key === 'Enter' && !e.shiftKey) return paperEnter(e, body, chId);
+  if (e.key === ' ' && paperHashHeading(e, body)) return true;
+  return false;
+}
+
+// Enter is a new paragraph and only that: a paper has no *** and no
+// chapter splits. On a heading, the next line is body text; on a line that
+// is only $$…$$, the maths becomes a numbered display equation.
+function paperEnter(e, body, chId) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return false;
+  const block = caretBlock(body);
+  if (!block) return false;
+  e.preventDefault();
+  enterRun = 0;
+  if (!sel.isCollapsed) document.execCommand('delete');
+  const text = block.textContent.trim();
+  const display = /^\$\$([\s\S]*?)(?:\$\$)?$/.exec(text);
+  if (display && !headingOf(block)) {
+    snapshotStructure('equation');
+    const eq = makeDisplayEq(display[1].trim());
+    block.replaceWith(eq);
+    const after = document.createElement('p');
+    after.innerHTML = '<br>';
+    eq.after(after);
+    placeCaret(after, 0);
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    if (!display[1].trim()) openMathEditor(eq);
+    return true;
+  }
+  const level = headingOf(block);
+  if (level) {
+    const r = sel.getRangeAt(0);
+    const pre = document.createRange();
+    pre.selectNodeContents(block);
+    pre.setEnd(r.startContainer, r.startOffset);
+    if (!pre.toString().length && text) {
+      // at the start of a heading: an empty line opens above it
+      const p = document.createElement('p');
+      p.innerHTML = '<br>';
+      block.before(p);
+      syncChapter(body, chId);
+      return true;
+    }
+  }
+  if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) {
+    const caret = captureCaret();
+    stripJunkSpans(block);
+    restoreCaret(caret);
+  }
+  document.execCommand('insertParagraph');
+  const cur = caretBlock(body);
+  if (cur && cur !== block) {
+    // the engine copies the paragraph it split, class, id and all
+    cur.classList.remove(...HEADINGS);
+    delete cur.dataset.id;
+    delete cur.dataset.num;
+    if (!cur.getAttribute('class')) cur.removeAttribute('class');
+  }
+  syncChapter(body, chId);
+  revealCaret();
+  return true;
+}
+
+// "# " at the start of a line makes a section heading; ## and ### the levels below
+function paperHashHeading(e, body) {
+  const block = caretBlock(body);
+  if (!block || headingOf(block) || block.classList.contains('eq')) return false;
+  const sel = window.getSelection();
+  const r = sel.getRangeAt(0);
+  if (!r.collapsed) return false;
+  const pre = document.createRange();
+  pre.selectNodeContents(block);
+  pre.setEnd(r.startContainer, r.startOffset);
+  const before = pre.toString();
+  if (!/^#{1,3}$/.test(before)) return false;
+  e.preventDefault();
+  selectChars(block, 0, before.length);
+  document.execCommand('delete');
+  paperSetHeading(HEADINGS[before.length - 1], body);
+  return true;
+}
+
+// $x^2$: the closing $ turns what's between into maths, the way *…* turns
+// italic. Not money: "$5 and $10" stays as typed, and so does a $ after a
+// space. ⌘Z right after brings back the dollar signs.
+const MATH_INLINE = /(^|[^\\$\p{L}\p{N}])\$([^\s$](?:[^$]*?[^\s$\\])?)$/u;
+const typedChar = (e) => !e.metaKey && (!e.ctrlKey || (e.getModifierState && e.getModifierState('AltGraph')));
+function paperMathKey(e, field) {
+  if (e.key !== '$' || !typedChar(e) || (library && library.markdownOff)) return false;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  const start = r.startContainer.nodeType === 3 ? r.startContainer.parentElement : r.startContainer;
+  const block = start && start.closest('p, div');
+  if (!block || !field.contains(block) || block.closest('figure') || block.classList.contains('eq')) return false;
+  const pre = document.createRange();
+  pre.selectNodeContents(block);
+  pre.setEnd(r.startContainer, r.startOffset);
+  const before = pre.toString();
+  const m = MATH_INLINE.exec(before);
+  if (!m || /^[\d.,\s–-]+$/.test(m[2])) return false;
+  const from = before.length - m[2].length - 1;
+  selectChars(block, from, before.length);
+  // only plain text between the dollars: not across a citation or a picture
+  if (window.getSelection().getRangeAt(0).cloneContents().querySelector('*')) {
+    placeCaret(r.startContainer, r.startOffset);
+    return false;
+  }
+  e.preventDefault();
+  placeCaret(r.startContainer, r.startOffset);
+  document.execCommand('insertText', false, '$');
+  selectChars(block, from, before.length + 1);
+  const node = placeAtom(window.getSelection().getRangeAt(0), `<span class="math" contenteditable="false">${escHtml(m[2])}</span>`, 'maths');
+  if (!field.matches('.chapter-body')) {
+    drawMath(node); // the page draws its own; the abstract is drawn here
+    field.dispatchEvent(new Event('input'));
+  }
+  return true;
+}
+
+// A citation, cross-reference or maths in place of a range. Placed by hand:
+// the engine's insertHTML sets an uneditable span outside its paragraph
+// when it lands at the end of a line. In the paper, ⌘Z takes it back
+// through NEO's structural undo, the way it takes back a section break.
+function placeAtom(range, html, label) {
+  const start = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+  const body = start && start.closest('.chapter-body');
+  if (body) snapshotStructure(label);
+  const holder = document.createElement('span');
+  holder.innerHTML = html;
+  const node = holder.firstChild;
+  range.deleteContents();
+  range.insertNode(node);
+  // no empty text left beside it, and none of the engine's style spans
+  for (const n of [node.previousSibling, node.nextSibling]) if (n && n.nodeType === 3 && !n.data) n.remove();
+  if (body) {
+    syncChapter(body, body.closest('.chapter').dataset.id);
+    // the engine's own undo never saw this: start it afresh, and send ⌘Z to NEO's
+    body.contentEditable = 'false';
+    body.contentEditable = 'true';
+    body.focus({ preventScroll: true });
+    breakRun++;
+  }
+  caretAfter(node);
+  return node;
+}
+// the caret just past a piece the caret can't go into
+function caretAfter(node) {
+  const r = document.createRange();
+  const next = node.nextSibling;
+  if (next && next.nodeType === 3) r.setStart(next, 0);
+  else r.setStartAfter(node);
+  r.collapse(true);
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(r);
+}
+
+function makeDisplayEq(tex) {
+  const eq = document.createElement('p');
+  eq.className = 'eq';
+  eq.contentEditable = 'false';
+  eq.dataset.id = paperId('eq');
+  eq.textContent = tex;
+  return eq;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Maths: drawn by MathJax into a shadow root, edited in place        */
+/* ------------------------------------------------------------------ */
+
+const MATH_CSS = `:host{display:inline}:host(.eq){display:block}
+.m{display:inline-block;cursor:pointer;border-radius:3px}
+.m:hover{background:rgba(201,168,106,.16)}
+.d{display:flex;align-items:center;justify-content:center;position:relative;padding:.4em 3em;cursor:pointer}
+.d:hover{background:rgba(201,168,106,.12)}
+.n{position:absolute;right:0}
+.src{font-family:Menlo,Consolas,monospace;font-size:.8em;opacity:.7}
+.err{color:#c0392b;font-family:Menlo,Consolas,monospace;font-size:.8em}
+mjx-container{display:inline-block}
+svg{overflow:visible}`;
+
+const drawn = new WeakMap(); // node → the TeX (and number) last drawn
+function drawMath(node) {
+  const display = node.classList.contains('eq');
+  const tex = node.textContent;
+  const num = display ? node.dataset.num || '' : '';
+  const key = tex + '\u0000' + num + '\u0000' + (mathReady() ? 1 : 0);
+  if (node.shadowRoot && drawn.get(node) === key) return;
+  const root = node.shadowRoot || node.attachShadow({ mode: 'open' });
+  drawn.set(node, key);
+  const box = document.createElement('span');
+  box.className = display ? 'd' : 'm';
+  if (!tex.trim()) {
+    box.innerHTML = `<span class="src">${escHtml(display ? t('empty equation — click to write it') : '$ $')}</span>`;
+  } else if (!mathReady()) {
+    box.innerHTML = `<span class="src">${escHtml(display ? tex : '$' + tex + '$')}</span>`;
+  } else {
+    const svg = texSvg(tex, display);
+    if (svg) box.appendChild(svg); else box.innerHTML = `<span class="err">${escHtml(tex)}</span>`;
+  }
+  if (display) {
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = num ? '(' + num + ')' : '';
+    box.appendChild(n);
+  }
+  root.innerHTML = `<style>${MATH_CSS}</style>`;
+  root.appendChild(box);
+}
+// TeX → an <svg>, or null when the TeX doesn't parse
+function texSvg(tex, display) {
+  try {
+    const out = window.MathJax.tex2svg(tex, { display });
+    const svg = out.querySelector('svg');
+    if (!svg || out.querySelector('[data-mjx-error]')) return null;
+    return svg;
+  } catch {
+    return null;
+  }
+}
+// re-drawn when its number changes
+const eqNumberWatch = new MutationObserver((records) => {
+  for (const r of records) if (r.target.classList && r.target.classList.contains('eq')) drawMath(r.target);
+});
+eqNumberWatch.observe($('#chapters'), { attributes: true, attributeFilter: ['data-num'], subtree: true });
+
+// A click on maths opens its TeX under it, drawn again as it is typed.
+// Enter keeps it, Esc leaves it as it was; emptied, the maths goes.
+function openMathEditor(node) {
+  closePaperPop();
+  const display = node.classList.contains('eq');
+  const was = node.textContent;
+  const pop = paperPop(node, 'math-pop');
+  pop.innerHTML = `<textarea class="mp-src" spellcheck="false" rows="${display ? 3 : 1}"></textarea>
+    <div class="mp-preview"></div><div class="mp-hint"></div>`;
+  const src = pop.querySelector('.mp-src');
+  const preview = pop.querySelector('.mp-preview');
+  src.value = was;
+  src.setAttribute('aria-label', display ? t('Equation, in TeX') : t('Maths, in TeX'));
+  pop.querySelector('.mp-hint').textContent = display
+    ? t('TeX · Enter to finish · ⇧Enter for a new line · Esc to leave it as it was')
+    : t('TeX · Enter to finish · Esc to leave it as it was');
+  const show = () => {
+    preview.innerHTML = '';
+    if (!src.value.trim()) return;
+    if (!mathReady()) { preview.textContent = t('Loading the maths…'); return; }
+    const svg = texSvg(src.value, display);
+    if (svg) preview.appendChild(svg);
+    else { preview.textContent = t('This TeX doesn’t parse yet'); preview.classList.add('bad'); return; }
+    preview.classList.remove('bad');
+  };
+  show();
+  src.addEventListener('input', () => { autoGrow(src); show(); });
+  autoGrow(src);
+  src.focus();
+  src.select();
+  const finish = (keep) => {
+    closePaperPop();
+    const body = node.closest('.chapter-body');
+    const field = body || node.closest('#tp-abstract');
+    const tex = keep ? src.value.trim() : was;
+    if (body && tex !== was) snapshotStructure('maths');
+    let caretAfter = node;
+    if (!tex) {
+      // emptied: the maths goes, the caret stays where it stood
+      const parent = node.parentElement;
+      const next = node.nextSibling;
+      node.remove();
+      if (display && parent && parent.matches('.chapter-body') && next && next.nodeName === 'P' && !next.textContent.trim() && next.previousElementSibling && next.previousElementSibling.matches('p') && !next.previousElementSibling.textContent.trim()) next.remove();
+      caretAfter = null;
+      if (next && next.isConnected) placeCaret(next.nodeType === 3 ? next : next, 0);
+    } else if (tex !== node.textContent) {
+      node.textContent = tex;
+      drawMath(node);
+    }
+    if (body) {
+      syncChapter(body, body.closest('.chapter').dataset.id);
+      if (tex !== was) { resetNativeUndo(); breakRun++; }
+    } else if (field) field.dispatchEvent(new Event('input'));
+    if (caretAfter && caretAfter.isConnected && field) {
+      field.focus({ preventScroll: true });
+      const r = document.createRange();
+      if (display) {
+        const next = caretAfter.nextElementSibling;
+        if (next && next.matches('p:not(.eq)')) r.setStart(next, 0); else r.setStartAfter(caretAfter);
+      } else r.setStartAfter(caretAfter);
+      r.collapse(true);
+      const s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+    }
+  };
+  src.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    else if (e.key === 'Enter' && !(display && e.shiftKey)) { e.preventDefault(); finish(true); }
+  });
+  pop.onAway = () => finish(true);
+}
+function autoGrow(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight + 2, 240) + 'px';
+}
+
+// ⌘⇧M: maths where the caret is — a display equation on an empty line,
+// inline maths in the middle of a sentence
+function paperInsertEquation() {
+  const body = paperCaretBody();
+  if (!body) return;
+  const block = caretBlock(body);
+  const chId = body.closest('.chapter').dataset.id;
+  if (!block || !block.textContent.trim()) {
+    snapshotStructure('equation');
+    const eq = makeDisplayEq('');
+    if (block) block.replaceWith(eq); else body.appendChild(eq);
+    if (!eq.nextElementSibling || !eq.nextElementSibling.matches('p:not(.eq)')) {
+      const after = document.createElement('p');
+      after.innerHTML = '<br>';
+      eq.after(after);
+    }
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    openMathEditor(eq);
+    return;
+  }
+  const sel = window.getSelection();
+  const selected = sel.isCollapsed ? '' : sel.toString();
+  const node = placeAtom(sel.getRangeAt(0), `<span class="math" contenteditable="false">${escHtml(selected)}</span>`, 'maths');
+  openMathEditor(node);
+}
+
+// The chapter the caret is in, or (from a menu, with the caret elsewhere)
+// the paper's own; null with a word to the writer when there's none
+function paperCaretBody() {
+  if (currentTab !== 'manuscript') switchTab('manuscript');
+  const sel = window.getSelection();
+  let el = sel && sel.rangeCount ? sel.anchorNode : null;
+  if (el && el.nodeType === 3) el = el.parentElement;
+  const body = el && el.closest ? el.closest('.chapter-body') : null;
+  if (body && !el.closest('figure')) return body;
+  toast(t('Click where it should go, in the paper, then try again'));
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  A small panel under something on the page (maths, a citation)     */
+/* ------------------------------------------------------------------ */
+
+let paperPopEl = null;
+function paperPop(anchor, cls) {
+  closePaperPop();
+  const pop = document.createElement('div');
+  pop.className = 'paper-pop ' + cls;
+  document.body.appendChild(pop);
+  paperPopEl = pop;
+  const place = () => {
+    if (!anchor.isConnected) { closePaperPop(); return; }
+    const r = anchor.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2)) + 'px';
+    const below = r.bottom + 8;
+    pop.style.top = (below + pop.offsetHeight > window.innerHeight - 8 ? Math.max(8, r.top - pop.offsetHeight - 8) : below) + 'px';
+  };
+  pop.place = place;
+  requestAnimationFrame(place);
+  setTimeout(() => {
+    const away = (e) => {
+      if (!paperPopEl || paperPopEl !== pop) { document.removeEventListener('mousedown', away, true); return; }
+      if (pop.contains(e.target)) return;
+      document.removeEventListener('mousedown', away, true);
+      if (pop.onAway) pop.onAway(); else closePaperPop();
+    };
+    document.addEventListener('mousedown', away, true);
+  }, 0);
+  $('#paper-scroll').addEventListener('scroll', place, { passive: true });
+  pop.unplace = () => $('#paper-scroll').removeEventListener('scroll', place);
+  return pop;
+}
+function closePaperPop() {
+  if (!paperPopEl) return;
+  const pop = paperPopEl;
+  paperPopEl = null;
+  if (pop.unplace) pop.unplace();
+  pop.remove();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Citations and the reference list                                  */
+/* ------------------------------------------------------------------ */
+
+const citeData = (node) => {
+  try {
+    const list = JSON.parse(node.dataset.cite || '[]');
+    return Array.isArray(list) ? list.filter((x) => x && typeof x.id === 'string' && NeoReferences.KEY.test(x.id)) : [];
+  } catch { return []; }
+};
+const citeAttr = (items) => escHtml(JSON.stringify(items)).replace(/"/g, '&quot;');
+const citeHtml = (items, narrative) => `<span class="cite" contenteditable="false"${narrative ? ' data-narrative=""' : ''} data-cite="${citeAttr(items)}">${escHtml(items.map((x) => '@' + x.id).join('; '))}</span>`;
+
+async function paperProcessor() {
+  const m = paperMeta();
+  let id = m.style || NeoCite.DEFAULT_STYLE;
+  if (paper.proc && paper.procStyle === id) return paper.proc;
+  if (!window.CSL) return null;
+  if (!paper.locales) {
+    const [us, gb] = await Promise.all([paperAsset('locales-en-US.xml'), paperAsset('locales-en-GB.xml')]);
+    paper.locales = { 'en-US': us, 'en-GB': gb };
+  }
+  if (id === 'custom' && !paper.styleXml.custom) {
+    const b64 = await window.neo.paperRead(book.id, 'style.csl');
+    if (b64) paper.styleXml.custom = new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+    else id = NeoCite.DEFAULT_STYLE; // style.csl hasn't arrived from the other device yet
+  }
+  let xml = paper.styleXml[id];
+  if (!xml) {
+    const known = NeoCite.STYLES.find((s) => s.id === id) || NeoCite.STYLES[0];
+    xml = paper.styleXml[id] = await paperAsset(known.file);
+  }
+  try {
+    paper.proc = NeoCite.processor({ style: xml, locales: paper.locales, items: paper.refs });
+  } catch (err) {
+    window.neo.logError('citation style: ' + (err && err.stack || err));
+    toast(t('That citation style didn’t load ({error}); using APA', { error: String(err && err.message || err) }), 8000);
+    m.style = NeoCite.DEFAULT_STYLE;
+    scheduleMetaSave();
+    return paperProcessor();
+  }
+  paper.procStyle = id;
+  return paper.proc;
+}
+
+let paperCiteTimer = null;
+function paperCiteSoon(ms = 150) {
+  clearTimeout(paperCiteTimer);
+  paperCiteTimer = setTimeout(paperCiteNow, ms);
+}
+// Every citation in reading order, set in the paper's style; then the list
+let paperCiting = Promise.resolve();
+function paperCiteNow() {
+  paperCiting = paperCiting.then(async () => {
+    if (!book || !isPaper()) return;
+    const proc = await paperProcessor();
+    if (!proc || !book || !isPaper()) return;
+    const nodes = [...document.querySelectorAll('#chapters .cite')];
+    const clusters = nodes.map((n, i) => ({ id: i, items: citeData(n), narrative: n.hasAttribute('data-narrative') }));
+    let out;
+    try {
+      out = proc.render(clusters);
+    } catch (err) {
+      window.neo.logError('citations: ' + (err && err.stack || err));
+      return;
+    }
+    const touched = new Set();
+    paper.citeText = new Map();
+    nodes.forEach((n, i) => {
+      const html = out.text.get(i);
+      const missing = citeData(n).filter((x) => out.missing.includes(x.id)).map((x) => x.id);
+      const shown = html ? paperSafe(html) : '(' + citeData(n).map((x) => '?' + escHtml(x.id)).join('; ') + ')';
+      if (n.innerHTML !== shown) { n.innerHTML = shown; touched.add(n.closest('.chapter-body')); }
+      paper.citeText.set(n, shown);
+      if (missing.length) {
+        n.setAttribute('data-missing', '');
+        n.dataset.state = t('Not in this paper’s references: {keys}', { keys: missing.join(', ') });
+      } else if (n.hasAttribute('data-missing')) {
+        n.removeAttribute('data-missing');
+        delete n.dataset.state;
+      }
+    });
+    // a citation set afresh is part of what the chapter says: saved with it
+    for (const body of touched) if (body) syncChapter(body, body.closest('.chapter').dataset.id);
+    paper.bibliography = proc.bibliography();
+    paper.cited = out.order;
+    paperShowRefs();
+    if (currentTab === 'references') paperLibraryRender();
+  });
+  return paperCiting;
+}
+
+// The reference list after the last page: made, never typed
+function paperRefsBlock(on) {
+  let el = $('#paper-refs');
+  if (!on) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('section');
+    el.id = 'paper-refs';
+    el.className = 'sheet';
+    $('#chapters').after(el);
+  }
+  paperShowRefs();
+}
+function paperShowRefs() {
+  const el = $('#paper-refs');
+  if (!el) return;
+  const bib = paper.bibliography;
+  el.innerHTML = '';
+  const h = document.createElement('h2');
+  h.textContent = t('References');
+  el.appendChild(h);
+  if (!bib || !bib.entries.length) {
+    const p = document.createElement('p');
+    p.className = 'pr-empty';
+    p.textContent = paper.refs.length
+      ? t('Cite with @ and the list makes itself here.')
+      : t('Cite with @. Paste a DOI after the @, or add references in the References tab.');
+    el.appendChild(p);
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'pr-list' + (bib.hanging ? ' hanging' : '') + (bib.numeric ? ' numeric' : '');
+  for (const e of bib.entries) {
+    const row = document.createElement('div');
+    row.className = 'pr-entry';
+    row.dataset.ref = e.id;
+    row.innerHTML = paperSafe(e.html);
+    list.appendChild(row);
+  }
+  el.appendChild(list);
+}
+// citeproc's HTML, rebuilt from what a citation or a reference can hold:
+// emphasis, sub/superscript, citeproc's own csl-* blocks, and links to
+// http(s) addresses. Reference data is anyone's (a .bib file, a DOI
+// lookup), so nothing else from it reaches the page or an export.
+function paperSafe(html, { links = false } = {}) {
+  const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html');
+  const out = (node) => [...node.childNodes].map((n) => {
+    if (n.nodeType === 3) return escHtml(n.data);
+    if (n.nodeType !== 1) return '';
+    const tag = n.tagName.toLowerCase();
+    const inner = out(n);
+    if (['i', 'b', 'sup', 'sub'].includes(tag)) return `<${tag}>${inner}</${tag}>`;
+    if (tag === 'em') return `<i>${inner}</i>`;
+    if (tag === 'strong') return `<b>${inner}</b>`;
+    const cls = /^csl-[\w-]+$/.test(n.className) ? ` class="${n.className}"` : '';
+    if (tag === 'div') return `<div${cls}>${inner}</div>`;
+    if (tag === 'span') {
+      const it = /font-style:\s*italic/.test(n.getAttribute('style') || '');
+      return it ? `<i>${inner}</i>` : cls ? `<span${cls}>${inner}</span>` : inner;
+    }
+    if (tag === 'a') {
+      const href = n.getAttribute('href') || '';
+      return links && /^https?:\/\//i.test(href) ? `<a href="${escHtml(href).replace(/"/g, '&quot;')}">${inner}</a>` : inner;
+    }
+    return inner;
+  }).join('');
+  return out(doc.body.firstChild);
+}
+
+/* ---- the @ picker: references to cite, and what can be referred to ---- */
+
+const picker = { el: null, body: null, at: null, rows: [], idx: 0, mode: 'all', busy: false };
+
+function pickerOpenOnAt(e, body) {
+  const sel = window.getSelection();
+  if (!sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  const block = caretBlock(body);
+  if (!block || block.classList.contains('eq')) return false;
+  const pre = document.createRange();
+  pre.selectNodeContents(block);
+  pre.setEnd(r.startContainer, r.startOffset);
+  const before = pre.toString();
+  // an @ that starts a word: not the one in an email address
+  if (before && !/[\s([{;,"“‘' ]$/.test(before)) return false;
+  e.preventDefault();
+  document.execCommand('insertText', false, '@');
+  pickerOpen(body, 'all');
+  return true;
+}
+
+function pickerOpen(body, mode) {
+  pickerClose();
+  const sel = window.getSelection();
+  const r = sel.getRangeAt(0);
+  if (r.startContainer.nodeType !== 3 || r.startOffset < 1 || r.startContainer.data[r.startOffset - 1] !== '@') return;
+  picker.body = body;
+  picker.at = { node: r.startContainer, offset: r.startOffset - 1 };
+  picker.mode = mode;
+  picker.idx = 0;
+  picker.el = document.createElement('div');
+  picker.el.className = 'paper-picker';
+  picker.el.setAttribute('role', 'listbox');
+  picker.el.addEventListener('mousedown', (e) => e.preventDefault());
+  document.body.appendChild(picker.el);
+  body.addEventListener('input', pickerUpdate);
+  document.addEventListener('selectionchange', pickerFollow);
+  pickerUpdate();
+}
+function pickerClose() {
+  if (!picker.el) return;
+  picker.el.remove();
+  picker.el = null;
+  if (picker.body) picker.body.removeEventListener('input', pickerUpdate);
+  document.removeEventListener('selectionchange', pickerFollow);
+  picker.body = null;
+}
+// what has been typed after the @, or null once the caret has left it
+function pickerQuery() {
+  const { node, offset } = picker.at;
+  const sel = window.getSelection();
+  if (!node.isConnected || !sel.rangeCount || !sel.isCollapsed) return null;
+  const r = sel.getRangeAt(0);
+  if (r.startContainer !== node || r.startOffset <= offset || node.data[offset] !== '@') return null;
+  const q = node.data.slice(offset + 1, r.startOffset);
+  return /\n/.test(q) || q.length > 120 ? null : q;
+}
+function pickerFollow() {
+  if (picker.el && pickerQuery() === null && !picker.busy) pickerClose();
+}
+function pickerUpdate() {
+  if (!picker.el) return;
+  const q = pickerQuery();
+  if (q === null) { pickerClose(); return; }
+  const rows = [];
+  const ident = NeoReferences.findIdentifier(q);
+  if (ident && picker.mode !== 'xref') rows.push({ kind: 'lookup', ident });
+  const words = q.trim().toLowerCase();
+  if (picker.mode !== 'xref' && !ident) {
+    paper.refs.map((it) => ({ it, s: NeoReferences.score(it, words) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s || NeoReferences.shortLabel(a.it).localeCompare(NeoReferences.shortLabel(b.it)))
+      .slice(0, picker.mode === 'cite' ? 8 : 6)
+      .forEach((x) => rows.push({ kind: 'ref', item: x.it }));
+  }
+  if (picker.mode !== 'cite' && !ident) {
+    // "fig", "tab", "eq", "sec" narrow it to those
+    const kindWord = /^(fig|tab|tbl|eq|sec)\w*:?\s*/.exec(words);
+    const want = kindWord ? { fig: 'fig', tab: 'tbl', tbl: 'tbl', eq: 'eq', sec: 'sec' }[kindWord[1]] : null;
+    const rest = kindWord ? words.slice(kindWord[0].length) : words;
+    paperTargets()
+      .filter((x) => (!want || x.kind === want) && (!rest || (x.label + ' ' + x.text).toLowerCase().includes(rest)))
+      .slice(0, want || picker.mode === 'xref' ? 10 : 4)
+      .forEach((x) => rows.push({ kind: 'label', target: x }));
+  }
+  if (!rows.length) {
+    // nothing matches, and nothing ever will at this point: the @ is just an @
+    if (words.length > 2 && /\s$/.test(q)) { pickerClose(); return; }
+    rows.push({ kind: 'hint' });
+  }
+  picker.rows = rows;
+  picker.idx = Math.min(picker.idx, rows.length - 1);
+  pickerDraw(q);
+}
+function pickerDraw(q) {
+  const el = picker.el;
+  el.innerHTML = '';
+  picker.rows.forEach((row, i) => {
+    const item = document.createElement('div');
+    item.className = 'pp-row pp-' + row.kind + (i === picker.idx ? ' active' : '');
+    item.setAttribute('role', 'option');
+    const main = document.createElement('span');
+    main.className = 'pp-main';
+    const sub = document.createElement('span');
+    sub.className = 'pp-sub';
+    if (row.kind === 'ref') {
+      main.textContent = NeoReferences.shortLabel(row.item);
+      sub.textContent = row.item.title || row.item.id;
+    } else if (row.kind === 'label') {
+      main.textContent = row.target.label;
+      sub.textContent = row.target.text;
+    } else if (row.kind === 'lookup') {
+      main.textContent = picker.busy ? t('Looking it up…') : (row.ident.type === 'doi' ? t('Look up DOI {id}', { id: row.ident.id }) : t('Look up arXiv {id}', { id: row.ident.id }));
+      sub.textContent = picker.busy ? '' : t('Enter adds it to the references and cites it');
+    } else {
+      main.textContent = paper.refs.length || picker.mode === 'xref' ? t('Nothing matches “{q}”', { q }) : t('No references yet');
+      sub.textContent = picker.mode === 'xref'
+        ? t('Headings, figures, tables and equations can be referred to')
+        : t('Paste a DOI or arXiv ID after the @, or drop a .bib file on the page · Esc keeps the @');
+    }
+    item.append(main, sub);
+    if (row.kind !== 'hint') item.addEventListener('click', () => { picker.idx = i; pickerChoose(); });
+    el.appendChild(item);
+  });
+  // under the @, kept on screen
+  const r = document.createRange();
+  r.setStart(picker.at.node, picker.at.offset);
+  r.setEnd(picker.at.node, picker.at.offset + 1);
+  const box = r.getBoundingClientRect();
+  const w = el.offsetWidth;
+  el.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, box.left - 12)) + 'px';
+  const below = box.bottom + 6;
+  el.style.top = (below + el.offsetHeight > window.innerHeight - 8 ? Math.max(8, box.top - el.offsetHeight - 6) : below) + 'px';
+}
+function pickerKey(e) {
+  if (!picker.el) return false;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const n = picker.rows.length;
+    picker.idx = (picker.idx + (e.key === 'ArrowDown' ? 1 : -1) + n) % n;
+    pickerDraw(pickerQuery() || '');
+    return true;
+  }
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    if (picker.rows[picker.idx] && picker.rows[picker.idx].kind !== 'hint') {
+      e.preventDefault();
+      pickerChoose();
+      return true;
+    }
+    pickerClose();
+    return false;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    pickerClose();
+    return true;
+  }
+  return false;
+}
+async function pickerChoose() {
+  const row = picker.rows[picker.idx];
+  if (!row || picker.busy) return;
+  if (row.kind === 'lookup') {
+    picker.busy = true;
+    pickerDraw(pickerQuery() || '');
+    let item = null;
+    try {
+      item = await paperLookup(row.ident);
+    } catch (err) {
+      toast(t('Couldn’t look that up: {error}', { error: plainError(err) }), 8000);
+    } finally {
+      picker.busy = false;
+    }
+    if (!item || !picker.el) { if (picker.el) pickerUpdate(); return; }
+    pickerInsert(citeHtml([{ id: item.id }]));
+    toast(t('Added to the references: {ref}', { ref: NeoReferences.shortLabel(item) }));
+    return;
+  }
+  if (row.kind === 'ref') pickerInsert(citeHtml([{ id: row.item.id }]), row.item.id);
+  else if (row.kind === 'label') pickerInsert(`<span class="xref" contenteditable="false" data-ref="${escHtml(row.target.id)}">${escHtml(row.target.label)}</span>`);
+}
+// The @ and what was typed after it become the citation. One right after
+// another citation (only a space between) joins it: @smith then @doe is
+// (Smith, 2020; Doe, 2019).
+function pickerInsert(html, refId) {
+  const q = pickerQuery();
+  const { node, offset } = picker.at;
+  pickerClose();
+  if (q === null) return;
+  const r = document.createRange();
+  r.setStart(node, offset);
+  r.setEnd(node, offset + 1 + q.length);
+  if (refId) {
+    const prev = offset === 0 || /^\s?$/.test(node.data.slice(0, offset)) ? node.previousSibling : null;
+    const gap = node.data.slice(0, offset);
+    if (prev && prev.nodeType === 1 && prev.classList.contains('cite') && /^ ?$/.test(gap)) {
+      const items = citeData(prev);
+      if (!items.some((x) => x.id === refId)) items.push({ id: refId });
+      r.setStartBefore(prev);
+      html = citeHtml(items, prev.hasAttribute('data-narrative'));
+    }
+  }
+  placeAtom(r, html, 'citation');
+  paperCiteSoon(0);
+  paperRenumberSoon();
+}
+
+// Insert → Citation… (⌘⇧K) and Cross-Reference…: the same picker, opened
+// on an @ typed for the writer
+function paperPickAtCaret(mode) {
+  const body = paperCaretBody();
+  if (!body) return;
+  const sel = window.getSelection();
+  if (!sel.isCollapsed) sel.collapseToEnd();
+  const block = caretBlock(body);
+  const pre = document.createRange();
+  if (block) {
+    pre.selectNodeContents(block);
+    const r = sel.getRangeAt(0);
+    pre.setEnd(r.startContainer, r.startOffset);
+  }
+  const before = block ? pre.toString() : '';
+  document.execCommand('insertText', false, (before && !/\s$/.test(before) ? ' ' : '') + '@');
+  pickerOpen(body, mode);
+}
+
+/* ---- a citation, clicked: pages, prefix, who's named, what's in it ---- */
+
+function openCitePop(node) {
+  const body = node.closest('.chapter-body');
+  if (!body) return;
+  const pop = paperPop(node, 'cite-pop');
+  const draw = () => {
+    const items = citeData(node);
+    pop.innerHTML = '';
+    items.forEach((x, i) => {
+      const it = paper.refs.find((r) => r.id === x.id);
+      const row = document.createElement('div');
+      row.className = 'cp-row';
+      const name = document.createElement('div');
+      name.className = 'cp-name';
+      name.textContent = it ? NeoReferences.shortLabel(it) : t('{key} (not in the references)', { key: x.id });
+      if (it && it.title) name.title = it.title;
+      const fields = document.createElement('div');
+      fields.className = 'cp-fields';
+      const input = (cls, ph, value, apply) => {
+        const el = document.createElement('input');
+        el.className = cls;
+        el.placeholder = ph;
+        el.setAttribute('aria-label', ph);
+        el.value = value || '';
+        el.spellcheck = false;
+        el.addEventListener('change', () => { apply(el.value.trim()); commit(items); });
+        el.addEventListener('keydown', (e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter') { e.preventDefault(); el.blur(); closePaperPop(); }
+          if (e.key === 'Escape') { e.preventDefault(); closePaperPop(); }
+        });
+        return el;
+      };
+      fields.append(
+        input('cp-prefix', t('before, e.g. see'), x.prefix, (v) => { if (v) x.prefix = v; else delete x.prefix; }),
+        input('cp-loc', t('page, e.g. 12 or pp. 4–6'), x.locator ? (x.label && x.label !== 'page' ? x.label + ' ' : '') + x.locator : '', (v) => {
+          const loc = NeoCite.parseLocator(v);
+          if (loc.locator) { x.locator = loc.locator; x.label = loc.label; } else { delete x.locator; delete x.label; }
+        })
+      );
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'cp-del';
+      del.textContent = '×';
+      del.title = t('Take this reference out of the citation');
+      del.setAttribute('aria-label', del.title);
+      del.onclick = () => {
+        items.splice(i, 1);
+        if (!items.length) { closePaperPop(); removeNode(node); return; }
+        commit(items);
+        draw();
+      };
+      row.append(name, fields, del);
+      pop.appendChild(row);
+    });
+    const foot = document.createElement('label');
+    foot.className = 'cp-narrative';
+    foot.innerHTML = '<input type="checkbox"> <span></span>';
+    foot.querySelector('span').textContent = t('Name the authors in the sentence: Smith (2020)');
+    foot.querySelector('input').checked = node.hasAttribute('data-narrative');
+    foot.querySelector('input').onchange = (e) => {
+      node.toggleAttribute('data-narrative', e.target.checked);
+      commit(citeData(node));
+    };
+    pop.appendChild(foot);
+    const hint = document.createElement('div');
+    hint.className = 'cp-hint';
+    hint.textContent = t('To cite another work here, type @ right after this citation');
+    pop.appendChild(hint);
+    if (pop.place) pop.place();
+  };
+  const commit = (items) => {
+    node.dataset.cite = JSON.stringify(items);
+    syncChapter(body, body.closest('.chapter').dataset.id);
+    paperCiteSoon(0);
+  };
+  draw();
+}
+// a citation, cross-reference or maths taken out by the writer: ⌘Z brings it back
+function removeNode(node) {
+  const body = node.closest('.chapter-body');
+  if (!body) { node.remove(); return; }
+  body.focus({ preventScroll: true });
+  const r = document.createRange();
+  r.selectNode(node);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+  document.execCommand('delete');
+}
+
+// a DOI or arXiv ID to a reference in this paper's list (the one already
+// there if it is)
+async function paperLookup(ident) {
+  const doi = NeoReferences.identifierDoi(ident);
+  const known = paper.refs.find((r) => r.DOI && r.DOI.toLowerCase() === doi.toLowerCase());
+  if (known) return known;
+  if (!window.neo.paperLookup) throw new Error(t('looking up needs the desktop app'));
+  const csl = await window.neo.paperLookup(doi);
+  const item = paperTidyLookup(csl, doi);
+  const { items, added, updated } = NeoReferences.mergeReferences(paper.refs, [item]);
+  await paperSaveRefs(items);
+  return paper.refs.find((r) => r.id === (added[0] || updated[0]));
+}
+// doi.org's CSL JSON carries more than a reference needs
+function paperTidyLookup(csl, doi) {
+  const keep = ['type', 'title', 'author', 'editor', 'container-title', 'collection-title', 'volume', 'issue', 'page',
+    'publisher', 'publisher-place', 'issued', 'DOI', 'URL', 'ISBN', 'ISSN', 'edition', 'number', 'genre', 'abstract'];
+  const it = {};
+  for (const k of keep) if (csl[k] !== undefined && csl[k] !== '' && !(Array.isArray(csl[k]) && !csl[k].length)) it[k] = csl[k];
+  for (const k of ['container-title', 'title', 'ISSN', 'ISBN']) if (Array.isArray(it[k])) it[k] = it[k][0];
+  if (!it.issued && csl.published) it.issued = csl.published;
+  if (!it.issued && csl['published-print']) it.issued = csl['published-print'];
+  if (!it.issued && csl['published-online']) it.issued = csl['published-online'];
+  if (it.issued && it.issued['date-parts']) it.issued = { 'date-parts': [it.issued['date-parts'][0].filter((x) => x != null)] };
+  it.DOI = it.DOI || doi;
+  if (it.abstract) it.abstract = it.abstract.replace(/<[^>]+>/g, '').trim();
+  if (it.type === 'journal-article') it.type = 'article-journal';
+  if (it.type === 'posted-content' || /arxiv/i.test(it.DOI)) {
+    it.type = 'article';
+    if (!it['container-title'] && /arxiv/i.test(it.DOI)) it['container-title'] = 'arXiv';
+  }
+  if (it.author) {
+    it.author = it.author.map((a) => {
+      const n = {};
+      for (const k of ['family', 'given', 'literal', 'suffix', 'non-dropping-particle', 'dropping-particle']) if (a[k]) n[k] = a[k];
+      return n;
+    });
+  }
+  return it;
+}
+
+// The references to disk. references.json syncs like the chapters do, so
+// what another device added since NEO last read it is kept: a reference
+// there and not here comes in (by key) before the write, never lost to it.
+let refsWriting = 0;
+async function paperSaveRefs(items) {
+  const bookId = book.id;
+  const disk = await window.neo.readJSON(bookId, 'references', []);
+  if (!book || book.id !== bookId) return;
+  if (Array.isArray(disk) && JSON.stringify(disk) !== paper.refsSaved) {
+    const saved = new Set(JSON.parse(paper.refsSaved || '[]').map((r) => r.id));
+    const mine = new Set(items.map((r) => r.id));
+    // new over there (not just something deleted here)
+    const theirs = disk.filter((r) => r && !mine.has(String(r.id)) && !saved.has(String(r.id)));
+    if (theirs.length) items = NeoReferences.mergeReferences(items, theirs, { keepKeys: true }).items;
+  }
+  paper.refs = items;
+  if (paper.proc) paper.proc.setItems(items);
+  const json = JSON.stringify(items);
+  if (json !== paper.refsSaved) {
+    refsWriting++;
+    try {
+      await window.neo.writeJSON(bookId, 'references', items);
+      paper.refsSaved = json;
+    } finally {
+      refsWriting--;
+    }
+  }
+  paperCiteSoon(0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Figures: an image dropped, pasted or picked, with its caption      */
+/* ------------------------------------------------------------------ */
+
+const FIGURE_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/svg+xml': 'svg' };
+const FIGURE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' };
+
+function figureUrl(name) {
+  if (!paper.figures.has(name)) {
+    paper.figures.set(name, window.neo.paperRead(book.id, name).then((b64) => {
+      if (!b64) return null;
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      return URL.createObjectURL(new Blob([bytes], { type: FIGURE_MIME[name.split('.').pop()] || 'application/octet-stream' }));
+    }).catch(() => null));
+  }
+  return paper.figures.get(name);
+}
+function loadFigure(fig) {
+  const img = fig.querySelector('img') || fig.insertBefore(document.createElement('img'), fig.firstChild);
+  const name = fig.dataset.src;
+  if (!name || (img.getAttribute('src') || '').startsWith('blob:')) return;
+  figureUrl(name).then((url) => {
+    if (url) { img.src = url; fig.removeAttribute('data-missing'); } else fig.setAttribute('data-missing', '');
+  });
+}
+
+// An image file into the paper's folder, then onto the page after the
+// caret's paragraph (or in place of an empty one)
+async function paperAddFigure(file, body, at = null) {
+  const ext = FIGURE_TYPES[file.type];
+  if (!ext) { toast(t('A figure can be a PNG, JPEG, GIF, WebP or SVG picture')); return; }
+  if (file.size > 40 * 1024 * 1024) { toast(t('That picture is over 40 MB — save a smaller copy and try again')); return; }
+  const id = paperId('fig');
+  const name = `figure-${id.slice(4)}.${ext}`;
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let b64 = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) b64 += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  try {
+    await window.neo.paperWrite(book.id, name, btoa(b64));
+  } catch (err) {
+    toast(t('Couldn’t save the figure: {error}', { error: plainError(err) }), 8000);
+    return;
+  }
+  const chId = body.closest('.chapter').dataset.id;
+  snapshotStructure('figure');
+  const fig = document.createElement('figure');
+  fig.className = 'fig';
+  fig.contentEditable = 'false';
+  fig.dataset.id = id;
+  fig.dataset.src = name;
+  const img = document.createElement('img');
+  img.alt = '';
+  const cap = document.createElement('figcaption');
+  cap.contentEditable = 'true';
+  fig.append(img, cap);
+  placeBlock(fig, body, at);
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+  loadFigure(fig);
+  paperRenumber();
+  cap.focus();
+}
+// A block (figure, table) goes after the paragraph the caret is in, or in
+// place of an empty one; a paragraph follows it, to write on
+function placeBlock(el, body, at) {
+  const block = at || caretBlock(body);
+  if (block && body.contains(block) && block.matches('p') && !block.textContent.trim() && !block.classList.contains('eq')) block.replaceWith(el);
+  else if (block && body.contains(block)) block.after(el);
+  else body.appendChild(el);
+  const next = el.nextElementSibling;
+  if (!next || !next.matches('p:not(.eq)') || headingOf(next)) {
+    const p = document.createElement('p');
+    p.innerHTML = '<br>';
+    el.after(p);
+  }
+}
+function pickFile(accept) {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = accept;
+    input.onchange = () => resolve(input.files[0] || null);
+    input.click();
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Tables: pasted from a spreadsheet, or made empty, edited in place  */
+/* ------------------------------------------------------------------ */
+
+function makeTable(rows, header = true) {
+  const fig = document.createElement('figure');
+  fig.className = 'tbl';
+  fig.contentEditable = 'false';
+  fig.dataset.id = paperId('tab');
+  const cap = document.createElement('figcaption');
+  cap.contentEditable = 'true';
+  const table = document.createElement('table');
+  const width = Math.max(1, ...rows.map((r) => r.length));
+  rows.forEach((cells, i) => {
+    const tr = document.createElement('tr');
+    for (let k = 0; k < width; k++) {
+      const c = document.createElement(header && i === 0 ? 'th' : 'td');
+      c.contentEditable = 'true';
+      c.innerHTML = cells[k] || '';
+      tr.appendChild(c);
+    }
+    table.appendChild(tr);
+  });
+  fig.append(cap, table);
+  return fig;
+}
+function paperInsertTable(rows = [['', '', ''], ['', '', ''], ['', '', '']], header = true) {
+  const body = paperCaretBody();
+  if (!body) return;
+  snapshotStructure('table');
+  const fig = makeTable(rows, header);
+  placeBlock(fig, body);
+  syncChapter(body, body.closest('.chapter').dataset.id);
+  resetNativeUndo();
+  breakRun++;
+  paperRenumber();
+  const first = fig.querySelector('th, td');
+  if (first && !first.textContent) placeCaret(first, 0); else fig.querySelector('figcaption').focus();
+}
+// Cells from the clipboard: an HTML table (Excel, Sheets, Numbers, Word)
+// or tab-separated lines; null when it isn't a table
+function clipboardTable(html, text) {
+  if (html && /<table/i.test(html)) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const table = doc.querySelector('table');
+    const rows = [...table.querySelectorAll('tr')].map((tr) => [...tr.querySelectorAll('th, td')].map((c) => cellHtml(c)));
+    if (rows.length && rows.some((r) => r.length)) return { rows, header: !!table.querySelector('th') || rows.length > 1 };
+  }
+  if (text && /\t/.test(text) && /\n/.test(text.trim())) {
+    const rows = text.replace(/\r/g, '').replace(/\n$/, '').split('\n').map((l) => l.split('\t').map((c) => escHtml(c.trim())));
+    if (rows.length > 1 && rows.every((r) => r.length > 1)) return { rows, header: true };
+  }
+  return null;
+}
+// a cell's own words, with its italics, bold and sub/superscripts
+function cellHtml(cell) {
+  const out = (node) => [...node.childNodes].map((n) => {
+    if (n.nodeType === 3) return escHtml(n.data.replace(/\s+/g, ' '));
+    if (n.nodeType !== 1) return '';
+    const tag = n.tagName.toLowerCase();
+    const st = n.getAttribute('style') || '';
+    let inner = out(n);
+    if (tag === 'i' || tag === 'em' || /font-style:\s*italic/.test(st)) inner = `<i>${inner}</i>`;
+    if (tag === 'b' || tag === 'strong' || /font-weight:\s*(bold|[6-9]00)/.test(st)) inner = `<b>${inner}</b>`;
+    if (tag === 'sub' || tag === 'sup') inner = `<${tag}>${inner}</${tag}>`;
+    if (tag === 'br') return ' ';
+    return inner;
+  }).join('');
+  return out(cell).trim();
+}
+
+// Keys inside a figure's caption or a table's cells
+function figureKey(e, body, chId) {
+  const cell = e.target.closest('th, td');
+  const fig = e.target.closest('figure');
+  if (e.key === 'Tab' && cell) {
+    e.preventDefault();
+    const cells = [...fig.querySelectorAll('th, td')];
+    const i = cells.indexOf(cell) + (e.shiftKey ? -1 : 1);
+    if (i >= cells.length) {
+      // Tab in the last cell: a new row
+      const tr = cell.closest('tr').cloneNode(true);
+      for (const c of tr.children) {
+        const td = document.createElement('td');
+        td.contentEditable = 'true';
+        c.replaceWith(td);
+      }
+      cell.closest('tr').after(tr);
+      syncChapter(body, chId);
+      placeCaret(tr.firstElementChild, 0);
+      return true;
+    }
+    if (i < 0) { fig.querySelector('figcaption').focus(); return true; }
+    const r = document.createRange();
+    r.selectNodeContents(cells[i]);
+    const s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+    cells[i].focus();
+    return true;
+  }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (cell) {
+      // down a row, as in a spreadsheet
+      const tr = cell.closest('tr');
+      const k = [...tr.children].indexOf(cell);
+      const next = tr.nextElementSibling;
+      if (next && next.children[k]) { placeCaret(next.children[k], 0); next.children[k].focus(); return true; }
+    } else if (e.target.matches('figcaption') && fig.classList.contains('tbl')) {
+      const first = fig.querySelector('th, td');
+      if (first) { first.focus(); placeCaret(first, 0); return true; }
+    }
+    // out of the figure, to the paragraph after it
+    let after = fig.nextElementSibling;
+    if (!after || !after.matches('p:not(.eq)')) {
+      after = document.createElement('p');
+      after.innerHTML = '<br>';
+      fig.after(after);
+      syncChapter(body, chId);
+    }
+    body.focus({ preventScroll: true });
+    placeCaret(after, 0);
+    return true;
+  }
+  if (e.key === 'Enter') { e.preventDefault(); document.execCommand('insertLineBreak'); return true; }
+  // a caption and cells are short: no breaks, no chapters, no poetry
+  return e.key === 'Tab';
+}
+
+// Words a table or figure takes with it go to Darlings, the way a deleted
+// chapter's do, and the writer is told
+async function paperToDarlings(text, what) {
+  if (!text.trim()) return;
+  darlings.push({
+    id: 'd-' + Date.now().toString(36),
+    html: text.split('\n').map((l) => `<p>${escHtml(l)}</p>`).join(''),
+    text: text.slice(0, 2000),
+    chapterId: null,
+    chapterLabel: what,
+    date: new Date().toISOString()
+  });
+  await window.neo.writeJSON(book.id, 'darlings', darlings);
+  toast(t('{what} removed — its words are in Darlings, or {key} to undo', { what, key: KZ }));
+}
+const cellsText = (cells) => cells.map((c) => c.textContent.trim()).filter(Boolean);
+
+async function tableMenu(e, cell) {
+  const fig = cell.closest('figure.tbl');
+  const tr = cell.closest('tr');
+  const col = [...tr.children].indexOf(cell);
+  const rows = [...fig.querySelectorAll('tr')];
+  const hasHeader = !!rows[0].querySelector('th');
+  const choice = await popMenu(e.clientX, e.clientY, [
+    { label: t('Insert Row Above'), value: 'rowAbove' }, { label: t('Insert Row Below'), value: 'rowBelow' },
+    { label: t('Insert Column Left'), value: 'colLeft' }, { label: t('Insert Column Right'), value: 'colRight' },
+    '-',
+    { label: t('Delete Row'), value: 'rowDel', disabled: rows.length < 2 },
+    { label: t('Delete Column'), value: 'colDel', disabled: tr.children.length < 2 },
+    '-',
+    { label: t('Header Row'), value: 'header', checked: hasHeader },
+    { label: t('Copy a Reference to This Table'), value: 'xref' },
+    '-',
+    { label: t('Delete Table'), value: 'delete', danger: true }
+  ], { title: t('Table') });
+  if (!choice) return;
+  const body = fig.closest('.chapter-body');
+  const chId = body.closest('.chapter').dataset.id;
+  if (choice === 'xref') { copyXref(fig); return; }
+  snapshotStructure('table');
+  const newCell = (tag) => { const c = document.createElement(tag); c.contentEditable = 'true'; return c; };
+  if (choice === 'rowAbove' || choice === 'rowBelow') {
+    const row = document.createElement('tr');
+    for (let k = 0; k < tr.children.length; k++) row.appendChild(newCell('td'));
+    if (choice === 'rowAbove') tr.before(row); else tr.after(row);
+  } else if (choice === 'colLeft' || choice === 'colRight') {
+    for (const r of rows) {
+      const ref = r.children[col];
+      const c = newCell(ref && ref.tagName === 'TH' ? 'th' : 'td');
+      if (!ref) r.appendChild(c); else if (choice === 'colLeft') ref.before(c); else ref.after(c);
+    }
+  } else if (choice === 'rowDel') {
+    await paperToDarlings(cellsText([...tr.children]).join('\t'), t('A table row'));
+    tr.remove();
+  } else if (choice === 'colDel') {
+    await paperToDarlings(cellsText(rows.map((r) => r.children[col]).filter(Boolean)).join('\n'), t('A table column'));
+    for (const r of rows) if (r.children[col]) r.children[col].remove();
+  }
+  else if (choice === 'header') {
+    for (const c of [...rows[0].children]) {
+      const n = newCell(hasHeader ? 'td' : 'th');
+      n.innerHTML = c.innerHTML;
+      c.replaceWith(n);
+    }
+  } else if (choice === 'delete') {
+    const cap = fig.querySelector('figcaption').textContent.trim();
+    await paperToDarlings([cap, ...rows.map((r) => cellsText([...r.children]).join('\t'))].filter(Boolean).join('\n'), t('Table {n}', { n: fig.dataset.num || '' }));
+    fig.remove();
+  }
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+  paperRenumber();
+}
+
+async function figureMenu(e, fig) {
+  const width = fig.dataset.width || '100';
+  const choice = await popMenu(e.clientX, e.clientY, [
+    { label: t('Full Width'), value: 'w100', checked: width === '100' },
+    { label: t('Two-Thirds Width'), value: 'w67', checked: width === '67' },
+    { label: t('Half Width'), value: 'w50', checked: width === '50' },
+    '-',
+    { label: t('Description for Screen Readers…'), value: 'alt' },
+    { label: t('Replace Picture…'), value: 'replace' },
+    { label: t('Copy a Reference to This Figure'), value: 'xref' },
+    '-',
+    { label: t('Delete Figure'), value: 'delete', danger: true }
+  ], { title: t('Figure {n}', { n: fig.dataset.num || '' }) });
+  if (!choice) return;
+  const body = fig.closest('.chapter-body');
+  const chId = body.closest('.chapter').dataset.id;
+  if (choice === 'xref') { copyXref(fig); return; }
+  if (choice === 'alt') {
+    const img = fig.querySelector('img');
+    const v = await askInput(t('Describe the figure'), t('What it shows, for someone who can’t see it'), img.alt || '');
+    if (v === null) return;
+    img.alt = v;
+    syncChapter(body, chId);
+    return;
+  }
+  if (choice === 'replace') {
+    const file = await pickFile('image/png,image/jpeg,image/gif,image/webp,image/svg+xml');
+    if (!file) return;
+    const ext = FIGURE_TYPES[file.type];
+    if (!ext) return;
+    const name = `figure-${paperId('x').slice(2)}.${ext}`;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let b64 = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) b64 += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    await window.neo.paperWrite(book.id, name, btoa(b64));
+    snapshotStructure('figure');
+    fig.dataset.src = name;
+    fig.querySelector('img').removeAttribute('src');
+    loadFigure(fig);
+    syncChapter(body, chId);
+    return;
+  }
+  snapshotStructure('figure');
+  if (choice === 'delete') {
+    // the caption's words go to Darlings; the picture stays in the paper's folder
+    await paperToDarlings(fig.querySelector('figcaption').textContent.trim(), t('Figure {n}', { n: fig.dataset.num || '' }));
+    fig.remove();
+  }
+  else if (choice.startsWith('w')) { if (choice === 'w100') delete fig.dataset.width; else fig.dataset.width = choice.slice(1); }
+  syncChapter(body, chId);
+  resetNativeUndo();
+  breakRun++;
+  paperRenumber();
+}
+// A reference to a figure or table, ready to paste anywhere in the paper
+function copyXref(el) {
+  const tgt = paper.targets && paper.targets.get(el.dataset.id);
+  const label = tgt ? tgt.label : '';
+  const html = `<span class="xref" contenteditable="false" data-ref="${escHtml(el.dataset.id)}">${escHtml(label)}</span>`;
+  const done = () => toast(t('Copied: paste it where the paper mentions {what}', { what: label }));
+  if (navigator.clipboard && window.ClipboardItem) {
+    navigator.clipboard.write([new ClipboardItem({ 'text/html': new Blob([html], { type: 'text/html' }), 'text/plain': new Blob([label], { type: 'text/plain' }) })]).then(done, () => {});
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Paste and drop                                                    */
+/* ------------------------------------------------------------------ */
+
+// From the chapter's paste: a picture becomes a figure; a spreadsheet, a
+// table; a paper's own pieces (copied from here) keep what they are; text
+// with $maths$ and [@citations] (Markdown, Pandoc) has them made. Anything
+// else is left to NEO's own paste. true = handled.
+function paperPaste(e, body, chId) {
+  if (e.target !== body && e.target.closest && e.target.closest('figure')) {
+    // into a caption or a cell: words only
+    e.preventDefault();
+    document.execCommand('insertText', false, (e.clipboardData.getData('text/plain') || '').replace(/\s*\n\s*/g, ' '));
+    return true;
+  }
+  const files = [...(e.clipboardData.files || [])].filter((f) => FIGURE_TYPES[f.type]);
+  const html = e.clipboardData.getData('text/html');
+  const text = e.clipboardData.getData('text/plain');
+  if (files.length && !(html && /<(p|span|div)\b/i.test(html) && !/<img\b/i.test(html))) {
+    e.preventDefault();
+    paperAddFigure(files[0], body);
+    return true;
+  }
+  const table = clipboardTable(html, text);
+  if (table) {
+    e.preventDefault();
+    snapshotStructure('table');
+    const fig = makeTable(table.rows, table.header);
+    placeBlock(fig, body);
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    paperRenumber();
+    fig.querySelector('figcaption').focus();
+    return true;
+  }
+  if (html && /class="(?:cite|xref|math|eq|fig|tbl|h[123])\b/.test(html)) {
+    e.preventDefault();
+    const clean = paperPasteHtml(html);
+    document.execCommand('insertHTML', false, clean);
+    stripJunkSpans(body);
+    return true;
+  }
+  if (!html && text && (/\$[^$\s][^$]*\$/.test(text) || /\[@[\w:.#$%&+?<>~/-]+/.test(text))) {
+    e.preventDefault();
+    const parts = text.replace(/\r/g, '').split(/\n+/).filter((p) => p.trim());
+    const out = parts.map((p) => {
+      let s = escHtml(p.trim());
+      s = s.replace(/\[((?:[^\]]*?@[\w:.#$%&+?<>~/-]+[^\]]*?))\]/g, (m, inner) => {
+        const items = inner.split(';').map((bit) => {
+          const mm = /^\s*(.*?)\s*@([\w:.#$%&+?<>~/-]+)\s*,?\s*(.*?)\s*$/.exec(bit);
+          if (!mm) return null;
+          const x = { id: mm[2] };
+          if (mm[1]) x.prefix = mm[1];
+          const loc = NeoCite.parseLocator(mm[3]);
+          if (loc.locator) { x.locator = loc.locator; x.label = loc.label; }
+          return x;
+        }).filter(Boolean);
+        return items.length ? citeHtml(items) : m;
+      });
+      s = s.replace(/\$\$([^$]+)\$\$/g, (m, tex) => `<span class="math" contenteditable="false">${tex}</span>`);
+      s = s.replace(/(^|[^\\$\w])\$([^\s$](?:[^$]*?[^\s$\\])?)\$(?!\d)/g, (m, pre, tex) => `${pre}<span class="math" contenteditable="false">${tex}</span>`);
+      return s;
+    });
+    out.forEach((line, i) => {
+      if (i > 0) document.execCommand('insertParagraph');
+      document.execCommand('insertHTML', false, line);
+    });
+    stripJunkSpans(body);
+    return true;
+  }
+  return false;
+}
+// Pieces copied out of a paper, kept; everything else reduced as NEO reduces it
+function paperPasteHtml(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const out = (node) => [...node.childNodes].map((n) => {
+    if (n.nodeType === 3) return escHtml(n.data);
+    if (n.nodeType !== 1) return '';
+    const tag = n.tagName.toLowerCase();
+    const cls = n.classList;
+    if (cls.contains('cite')) return citeHtml(citeData(n), n.hasAttribute('data-narrative'));
+    if (cls.contains('xref')) return `<span class="xref" contenteditable="false" data-ref="${escHtml(n.dataset.ref || '')}">${escHtml(n.textContent)}</span>`;
+    if (cls.contains('math')) return `<span class="math" contenteditable="false">${escHtml(n.textContent)}</span>`;
+    if (cls.contains('eq')) return `<p class="eq" contenteditable="false" data-id="${paperId('eq')}">${escHtml(n.textContent)}</p>`;
+    // a figure or a table is made again from its parts: nothing else in
+    // the clipboard's markup comes along
+    if (tag === 'figure' && cls.contains('tbl')) {
+      const rows = [...n.querySelectorAll('tr')].map((tr) => [...tr.querySelectorAll('th, td')].map((c) => cellHtml(c)));
+      const fig = makeTable(rows.length ? rows : [['']], !!n.querySelector('tr:first-child th'));
+      const cap = n.querySelector('figcaption');
+      fig.querySelector('figcaption').innerHTML = cap ? cellHtml(cap) : '';
+      return fig.outerHTML;
+    }
+    if (tag === 'figure' && cls.contains('fig')) {
+      const src = /^figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)$/.test(n.dataset.src || '') ? n.dataset.src : '';
+      const width = ['50', '67'].includes(n.dataset.width) ? ` data-width="${n.dataset.width}"` : '';
+      const img = n.querySelector('img');
+      const cap = n.querySelector('figcaption');
+      return `<figure class="fig" contenteditable="false" data-id="${paperId('fig')}"${src ? ` data-src="${src}"` : ''}${width}><img alt="${escHtml(img ? img.alt : '').replace(/"/g, '&quot;')}"><figcaption contenteditable="true">${cap ? cellHtml(cap) : ''}</figcaption></figure>`;
+    }
+    if (tag === 'p') {
+      const level = HEADINGS.find((h) => cls.contains(h));
+      return level ? `<p class="${level}" data-id="${paperId('sec')}">${out(n)}</p>` : `<p>${out(n)}</p>`;
+    }
+    if (['i', 'em'].includes(tag)) return `<i>${out(n)}</i>`;
+    if (['b', 'strong'].includes(tag)) return `<b>${out(n)}</b>`;
+    if (['sub', 'sup', 'u', 's'].includes(tag)) return `<${tag}>${out(n)}</${tag}>`;
+    if (tag === 'br') return '<br>';
+    if (['script', 'style', 'meta', 'title'].includes(tag)) return '';
+    return out(n);
+  }).join('');
+  return out(doc.body);
+}
+
+// Pictures and reference files dropped on the page
+function paperDragOver(e) {
+  if (!book || !isPaper() || currentTab !== 'manuscript') return;
+  if ([...e.dataTransfer.items || []].some((i) => i.kind === 'file')) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+}
+async function paperDrop(e) {
+  if (!book || !isPaper() || currentTab !== 'manuscript' || !e.dataTransfer.files.length) return;
+  e.preventDefault();
+  const files = [...e.dataTransfer.files];
+  const refs = files.filter((f) => /\.(bib|ris|json)$/i.test(f.name));
+  if (refs.length) { for (const f of refs) await paperImportText(await f.text(), f.name); return; }
+  const pics = files.filter((f) => FIGURE_TYPES[f.type]);
+  if (!pics.length) { toast(t('Drop a picture (PNG, JPEG, SVG…) for a figure, or a .bib, .ris or CSL JSON file of references')); return; }
+  const r = document.caretRangeFromPoint(e.clientX, e.clientY);
+  let el = r && r.startContainer;
+  if (el && el.nodeType === 3) el = el.parentElement;
+  let body = el && el.closest && el.closest('.chapter-body');
+  let at = body && el.closest('p, figure');
+  if (!body) { body = paperBodies()[paperBodies().length - 1]; at = body && body.lastElementChild; }
+  if (!body) return;
+  for (const f of pics) await paperAddFigure(f, body, at);
+}
+$('#paper-scroll').addEventListener('dragover', paperDragOver);
+$('#paper-scroll').addEventListener('drop', paperDrop);
+
+/* ------------------------------------------------------------------ */
+/*  Clicks on the page's own pieces                                   */
+/* ------------------------------------------------------------------ */
+
+$('#chapters').addEventListener('click', (e) => {
+  if (!book || !isPaper()) return;
+  const node = e.target.closest('.cite, .math, .eq, .xref');
+  if (!node || !node.closest('.chapter-body')) return;
+  e.preventDefault();
+  if (node.matches('.cite')) openCitePop(node);
+  else if (node.matches('.math, .eq')) openMathEditor(node);
+  else xrefMenu(e, node);
+});
+$('#chapters').addEventListener('contextmenu', (e) => {
+  if (!book || !isPaper()) return;
+  const cell = e.target.closest('figure.tbl th, figure.tbl td, figure.tbl');
+  const fig = e.target.closest('figure.fig');
+  if (cell) { e.preventDefault(); tableMenu(e, cell.matches('figure') ? cell.querySelector('td, th') : cell); }
+  else if (fig) { e.preventDefault(); figureMenu(e, fig); }
+});
+$('#chapters').addEventListener('mousedown', (e) => {
+  // a figure's picture is clicked for its menu, not dragged off as a file
+  if (book && isPaper() && e.target.matches('figure.fig img')) e.preventDefault();
+});
+$('#chapters').addEventListener('click', (e) => {
+  if (book && isPaper() && e.target.matches('figure.fig img')) figureMenu(e, e.target.closest('figure'));
+});
+async function xrefMenu(e, node) {
+  const tgt = paper.targets && paper.targets.get(node.dataset.ref);
+  const choice = await popMenu(e.clientX, e.clientY, [
+    { label: tgt ? t('Go to {what}', { what: tgt.label }) : t('Its target is gone'), value: 'go', disabled: !tgt },
+    { label: t('Remove'), value: 'remove', danger: true }
+  ]);
+  if (choice === 'go' && tgt) {
+    tgt.el.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
+    tgt.el.classList.add('flash');
+    setTimeout(() => tgt.el.classList.remove('flash'), 1200);
+  } else if (choice === 'remove') removeNode(node);
+}
+
+/* ------------------------------------------------------------------ */
+/*  The pane: the paper's sections, in order, to jump to or drag       */
+/* ------------------------------------------------------------------ */
+
+function renderPaperNav() {
+  const list = $('#nav-list');
+  list.innerHTML = '';
+  setText($('#nav-head span'), t('Sections'));
+  const row = (label, num, cls, go, words) => {
+    const item = document.createElement('div');
+    item.className = 'nav-item paper-sec ' + cls;
+    item.innerHTML = '<div class="n-row"><span class="n-num"></span><span class="n-label"></span><span class="n-words"></span></div>';
+    item.querySelector('.n-num').textContent = num || '';
+    item.querySelector('.n-label').textContent = label;
+    item.querySelector('.n-words').textContent = words ? words.toLocaleString() : '';
+    item.addEventListener('mousedown', (e) => e.preventDefault());
+    item.onclick = go;
+    pressable(item.querySelector('.n-row'), [num, label].filter(Boolean).join(' '));
+    list.appendChild(item);
+    return item;
+  };
+  row(t('Title and abstract'), '', 'ps-front', () => { $('#title-page').scrollIntoView({ behavior: scrollBehavior(), block: 'start' }); });
+  const heads = [...document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3')];
+  const caret = caretBlock(document.activeElement && document.activeElement.closest ? document.activeElement.closest('.chapter-body') || $('#chapters') : $('#chapters'));
+  heads.forEach((h, i) => {
+    const words = sectionWords(h, heads[i + 1]);
+    const item = row(h.textContent.trim() || '…', paperMeta().numbered === false ? '' : h.dataset.num, 'ps-' + headingOf(h), () => {
+      switchTab('manuscript');
+      const body = h.closest('.chapter-body');
+      body.focus({ preventScroll: true });
+      const r = document.createRange();
+      r.selectNodeContents(h);
+      r.collapse(false);
+      const s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      const sc = $('#paper-scroll');
+      sc.scrollTop += h.getBoundingClientRect().top - sc.getBoundingClientRect().top - sc.clientHeight / 5;
+      if (IS_POCKET && $('#nav-pane').dataset.pinned !== '1') $('#nav-pane').classList.remove('open');
+    }, words);
+    if (caret && (caret === h || (h.compareDocumentPosition(caret) & Node.DOCUMENT_POSITION_FOLLOWING && (!heads[i + 1] || heads[i + 1].compareDocumentPosition(caret) & Node.DOCUMENT_POSITION_PRECEDING)))) item.classList.add('current');
+    const r = item.querySelector('.n-row');
+    r.draggable = true;
+    r.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('application/x-neo-section', String(i));
+      item.classList.add('dragging');
+    });
+    r.addEventListener('dragend', () => {
+      item.classList.remove('dragging');
+      const ind = list.querySelector('.nav-drop-ind');
+      if (ind) ind.remove();
+    });
+  });
+  row(t('References'), '', 'ps-refs', () => { const el = $('#paper-refs'); if (el) el.scrollIntoView({ behavior: scrollBehavior(), block: 'start' }); },
+    paper.cited ? paper.cited.length : 0);
+}
+// the words of a section: from its heading to the next one
+function sectionWords(h, next) {
+  let n = 0;
+  for (let el = h.nextElementSibling; el && el !== next; el = el.nextElementSibling) {
+    if (headingOf(el)) break;
+    if (el.matches('p:not(.eq)')) n += countWords(el.textContent);
+  }
+  return n;
+}
+// A section dragged in the pane moves with everything under it
+(() => {
+  const list = $('#nav-list');
+  list.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer.types.includes('application/x-neo-section')) return;
+    e.preventDefault();
+    const ind = navDropInd();
+    let placed = false;
+    for (const it of list.querySelectorAll('.paper-sec.ps-h1:not(.dragging), .paper-sec.ps-h2:not(.dragging), .paper-sec.ps-h3:not(.dragging), .paper-sec.ps-refs')) {
+      const r = it.getBoundingClientRect();
+      if (e.clientY < r.top + r.height / 2) { list.insertBefore(ind, it); placed = true; break; }
+    }
+    if (!placed) list.appendChild(ind);
+  });
+  list.addEventListener('drop', (e) => {
+    if (!e.dataTransfer.types.includes('application/x-neo-section')) return;
+    e.preventDefault();
+    const from = +e.dataTransfer.getData('application/x-neo-section');
+    const ind = list.querySelector('.nav-drop-ind');
+    const before = ind && ind.nextElementSibling;
+    const items = [...list.querySelectorAll('.paper-sec.ps-h1, .paper-sec.ps-h2, .paper-sec.ps-h3')];
+    const to = before && items.includes(before) ? items.indexOf(before) : items.length;
+    if (ind) ind.remove();
+    paperMoveSection(from, to);
+  });
+})();
+function paperMoveSection(from, to) {
+  const heads = [...document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3')];
+  const h = heads[from];
+  if (!h || to === from || to === from + 1) return;
+  const level = HEADINGS.indexOf(headingOf(h));
+  // the section: its heading and everything up to the next heading as big or bigger
+  const part = [h];
+  for (let el = h.nextElementSibling; el; el = el.nextElementSibling) {
+    const l = HEADINGS.indexOf(headingOf(el));
+    if (l >= 0 && l <= level) break;
+    part.push(el);
+  }
+  const target = heads[to];
+  if (target && part.includes(target)) return;
+  snapshotStructure('section moved');
+  const body = h.closest('.chapter-body');
+  if (target) for (const el of part) target.before(el);
+  else for (const el of part) body.appendChild(el);
+  syncChapter(body, body.closest('.chapter').dataset.id);
+  resetNativeUndo();
+  breakRun++;
+  paperRenumber();
+  renderNav();
+  paperCiteSoon(0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  The shelf: a new paper, and how one looks there                   */
+/* ------------------------------------------------------------------ */
+
+async function createPaperOnShelf(shelf) {
+  const meta = await window.neo.createBook({ author: displayAuthor() });
+  const chId = 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  await window.neo.writeChapter(meta.id, chId, `<p class="h1" data-id="${paperId('sec')}">${escHtml(t('Introduction'))}</p><p><br></p>`);
+  meta.format = 'paper';
+  meta.chapterOrder = [chId];
+  meta.paper = { style: NeoCite.DEFAULT_STYLE, authors: displayAuthor() ? [{ name: displayAuthor(), affiliations: [], corresponding: true }] : [] };
+  meta.tabNames = { notes: (library.tabDefaults && library.tabDefaults.notes) || 'Notes', outline: 'Outline' };
+  await writeBookMeta(meta.id, meta);
+  await placeTitle(shelf, meta.id);
+  await writeLibrary(library);
+  await openBook(meta.id);
+  $('#tp-title').focus();
+}
+function paperTile(el, meta) {
+  el.classList.add('paper-tile');
+  el.innerHTML = `
+    <div class="pt-text"><div class="pt-title"></div><div class="pt-author"></div><div class="pt-lines"><i></i><i></i><i></i><i></i></div></div>
+    <div class="b-progress" hidden><div></div></div>`;
+  const title = isUntitled(meta.title) ? t('Untitled') : meta.title;
+  const tEl = el.querySelector('.pt-title');
+  tEl.textContent = title;
+  tEl.classList.toggle('long', title.length > 40);
+  el.querySelector('.pt-author').textContent = meta.author || '';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Menus and the state they show                                     */
+/* ------------------------------------------------------------------ */
+
+function paperReportState() {
+  if (!window.neo.paperState) return;
+  const on = !!book && isPaper() && !$('#editor-view').hidden;
+  const m = on ? paperMeta() : {};
+  let heading = '';
+  if (on) {
+    const sel = window.getSelection();
+    let el = sel && sel.rangeCount ? sel.anchorNode : null;
+    if (el && el.nodeType === 3) el = el.parentElement;
+    heading = headingOf(el && el.closest ? el.closest('p') : null);
+  }
+  window.neo.paperState({
+    on, style: m.style || null, custom: m.customStyleTitle || '', heading,
+    numbered: m.numbered !== false, double: !!m.double, linked: !!paper.linkedPath
+  });
+}
+document.addEventListener('selectionchange', () => {
+  if (!book || !isPaper()) return;
+  clearTimeout(paperReportState.t);
+  paperReportState.t = setTimeout(paperReportState, 120);
+});
+
+async function paperMenu(msg) {
+  if (!book || !isPaper()) { toast(t('Open a paper first')); return; }
+  const m = paperMeta();
+  const c = msg.command;
+  if (c === 'cite') paperPickAtCaret('cite');
+  else if (c === 'xref') paperPickAtCaret('xref');
+  else if (c === 'equation') paperInsertEquation();
+  else if (c === 'table') paperInsertTable();
+  else if (c === 'figure') {
+    const body = paperCaretBody();
+    if (!body) return;
+    const at = caretBlock(body);
+    const file = await pickFile('image/png,image/jpeg,image/gif,image/webp,image/svg+xml');
+    if (file) paperAddFigure(file, body, at);
+  } else if (c === 'heading') {
+    if (currentTab !== 'manuscript') return;
+    paperSetHeading(msg.value || '');
+  } else if (c === 'style') {
+    m.style = msg.value;
+    paper.proc = null;
+    await saveMeta();
+    await paperCiteNow();
+    const st = NeoCite.STYLES.find((s) => s.id === msg.value);
+    toast(t('Citations set in {style}', { style: st ? st.title : m.customStyleTitle || msg.value }));
+  } else if (c === 'styleFile') {
+    const file = await pickFile('.csl,application/xml,text/xml');
+    if (!file) return;
+    const xml = await file.text();
+    if (!/<style\b[^>]*xmlns="http:\/\/purl\.org\/net\/xbiblio\/csl"/.test(xml)) { toast(t('That isn’t a CSL style file. The Zotero Style Repository has one for almost every journal.'), 8000); return; }
+    const info = NeoCite.describeStyle(xml);
+    if (info.note) toast(t('“{style}” puts citations in footnotes, which NEO doesn’t make yet: they’ll show in the text', { style: info.title }), 9000);
+    await window.neo.paperWrite(book.id, 'style.csl', btoa(unescape(encodeURIComponent(xml))));
+    paper.styleXml.custom = xml;
+    m.style = 'custom';
+    m.customStyleTitle = info.title;
+    paper.proc = null;
+    await saveMeta();
+    await paperCiteNow();
+    toast(t('Citations set in {style}', { style: info.title }));
+  } else if (c === 'numbered') {
+    m.numbered = m.numbered === false;
+    if (m.numbered) delete m.numbered;
+    document.body.classList.toggle('paper-unnumbered', m.numbered === false);
+    paperRenumber();
+    renderNav();
+    scheduleMetaSave();
+  } else if (c === 'double') {
+    m.double = !m.double;
+    if (!m.double) delete m.double;
+    document.body.classList.toggle('paper-double', !!m.double);
+    scheduleMetaSave();
+  } else if (c === 'importReferences') {
+    const file = await pickFile('.bib,.ris,.json,.txt');
+    if (file) await paperImportText(await file.text(), file.name);
+  } else if (c === 'linkLibrary') paperLinkLibrary();
+  else if (c === 'unlinkLibrary') {
+    if (window.neo.paperUnlink) await window.neo.paperUnlink(book.id);
+    paper.linkedPath = null;
+    paper.linkedStamp = null;
+    toast(t('Unlinked. The references stay in the paper.'));
+  }
+  paperReportState();
+}
+
+// From refreshFromDisk: references.json written by the other device, and
+// the linked reference file, picked up when NEO comes back into view
+async function paperRefresh() {
+  if (!book || !isPaper() || refsWriting) return;
+  const disk = await window.neo.readJSON(book.id, 'references', []);
+  if (refsWriting || !book || !isPaper()) return;
+  const json = JSON.stringify(disk);
+  if (Array.isArray(disk) && json !== paper.refsSaved && JSON.stringify(paper.refs) === paper.refsSaved) {
+    paper.refs = disk;
+    paper.refsSaved = json;
+    if (paper.proc) paper.proc.setItems(disk);
+    paperCiteSoon(0);
+    if (currentTab === 'references') paperLibraryRender();
+  } else if (Array.isArray(disk) && json !== paper.refsSaved) {
+    // changed both here and there: what's new there joins what's here
+    await paperSaveRefs(paper.refs);
+  }
+  paperRefreshLinked();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Export: the page as a plain model, for paper/export.js            */
+/* ------------------------------------------------------------------ */
+
+// an SVG (MathJax's, or a figure's) drawn into a PNG, for Word and LaTeX
+async function svgToPng(svgText, { exPx = 8, maxW = 1800, scale = 2 } = {}) {
+  let s = svgText.replace(/currentColor/g, '#000');
+  const doc = new DOMParser().parseFromString(s, 'image/svg+xml');
+  const svg = doc.documentElement;
+  if (!svg || svg.nodeName.toLowerCase() !== 'svg') return null;
+  const size = (v) => {
+    const m = /^([\d.]+)(ex|px|pt|em)?$/.exec(String(v || '').trim());
+    if (!m) return 0;
+    return +m[1] * ({ ex: exPx, em: exPx * 2, pt: 4 / 3, px: 1 }[m[2] || 'px']);
+  };
+  let w = size(svg.getAttribute('width'));
+  let h = size(svg.getAttribute('height'));
+  const vb = (svg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+  if ((!w || !h) && vb.length === 4) { w = w || vb[2]; h = h || vb[3]; }
+  if (!w || !h) { w = w || 800; h = h || 600; }
+  const depth = (/vertical-align:\s*(-?[\d.]+)ex/.exec(svg.getAttribute('style') || '') || [])[1];
+  const k = Math.min(scale, maxW / w);
+  svg.setAttribute('width', w * k + 'px');
+  svg.setAttribute('height', h * k + 'px');
+  s = new XMLSerializer().serializeToString(svg);
+  const img = new Image();
+  img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(s)));
+  try { await img.decode(); } catch { return null; }
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(w * k);
+  canvas.height = Math.ceil(h * k);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return {
+    base64: canvas.toDataURL('image/png').split(',')[1],
+    w: canvas.width * (scale / k), h: canvas.height * (scale / k),
+    depth: depth ? -depth * exPx : 0
+  };
+}
+async function imageSize(mime, base64) {
+  const img = new Image();
+  img.src = `data:${mime};base64,${base64}`;
+  try { await img.decode(); } catch { return { w: 0, h: 0 }; }
+  return { w: img.naturalWidth, h: img.naturalHeight };
+}
+
+async function paperModel({ png = false } = {}) {
+  await paperLoad().catch(() => {});
+  await paperCiteNow();
+  paperRenumber();
+  const m = paperMeta();
+  const mathRun = async (tex, display) => {
+    const svg = mathReady() ? texSvg(tex, display) : null;
+    const svgText = svg ? new XMLSerializer().serializeToString(svg) : '';
+    return { svg: svgText, png: png && svgText ? await svgToPng(svgText) : null };
+  };
+  const runsOf = async (node, fmt = {}) => {
+    const out = [];
+    for (const n of node.childNodes) {
+      if (n.nodeType === 3) { if (n.data) out.push({ text: n.data.replace(/ /g, ' '), ...fmt }); continue; }
+      if (n.nodeType !== 1) continue;
+      const tag = n.tagName.toLowerCase();
+      const cls = n.classList;
+      if (cls.contains('ph-mark') || cls.contains('darling-anchor')) continue;
+      if (cls.contains('cite')) { out.push({ cite: citeData(n), narrative: n.hasAttribute('data-narrative'), html: paperSafe(paper.citeText.get(n) || n.innerHTML) }); continue; }
+      if (cls.contains('xref')) {
+        const tgt = paper.targets && paper.targets.get(n.dataset.ref);
+        out.push({ xref: n.dataset.ref, kind: tgt ? tgt.kind : '', num: tgt ? tgt.num : '', label: n.textContent });
+        continue;
+      }
+      if (cls.contains('math')) { out.push({ math: n.textContent, ...(await mathRun(n.textContent, false)) }); continue; }
+      if (tag === 'br') { out.push({ text: '\n', ...fmt }); continue; }
+      const next = { ...fmt };
+      if (tag === 'i' || tag === 'em') next.i = !fmt.i;
+      if (tag === 'b' || tag === 'strong') next.b = true;
+      if (tag === 'u') next.u = true;
+      if (tag === 's' || tag === 'strike') next.s = true;
+      if (tag === 'sup') next.sup = true;
+      if (tag === 'sub') next.sub = true;
+      out.push(...await runsOf(n, next));
+    }
+    return out;
+  };
+  const authors = (m.authors || []).filter((a) => a.name);
+  const affiliations = paperAffiliations(authors);
+  const model = {
+    title: isUntitled(book.title) ? '' : book.title,
+    subtitle: book.subtitle || '',
+    authors: authors.map((a) => ({ ...a, affiliations: (a.affiliations || []).map((f) => affiliations.indexOf(f)).filter((n) => n >= 0) })),
+    affiliations,
+    abstract: [],
+    keywords: m.keywords || [],
+    numbered: m.numbered !== false,
+    double: !!m.double,
+    font: getComputedStyle(paperBodies()[0] || document.body).fontFamily,
+    blocks: []
+  };
+  const abs = document.createElement('div');
+  abs.innerHTML = paperClean(m.abstract || '');
+  for (const p of abs.querySelectorAll('p')) if (p.textContent.trim()) model.abstract.push(await runsOf(p));
+  for (const body of paperBodies()) {
+    for (const el of body.children) {
+      if (el.matches('p.h1, p.h2, p.h3')) model.blocks.push({ type: 'heading', level: HEADINGS.indexOf(headingOf(el)) + 1, num: el.dataset.num || '', id: el.dataset.id, runs: await runsOf(el) });
+      else if (el.matches('p.eq')) model.blocks.push({ type: 'equation', id: el.dataset.id, num: el.dataset.num || '', tex: el.textContent, ...(await mathRun(el.textContent, true)) });
+      else if (el.matches('figure.fig')) {
+        const name = el.dataset.src || '';
+        const base64 = name ? await window.neo.paperRead(book.id, name) : null;
+        const mime = FIGURE_MIME[name.split('.').pop()] || 'image/png';
+        const fig = { type: 'figure', id: el.dataset.id, num: el.dataset.num || '', name, mime, base64, width: el.dataset.width ? +el.dataset.width : 0, alt: (el.querySelector('img') || {}).alt || '', caption: await runsOf(el.querySelector('figcaption') || document.createElement('i')) };
+        if (base64 && mime === 'image/svg+xml' && png) fig.png = await svgToPng(new TextDecoder().decode(Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))), { scale: 1, maxW: 2000 });
+        else if (base64 && png) Object.assign(fig, await imageSize(mime, base64));
+        model.blocks.push(fig);
+      } else if (el.matches('figure.tbl')) {
+        const rows = [];
+        for (const tr of el.querySelectorAll('tr')) {
+          const row = [];
+          for (const c of tr.children) row.push(await runsOf(c));
+          rows.push(row);
+        }
+        model.blocks.push({ type: 'table', id: el.dataset.id, num: el.dataset.num || '', caption: await runsOf(el.querySelector('figcaption') || document.createElement('i')), header: !!el.querySelector('tr:first-child th'), rows });
+      } else if (el.matches('p') && !el.classList.contains('ghost')) model.blocks.push({ type: 'para', runs: await runsOf(el), flush: el.classList.contains('flush') });
+    }
+  }
+  const cited = new Set(paper.cited || []);
+  const proc = paper.proc;
+  const st = NeoCite.STYLES.find((s) => s.id === m.style);
+  model.style = { id: m.style === 'custom' ? 'style' : m.style, title: st ? st.title : m.customStyleTitle || '', numeric: proc ? proc.info.numeric : !!(st && st.numeric), xml: paper.styleXml[m.style || NeoCite.DEFAULT_STYLE] || '' };
+  const bib = paper.bibliography || { entries: [] };
+  model.bibliography = { ...bib, entries: bib.entries.map((e) => ({ id: e.id, html: paperSafe(e.html, { links: true }) })) };
+  model.references = paper.refs.filter((r) => cited.has(r.id));
+  model.bibtex = NeoReferences.toBibtex(model.references);
+  return model;
+}
+
+// File → Export, for a paper (from doExport)
+async function paperExport(format) {
+  const name = safeName(isUntitled(book.title) ? t('Untitled') : book.title);
+  flushAllSaves();
+  const note = setTimeout(() => toast(t('Preparing the export…')), 400);
+  try {
+    let payload;
+    if (format === 'bib') {
+      if (!paper.refs.length) { toast(t('This paper has no references yet')); return; }
+      payload = { format: 'bib', defaultName: name, content: NeoReferences.toBibtex(paper.refs) };
+    } else if (format === 'latex' || format === 'pandoc') {
+      const model = await paperModel({ png: true });
+      payload = { format: 'zip', defaultName: name + (format === 'latex' ? '-latex' : '-markdown'), zipEntries: format === 'latex' ? NeoPaperExport.latex(model) : NeoPaperExport.pandoc(model) };
+    } else if (format === 'docx') {
+      const model = await paperModel({ png: true });
+      payload = { format: 'docx', defaultName: name, zipEntries: NeoPaperExport.docx(model) };
+    } else if (format === 'pdf' || format === 'html') {
+      const model = await paperModel();
+      payload = { format, defaultName: name, content: NeoPaperExport.html(model, { print: format === 'pdf' }) };
+    } else {
+      toast(t('A paper exports as PDF, Word, LaTeX, Markdown or a web page'));
+      return;
+    }
+    clearTimeout(note);
+    const saved = await window.neo.exportSave(payload);
+    if (saved) toast(t('Exported: {file}', { file: saved.split(/[\\/]/).pop() }));
+    const missing = document.querySelectorAll('#chapters .cite[data-missing], #chapters .xref[data-missing]').length;
+    if (saved && missing) toast(t('Exported, with {n} citations or cross-references that point at nothing (marked ? on the page)', { n: missing }), 8000);
+  } catch (err) {
+    clearTimeout(note);
+    window.neo.logError('paper export: ' + (err && err.stack || err));
+    toast(t('Couldn’t export: {error}', { error: plainError(err) }), 8000);
+  }
+}
+// The email snapshot of a paper, as it prints
+async function paperPrintHtml() {
+  return NeoPaperExport.html(await paperModel(), { print: true });
+}

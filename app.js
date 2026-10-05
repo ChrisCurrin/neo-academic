@@ -484,6 +484,8 @@ function cleanChapterEl(id) {
   const holder = document.createElement('div');
   holder.innerHTML = el ? el.innerHTML : (chapterHTML[id] || '');
   holder.querySelectorAll('.darling-anchor, .ph-mark, .ghost').forEach((n) => n.remove());
+  // a paper's words are its prose: not its figures, tables, maths or citations
+  if (isPaper()) holder.querySelectorAll('figure, .eq, .math, .cite, .xref').forEach((n) => n.remove());
   return holder;
 }
 // Text a line to each paragraph. innerText does that only for what is laid
@@ -907,10 +909,12 @@ async function renderShelves() {
         e.preventDefault();
         const pick = await popMenu(e.clientX, e.clientY, [
           { label: t('New Book'), value: 'book' },
-          { label: t('New Script'), value: 'script' }
+          { label: t('New Script'), value: 'script' },
+          { label: t('New Paper'), value: 'paper' }
         ], { from: blank });
         if (pick === 'book') createBookOnShelf(shelf);
         else if (pick === 'script') createScriptOnShelf(shelf);
+        else if (pick === 'paper') createPaperOnShelf(shelf);
       });
     }
 
@@ -1652,6 +1656,7 @@ function bookTile(meta, opts = {}) {
     <div class="b-progress" hidden><div></div></div>`;
   el.querySelector('.b-author').textContent = meta.author || '';
   if (isScript(meta)) scriptTile(el, meta);
+  else if (isPaper(meta)) paperTile(el, meta);
   else {
     dressTile(el, meta);
     el.querySelector('.b-painting').hidden = !(meta.coverArt && meta.coverArt.status === 'pending');
@@ -2223,6 +2228,7 @@ async function openBook(bookId) {
   savedMetaSig = metaSig(book); // what disk holds; NEO's own defaults don't count as edits
   stickies = await window.neo.readJSON(bookId, 'stickies', []);
   darlings = await window.neo.readJSON(bookId, 'darlings', []);
+  if (isPaper()) await paperOpen(); // its references, its style, its maths
 
   $('#bookshelf-view').hidden = true;
   $('#editor-view').hidden = false;
@@ -2235,6 +2241,7 @@ async function openBook(bookId) {
   $$('.tab[data-tab="notes"]')[0].textContent = tabName('notes');
   $$('.tab[data-tab="outline"]')[0].textContent = tabName('outline');
   spEditorMode(); // a script, or a book
+  paperEditorMode(); // …or a paper
 
   renderChapters();
   renderStickies();
@@ -2246,7 +2253,7 @@ async function openBook(bookId) {
   const isNew = book.chapterOrder.length === 0;
   // a new script opens on its title page (it has no outline to open to)
   const newScript = isScript() && isUntitled(book.title) && !bookWordCount();
-  if (isNew && library.writingStyle === 'plotter' && !isScript()) {
+  if (isNew && library.writingStyle === 'plotter' && !isScript() && !isPaper()) {
     switchTab('outline');
   } else {
     switchTab('manuscript');
@@ -2261,7 +2268,7 @@ async function openBook(bookId) {
   }
 
   // the Enter hint shows once per library, ever
-  if (!library.hintShown && !isScript()) {
+  if (!library.hintShown && !isScript() && !isPaper()) {
     library.hintShown = true;
     writeLibrary(library);
     setTimeout(() => toast(t('Enter twice = section break · three times = new chapter · {key} shows everything else', { key: KHELP }), 7000), 800);
@@ -2355,6 +2362,7 @@ function renderChapters() {
     if (!story) body.classList.add('no-cap');
     // a script's lines are set as they print (styles.css, SCREENPLAYS)
     if (isScript()) body.classList.add('script-body', $('#paper').classList.contains('narrow') ? 'sp-narrow' : 'sp-geom', 'no-cap');
+    if (isPaper()) body.classList.add('paper-body', 'no-cap');
     body.innerHTML = chapterHTML[chId] || '<p><br></p>';
     markDialogueOpening(body);
     if (PAGE_PROMPTS[kind]) {
@@ -2401,6 +2409,7 @@ function renderChapters() {
     spRepaginate();
     if (document.fonts) document.fonts.load('1em "Courier Prime"').then(() => spSchedule(0)).catch(() => {});
   }
+  if (isPaper()) paperRendered(); // numbers, maths, pictures, citations
   renderNav();
 }
 
@@ -2540,6 +2549,8 @@ function wireChapterBody(body, chId) {
   body.addEventListener('paste', (e) => {
     // a script's lines keep their elements; a script pasted as text is read
     if (isScript() && spPaste(e, body, chId)) return;
+    // a paper's figures, tables, maths and citations (paper/paper.js)
+    if (isPaper() && paperPaste(e, body, chId)) return;
     e.preventDefault();
     const html = e.clipboardData.getData('text/html');
     const text = e.clipboardData.getData('text/plain');
@@ -2592,6 +2603,8 @@ function wireChapterBody(body, chId) {
       if (destructive) healSelectionSeams(body);
     }
     if (styleKeepScroll(e)) return;
+    // a paper: its own Enter (no *** and no chapter splits), # headings, $maths$ and @
+    if (isPaper() && paperKey(e, body, chId)) return;
     // a script: its own Enter, Tab and ⌘1–7; no breaks, poetry or chapters
     if (isScript()) {
       if (scriptKey(e, body)) return;
@@ -3098,7 +3111,7 @@ function guardMarkerDelete(e, body, chId) {
 // ("<span style='text-indent...'>"). They corrupt later edits — unwrap them,
 // keeping only NEO's own marks.
 function stripJunkSpans(el) {
-  for (const s of [...el.querySelectorAll('span:not(.ph-mark)')]) {
+  for (const s of [...el.querySelectorAll('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')]) {
     while (s.firstChild) s.before(s.firstChild);
     s.remove();
   }
@@ -3155,7 +3168,7 @@ function handleEnter(e, body, chId) {
   if (!isStory(chId) && !block.classList.contains('poetry')) {
     e.preventDefault();
     enterRun = 0;
-    if (block.querySelector('span:not(.ph-mark)')) {
+    if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) {
       const caret = captureCaret();
       stripJunkSpans(block);
       restoreCaret(caret);
@@ -3242,7 +3255,7 @@ function handleEnter(e, body, chId) {
     // normal Enter — native split so ⌘Z keeps working; junk spans (which
     // make the engine clone whole paragraphs) are stripped first if present
     e.preventDefault();
-    if (block.querySelector('span:not(.ph-mark)')) {
+    if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) {
       // Unwrapping moves text nodes, so preserve the caret's text position.
       const caret = captureCaret();
       stripJunkSpans(block);
@@ -3354,7 +3367,7 @@ function handlePoetry(e, body, chId) {
 
   if (block.classList.contains('poetry')) {
     // the engine's own split keeps the class on the new line, and ⌘Z sees it
-    if (block.querySelector('span:not(.ph-mark)')) stripJunkSpans(block);
+    if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) stripJunkSpans(block);
     document.execCommand('insertParagraph');
     const cur = caretBlock(body);
     if (cur) {
@@ -3409,7 +3422,7 @@ function handleFlush(e, body, chId) {
   if (!block) return false;
   e.preventDefault();
   if (block.classList.contains('scene-break')) return true;
-  if (block.querySelector('span:not(.ph-mark)')) stripJunkSpans(block);
+  if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) stripJunkSpans(block);
   if (block.classList.contains('flush')) {
     // the engine's own split keeps the class on the new line, and ⌘Z sees it
     document.execCommand('insertParagraph');
@@ -3543,8 +3556,10 @@ function captureBody(body) {
   // (a page marks the lines that say who said it, and a chapter the speech
   // after a scene break, for the screen only)
   // (and a script's page breaks, (CONT'D) and suggestions)
-  return body.innerHTML.replace(/<p\b[^>]*>/g, (tag) => tag.replace(/ data-(?:attr|speech|first|walk)=""/g, '')
+  const html = body.innerHTML.replace(/<p\b[^>]*>/g, (tag) => tag.replace(/ data-(?:attr|speech|first|walk)=""/g, '')
     .replace(/ data-(?:pg|fill|contd|ghost|ghost-empty|sp-paste)(?:="[^"]*")?/g, ''));
+  // (and a paper's numbers and pictures)
+  return isPaper() ? paperStrip(html) : html;
 }
 
 // A chapter that opens on a line of dialogue sets no drop cap: the dash
@@ -5159,6 +5174,8 @@ function spToFdx(lines, title = {}) {
 // ---- end of screenplay rules ----
 
 const isScript = (meta = book) => !!meta && meta.format === 'screenplay';
+// a paper: book.json says "format": "paper" (paper/paper.js)
+const isPaper = (meta = book) => !!meta && meta.format === 'paper';
 const SP_CLASSES = SP_TYPES.filter((x) => x !== 'action').map((x) => 'sp-' + x);
 const SP_NAMES = {
   heading: tk('Scene Heading'), action: tk('Action'), character: tk('Character'), paren: tk('Parenthetical'),
@@ -6286,6 +6303,7 @@ function renderNav() {
   if (chapterDragActive) { navRefreshPending = true; return; }
   navRefreshPending = false;
   if (isScript()) { renderScriptNav(); return; }
+  if (isPaper()) { renderPaperNav(); return; }
   const list = $('#nav-list');
   // a keyboard user on a chapter row keeps their place through the rebuild
   const focusedRow = document.activeElement && document.activeElement.classList.contains('n-row') &&
@@ -6900,6 +6918,9 @@ function darlingFromKeyboard() {
 let tabPlaces = {};
 
 function switchTab(name) {
+  // a paper has its References where a book has its Outline
+  if (name === 'outline' && isPaper()) name = 'references';
+  if (name === 'references' && !isPaper()) name = 'outline';
   closeCardEditor();
   $('#editor-view').classList.remove('board-on');
   sidePaneForTab(name);
@@ -6926,6 +6947,7 @@ function switchTab(name) {
 
   // stash whatever aux content was open
   flushAux();
+  paperHideReferences();
 
   // an open Find follows the tab (Notes arrives from disk, so it looks later)
   const findHere = () => { if (!$('#searchbar').hidden) runSearch(); };
@@ -6946,7 +6968,11 @@ function switchTab(name) {
   // the outline's cards, their List/Cards switch and their hint belong to the Outline alone
   for (const id of ['#outline-board', '#outline-views', '#outline-board-hint']) { const el = $(id); if (el) el.hidden = true; }
 
-  if (name === 'darlings') {
+  if (name === 'references') {
+    paperShowReferences(); // a paper's references (paper/library.js)
+    returnTo();
+    findHere();
+  } else if (name === 'darlings') {
     $('#aux-title').textContent = t('Darlings');
     dList.hidden = false;
     renderDarlings();
@@ -9111,7 +9137,7 @@ function updateCounters() {
   if (!book) return;
   // a script is one long chapter: its words are counted when the typing
   // pauses, not at every key
-  if (isScript() && !updateCounters.now) {
+  if ((isScript() || isPaper()) && !updateCounters.now) {
     clearTimeout(updateCounters.t);
     updateCounters.t = setTimeout(() => {
       updateCounters.now = true;
@@ -9558,6 +9584,7 @@ async function refreshFromDisk() {
         show($('#tp-author'), book.author || t('Anonymous'));
         $$('.tab[data-tab="notes"]')[0].textContent = tabName('notes');
         $$('.tab[data-tab="outline"]')[0].textContent = tabName('outline');
+        if (isPaper()) paperEditorMode(); // its authors, abstract and keywords, as the other device left them
         renderStickies();
         if (currentTab === 'outline') renderOutline();
       }
@@ -9587,6 +9614,8 @@ async function refreshFromDisk() {
         book.lastPosition = { ...there, scroll: $('#paper-scroll').scrollTop };
       }
     }
+    // a paper's references, and the reference library it links to
+    if (isPaper()) await paperRefresh();
   } catch (err) {
     console.error(err);
   } finally {
@@ -9618,6 +9647,7 @@ async function backToShelf() {
   $('#bookshelf-view').hidden = false;
   applyBright();
   spEditorMode(); // a script's pane, page and title page go
+  paperEditorMode(); // and a paper's
   spReportState();
   renderShelves();
 }
@@ -10111,6 +10141,7 @@ function searchRoots() {
   if (currentTab === 'manuscript') return book.chapterOrder.map((chId) => document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`));
   if (currentTab === 'outline') return boardShowing() ? $$('#outline-board .ob-text, #loose-list .ob-text') : $$('#outline-list .ol-text');
   if (currentTab === 'darlings') return $$('#darlings-list .darling > :first-child');
+  if (currentTab === 'references') return $$('#references-view .rl-main');
   return [$('#aux-editor')];
 }
 
@@ -11383,6 +11414,23 @@ function shortcutSections() {
     ] };
     return sections;
   }
+  // a paper: its own Writing keys, and the Outline's give way to its Insert menu
+  if (book && isPaper()) {
+    const sections = bookShortcutSections().filter((s) => s.title !== tk('Outline'));
+    sections[0] = { title: tk('Writing a paper'), rows: [
+      [['#', '##', '###'], tk('At the start of a line, then a space: a section, subsection or subsubsection heading'), tk('Or ⌥⌘1, ⌥⌘2, ⌥⌘3; ⌥⌘0 makes it body text again.')],
+      ['@', tk('Cite a reference, or refer to a section, figure, table or equation'), tk('Type a name, a year or a word of the title. @fig, @tab, @eq and @sec narrow it. Paste a DOI or arXiv ID after the @ to add the reference.')],
+      [K('⌘⇧K', 'Ctrl+Shift+K'), tk('Insert a citation')],
+      [['$…$'], tk('Maths in the line, in TeX'), tk('Undo right after keeps the dollar signs. Click the maths to change it.')],
+      [['$$'], tk('On a line of its own, then Enter: a numbered equation')],
+      [K('⌘⇧M', 'Ctrl+Shift+M'), tk('Insert an equation')],
+      [tk('Drop or paste a picture'), tk('A numbered figure, with its caption under it')],
+      [tk('Paste from a spreadsheet'), tk('A numbered table'), tk('Tab moves between cells (and adds a row at the end); right-click for rows and columns.')],
+      [KPH, tk('Insert a placeholder note')],
+      [KDA, tk('Move selected text to Darlings')]
+    ] };
+    return sections;
+  }
   return bookShortcutSections();
 }
 function bookShortcutSections() {
@@ -12599,6 +12647,8 @@ async function doExport(format, chId = null) {
   if (!book) { toast(t('Open a book first')); return; }
   // a script leaves as a PDF set the way scripts print, or as Fountain
   if (isScript()) { await spExport(['pdf', 'fdx'].includes(format) ? format : 'fountain'); return; }
+  // a paper leaves as PDF, Word, LaTeX, Markdown for Pandoc, or a web page
+  if (isPaper()) { await paperExport(format); return; }
   flushAllSaves();
   const one = chId ? chapterExportData(chId) : null;
   if (chId && !one) return;
@@ -12686,13 +12736,13 @@ async function doEmailDraft() {
       : t('PDF snapshot attached.'));
   toast(t('Preparing your draft…'));
   const script = isScript();
-  const snapshot = script ? null : bookExportData();
+  const snapshot = script || isPaper() ? null : bookExportData();
   const res = await window.neo.emailDraft({
     to: library.emailAddress,
     subject,
     body,
     // the email snapshot is a provenance record (a script's, as it prints)
-    html: script ? await spPdfHtml() : buildHtml(snapshot, { stamp: true, fonts: await exportFontFaces(snapshot) }),
+    html: script ? await spPdfHtml() : isPaper() ? await paperPrintHtml() : buildHtml(snapshot, { stamp: true, fonts: await exportFontFaces(snapshot) }),
     print: script ? 'screenplay' : undefined,
     defaultName: safeName(book.title),
     method: library.emailMethod
@@ -12868,6 +12918,7 @@ window.neo.onMenu(async (msg) => {
   if (msg.type === 'update') updateMessage(msg);
   if (msg.type === 'export') doExport(msg.format);
   if (msg.type === 'scriptElement' && book && isScript()) spSetElement(msg.value);
+  if (msg.type === 'paper') await paperMenu(msg);
   if (msg.type === 'markdownEmphasis') {
     if (msg.checked) delete library.markdownOff; else library.markdownOff = true;
     await writeLibrary(library);
