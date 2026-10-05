@@ -254,12 +254,14 @@ function paperTitlePage(on) {
   wrap.querySelector('.tp-abstract-head').textContent = t('Abstract');
   const abs = wrap.querySelector('#tp-abstract');
   abs.setAttribute('aria-label', t('Abstract'));
-  abs.dataset.ph = t('What the paper asks, what it did, what it found');
+  abs.dataset.ph = t('One paragraph, about 200 words, in six moves:');
   abs.innerHTML = paperClean(m.abstract || '');
+  wrap.appendChild(abstractGuide(abs));
   page.appendChild(wrap);
   const count = () => {
     const n = countWords(abs.innerText || '');
     wrap.querySelector('.tp-abstract-count').textContent = n ? t('{n} words', { n }) : '';
+    wrap.classList.toggle('empty', !abs.textContent.trim() && !abs.querySelector('.math'));
   };
   count();
   abs.addEventListener('input', () => {
@@ -268,6 +270,8 @@ function paperTitlePage(on) {
     count();
     scheduleMetaSave();
   });
+  abs.addEventListener('focus', () => wrap.classList.add('writing'));
+  abs.addEventListener('blur', () => wrap.classList.remove('writing'));
   abs.addEventListener('keydown', (e) => paperMathKey(e, abs));
   abs.addEventListener('click', (e) => { const n = e.target.closest('.math'); if (n) openMathEditor(n); });
   for (const n of abs.querySelectorAll('.math')) drawMath(n);
@@ -292,6 +296,43 @@ function paperTitlePage(on) {
     const body = paperBodies()[0];
     if (body) focusChapterStart(body.closest('.chapter').dataset.id);
   });
+}
+
+// The six moves of an abstract, in order: the shape Nature's summary
+// paragraph and Springer Nature's editors teach (context, the gap, "here
+// we", results, implications), with the kind of answer named before the
+// specific one. Shown in full as the empty abstract's scaffold; while the
+// abstract is being written, only their names, faintly, under it; and
+// nothing at all once the caret is elsewhere.
+const ABSTRACT_MOVES = [
+  [tk('Status quo'), tk('What the field knows, and why it matters. One or two sentences any scientist could follow.')],
+  [tk('Problem'), tk('What that leaves unsolved, unknown or wrong. Often begins “However, …”.')],
+  [tk('Broader solution'), tk('The kind of approach that would close the gap, in general terms.')],
+  [tk('What we did'), tk('This study, specifically. Often begins “Here we …”.')],
+  [tk('What we found'), tk('The main results, in two or three sentences. A key number or two, not a table’s worth.')],
+  [tk('Implications'), tk('What changes because of it, for the field and beyond. Keep it to what the results support.')]
+];
+function abstractGuide(abs) {
+  const ol = document.createElement('ol');
+  ol.className = 'tp-abstract-guide';
+  ol.setAttribute('aria-label', t('The six moves of an abstract'));
+  for (const [name, what] of ABSTRACT_MOVES) {
+    const li = document.createElement('li');
+    li.title = t(what);
+    const b = document.createElement('b');
+    b.textContent = t(name);
+    const span = document.createElement('span');
+    span.textContent = t(what);
+    li.append(b, span);
+    ol.appendChild(li);
+  }
+  // the scaffold is only a guide: a click on it starts the writing
+  ol.addEventListener('mousedown', (e) => {
+    if (!ol.closest('.empty')) return;
+    e.preventDefault();
+    abs.focus();
+  });
+  return ol;
 }
 
 // Only what an abstract is made of: paragraphs, emphasis, sub/superscript, maths

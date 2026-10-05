@@ -73,7 +73,7 @@ Export an industry-format PDF, or a Fountain or Final Draft (.fdx) file. Drop a 
 
 **Academic papers**
 
-Right-click the + on a shelf and choose **New Paper**. The title page holds the title, the authors (click them for affiliations, email and ORCID iDs), the abstract with its word count, and keywords. Type `#` at the start of a line for a numbered section, `##` and `###` for the levels below.
+Right-click the + on a shelf and choose **New Paper**. The title page holds the title, the authors (click them for affiliations, email and ORCID iDs), the abstract with its word count, and keywords. The empty abstract lays out the six moves a good one makes (status quo, the problem with it, the broader solution, what you did, what you found, what it means), and while you write it they stay underneath as a faint reminder. Type `#` at the start of a line for a numbered section, `##` and `###` for the levels below.
 
 Type `@` to cite: a few letters of an author, a year or a title word find the reference, and Enter cites it. `@` again right after joins the same citation. Paste a DOI or an arXiv ID after the `@` and NEO looks it up, adds it to the paper's references and cites it. Click a citation to add a page number, a "see", or to name the authors in the sentence. The reference list sets itself at the end, in APA, Chicago, Harvard, MLA, IEEE, Vancouver, Nature or AMA (Format → Citation Style), or any journal's style from the Zotero Style Repository. The References tab takes BibTeX, RIS and CSL JSON from Zotero, Mendeley, EndNote or a publisher's download button, and can link the .bib file Zotero's Better BibTeX keeps up to date.
 

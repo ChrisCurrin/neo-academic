@@ -1953,6 +1953,25 @@ body.light #nav-pane.script .nav-item.sp-scene .n-num { color: #8f8a80; }
 }
 #tp-abstract p { margin: 0 0 0.5em; white-space: pre-wrap; }
 #tp-abstract:empty::before { content: attr(data-ph); color: #b9b4a8; font-style: italic; }
+/* the six moves: the empty abstract's scaffold, then a faint reminder
+   under it while it's written, then gone (paper.js, abstractGuide) */
+.tp-abstract-guide { display: none; list-style: none; counter-reset: move; font-family: var(--body-font); color: var(--paper-faint); }
+#tp-abstract-wrap.empty .tp-abstract-guide {
+  display: block; margin-top: 6px; font-size: calc(var(--editor-size, 17px) * 0.82 * var(--page-zoom, 1)); line-height: 1.45; cursor: text;
+}
+#tp-abstract-wrap.empty .tp-abstract-guide li { counter-increment: move; display: grid; grid-template-columns: 1.4em 9.5em 1fr; gap: 0 0.4em; margin-top: 5px; }
+#tp-abstract-wrap.empty .tp-abstract-guide li::before { content: counter(move) '.'; color: var(--paper-faint); }
+#tp-abstract-wrap.empty .tp-abstract-guide b { font-weight: 700; color: var(--paper-soft); }
+#tp-abstract-wrap.empty .tp-abstract-guide span { font-style: italic; }
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide {
+  display: flex; flex-wrap: wrap; gap: 2px 0; margin-top: 10px;
+  font: 11px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+}
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide li { cursor: help; }
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide li:not(:last-child)::after { content: '→'; margin: 0 5px; opacity: 0.6; }
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide b { font-weight: 400; }
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide span { display: none; }
+#tp-abstract-wrap.empty #tp-abstract:empty::before { font-style: normal; }
 .tp-abstract-count { position: absolute; right: 0; top: 2px; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; color: var(--paper-faint); opacity: 0; transition: opacity 0.15s; }
 #tp-abstract-wrap:hover .tp-abstract-count, #tp-abstract:focus + .tp-abstract-count { opacity: 1; }
 #tp-keywords {

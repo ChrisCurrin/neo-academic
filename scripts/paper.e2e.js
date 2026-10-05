@@ -115,6 +115,22 @@ test('New Paper on a shelf makes a paper and opens it on its title page', async 
   await snap('new-paper');
 });
 
+test('the empty abstract shows its six moves; writing it leaves only their names', async () => {
+  const shown = () => js(`getComputedStyle(document.querySelector('.tp-abstract-guide')).display`);
+  assert.deepEqual(await js(`[...document.querySelectorAll('.tp-abstract-guide b')].map((b) => b.textContent)`),
+    ['Status quo', 'Problem', 'Broader solution', 'What we did', 'What we found', 'Implications']);
+  assert.equal(await shown(), 'block', 'the scaffold, while the abstract is empty');
+  await snap('abstract-empty');
+  await js(`document.getElementById('tp-abstract').focus()`);
+  await type('Cortex keeps excitation and inhibition in balance.');
+  assert.equal(await shown(), 'flex', 'only the names, while writing');
+  await snap('abstract-writing');
+  await js(`document.getElementById('tp-title').focus()`);
+  await tick(100);
+  assert.equal(await shown(), 'none', 'gone, once the caret is elsewhere');
+  await js(`(() => { const a = document.getElementById('tp-abstract'); a.innerHTML = ''; a.dispatchEvent(new Event('input')); })()`);
+});
+
 test('MathJax and citeproc load', async () => {
   for (let i = 0; i < 60 && !(await js('!!(window.MathJax && window.MathJax.tex2svg && window.CSL)')); i++) await tick(200);
   assert.equal(await js('!!(window.MathJax && window.MathJax.tex2svg)'), true);
