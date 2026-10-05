@@ -702,6 +702,37 @@ ipcMain.handle('paper:lookup', async (_e, doi) => {
   if (!res.ok) throw new Error('doi.org answered ' + res.status);
   return res.json();
 });
+// Zotero, on this computer: Better BibTeX's search when it's installed
+// (its items carry their citation keys), else Zotero 7's own local API
+// (Settings → Advanced → "Allow other applications on this computer to
+// communicate with Zotero"). Only ever 127.0.0.1; null when neither answers.
+ipcMain.handle('paper:zotero', async (_e, q) => {
+  q = String(q || '').slice(0, 120).trim();
+  if (q.length < 2) return [];
+  const { net } = require('electron');
+  const ask = async (url, opts = {}) => {
+    const res = await net.fetch(url, { ...opts, signal: AbortSignal.timeout(1500) });
+    if (!res.ok) throw new Error('Zotero answered ' + res.status);
+    return res.json();
+  };
+  try {
+    const out = await ask('http://127.0.0.1:23119/better-bibtex/json-rpc', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'item.search', params: [q], id: 1 })
+    });
+    if (Array.isArray(out.result)) return out.result.slice(0, 8).map((it) => ({ ...it, id: it.citekey || it.citationKey || it['citation-key'] || '' }));
+  } catch { /* no Better BibTeX: Zotero's own API */ }
+  try {
+    const out = await ask('http://127.0.0.1:23119/api/users/0/items/top?format=csljson&limit=8&qmode=titleCreatorYear&q=' + encodeURIComponent(q), {
+      headers: { 'Zotero-API-Version': '3', 'Zotero-Allowed-Request': '1' }
+    });
+    const items = Array.isArray(out) ? out : out.items || [];
+    return items.slice(0, 8).map((it) => ({ ...it, id: it['citation-key'] || it.citationKey || '' }));
+  } catch {
+    return null;
+  }
+});
+
 // A reference file the writer keeps elsewhere (Zotero's Better BibTeX
 // keeps one up to date). Which file, for which paper, is this computer's
 // own business: it's kept in userData, written only when the writer picks
@@ -744,7 +775,7 @@ ipcMain.handle('paper:linked', (_e, bookId, since) => {
 // A paper as its journal would print it, in a window of its own: one
 // window, reused, its title naming the journal
 let previewWin = null;
-ipcMain.handle('paper:preview', async (_e, html, title) => {
+ipcMain.handle('paper:preview', async (_e, html, title, opts = {}) => {
   const pdf = await renderPDF(String(html), 'paper');
   const file = path.join(app.getPath('temp'), `neo-preview-${process.pid}-${Date.now()}.pdf`);
   fs.writeFileSync(file, pdf);
@@ -757,15 +788,23 @@ ipcMain.handle('paper:preview', async (_e, html, title) => {
       webPreferences: { plugins: true, sandbox: true, contextIsolation: true, nodeIntegration: false }
     });
     previewWin.on('page-title-updated', (e) => e.preventDefault());
-    previewWin.on('closed', () => { previewWin = null; });
+    previewWin.on('closed', () => {
+      previewWin = null;
+      sendToWindow({ type: 'paper', command: 'previewClosed' });
+    });
   }
   const old = previewWin.neoFile;
   previewWin.neoFile = file;
   previewWin.setTitle(String(title || 'Preview'));
-  await previewWin.loadFile(file);
-  previewWin.show();
+  // open at the page where the writer is: the section the caret is in
+  const pages = opts.focus ? pdfAnchorPages(pdf) : {};
+  const page = pages[String(opts.focus)];
+  await previewWin.loadURL(require('url').pathToFileURL(file).href + (page ? '#page=' + page : ''));
+  // a quiet redraw while writing doesn't take the writer away from the page
+  if (!opts.quiet) previewWin.show();
+  else if (!previewWin.isVisible()) previewWin.showInactive();
   if (old) { try { fs.unlinkSync(old); } catch { /* gone */ } }
-  return true;
+  return { page: page || 1 };
 });
 
 ipcMain.handle('cover:read', (_e, bookId, fname) => {
@@ -1856,6 +1895,7 @@ function buildMenu() {
         },
         ...(paperState.on ? [
           { label: t('Preview'), accelerator: 'CmdOrCtrl+Alt+P', click: () => sendToWindow({ type: 'paper', command: 'preview' }) },
+          { label: t('Draft for Feedback…'), click: () => sendToWindow({ type: 'paper', command: 'feedback' }) },
           {
             label: t('Preview As'),
             submenu: NeoJournals.JOURNALS.map((j) => ({

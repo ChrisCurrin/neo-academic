@@ -23,7 +23,11 @@
   const SANS = '"Helvetica Neue", Helvetica, Arial, sans-serif';
   const CM = '"Latin Modern Roman", "CMU Serif", "Computer Modern", Georgia, serif';
 
-  // heading numbers: arabic (1, 1.1), roman (I., A., 1)), or none
+  // heading numbers: arabic (1, 1.1), roman (I., A., 1)), or none. limits
+// are the journal's usual ones for its main article type (title in
+// characters, abstract in words or characters, main text in words): a
+// guide shown beside the counts, not a rule; each journal's own author
+// guidelines have the last word.
   const JOURNALS = [
     {
       id: 'preprint', name: 'Preprint (arXiv)', csl: null, page: 'letter', margin: '1in', columns: 1,
@@ -41,7 +45,8 @@
       abstract: 'bold', headings: { numbering: 'none', font: SANS, upper: false },
       captions: { figure: 'Fig.', table: 'Table', sep: ' |', font: SANS, size: '7.5pt' },
       keywords: '', refs: '7.5pt', refsFont: SANS,
-      latex: { cls: 'article', opts: '10pt' }
+      latex: { cls: 'article', opts: '10pt' },
+      limits: { title: 90, abstract: 200, words: 4300, note: 'Article: summary paragraph about 200 words, main text about 4,300' }
     },
     {
       id: 'science', name: 'Science', csl: 'science', page: 'letter', margin: '0.75in', columns: 2, gap: '0.25in',
@@ -50,7 +55,8 @@
       abstract: 'bold', headings: { numbering: 'none', font: SANS, upper: false },
       captions: { figure: 'Fig.', table: 'Table', sep: '.', font: SANS, size: '8pt' },
       keywords: '', refs: '8pt',
-      latex: { cls: 'article', opts: '10pt' }
+      latex: { cls: 'article', opts: '10pt' },
+      limits: { title: 96, abstract: 125, words: 4500, note: 'Research Article: abstract up to 125 words, main text about 4,500' }
     },
     {
       id: 'pnas', name: 'PNAS', csl: 'pnas', page: 'letter', margin: '0.7in', columns: 2, gap: '0.25in',
@@ -59,7 +65,8 @@
       abstract: 'box', headings: { numbering: 'none', font: SANS, upper: false },
       captions: { figure: 'Fig.', table: 'Table', sep: '.', font: SANS, size: '7.5pt' },
       keywords: 'Keywords', refs: '7pt',
-      latex: { cls: 'article', opts: '9pt' }
+      latex: { cls: 'article', opts: '9pt' },
+      limits: { title: 135, abstract: 250, words: 4500, note: 'Research Report: abstract up to 250 words, about six pages' }
     },
     {
       id: 'cell', name: 'Cell Press (Cell, Neuron…)', csl: 'cell', page: 'letter', margin: '0.8in', columns: 2, gap: '0.3in',
@@ -68,7 +75,8 @@
       abstract: 'heading', headings: { numbering: 'none', font: SANS, upper: true },
       captions: { figure: 'Figure', table: 'Table', sep: '.', font: SANS, size: '8pt' },
       keywords: 'Keywords', refs: '8pt',
-      latex: { cls: 'article', opts: '10pt' }
+      latex: { cls: 'article', opts: '10pt' },
+      limits: { title: 120, abstract: 150, note: 'Article: summary up to 150 words, title under 120 characters' }
     },
     {
       id: 'plos', name: 'PLOS', csl: 'plos', page: 'letter', margin: '1in 1in 1in 2.2in', columns: 1,
@@ -77,7 +85,8 @@
       abstract: 'heading', headings: { numbering: 'none', font: SANS, upper: false },
       captions: { figure: 'Fig', table: 'Table', sep: '.', font: SANS, size: '9pt' },
       keywords: '', refs: '9pt',
-      latex: { cls: 'article', opts: '10pt' }
+      latex: { cls: 'article', opts: '10pt' },
+      limits: { title: 250, abstract: 300, note: 'Research Article: abstract up to 300 words' }
     },
     {
       id: 'elife', name: 'eLife', csl: 'elife', page: 'A4', margin: '0.9in', columns: 1,
@@ -86,7 +95,8 @@
       abstract: 'heading', headings: { numbering: 'none', font: SANS, upper: false },
       captions: { figure: 'Figure', table: 'Table', sep: '.', font: SANS, size: '9pt' },
       keywords: '', refs: '9pt',
-      latex: { cls: 'article', opts: '10pt' }
+      latex: { cls: 'article', opts: '10pt' },
+      limits: { abstract: 150, note: 'Research Article: abstract up to 150 words' }
     },
     {
       id: 'ieee', name: 'IEEE (two-column)', csl: 'ieee', page: 'letter', margin: '0.75in 0.625in', columns: 2, gap: '0.2in',
@@ -95,7 +105,8 @@
       abstract: 'inline', headings: { numbering: 'roman', font: SERIF, upper: true, center: true },
       captions: { figure: 'Fig.', table: 'TABLE', sep: '.', font: SERIF, size: '8pt' },
       keywords: 'Index Terms', refs: '8pt',
-      latex: { cls: 'IEEEtran', opts: 'conference', bst: 'IEEEtranN' }
+      latex: { cls: 'IEEEtran', opts: 'conference', bst: 'IEEEtranN' },
+      limits: { abstract: 250, note: 'Abstract up to 250 words; conference papers by page count' }
     },
     {
       id: 'acm', name: 'ACM (sigconf)', csl: 'association-for-computing-machinery', page: 'letter', margin: '0.95in 0.75in', columns: 2, gap: '0.33in',
@@ -104,7 +115,8 @@
       abstract: 'heading', headings: { numbering: 'arabic', font: SANS, upper: true },
       captions: { figure: 'Figure', table: 'Table', sep: ':', font: SANS, size: '8pt' },
       keywords: 'Keywords', refs: '7.5pt',
-      latex: { cls: 'acmart', opts: 'sigconf', bst: 'ACM-Reference-Format' }
+      latex: { cls: 'acmart', opts: 'sigconf', bst: 'ACM-Reference-Format' },
+      limits: { abstract: 250, note: 'Abstract a single paragraph, typically up to 250 words' }
     },
     {
       id: 'neurips', name: 'NeurIPS', csl: 'ieee', page: 'letter', margin: '1in 1.5in', columns: 1,
@@ -113,7 +125,8 @@
       abstract: 'indented', headings: { numbering: 'arabic', font: SERIF, upper: false },
       captions: { figure: 'Figure', table: 'Table', sep: ':', font: SERIF, size: '9pt' },
       keywords: '', refs: '9pt',
-      latex: { cls: 'article', opts: '10pt', textwidth: '5.5in' }
+      latex: { cls: 'article', opts: '10pt', textwidth: '5.5in' },
+      limits: { abstract: 250, note: 'Abstract one paragraph; main text up to nine pages' }
     },
     {
       id: 'lncs', name: 'Springer LNCS', csl: 'springer-lecture-notes-in-computer-science', page: '152mm 235mm', margin: '20mm 15mm 22mm', columns: 1,
@@ -122,7 +135,8 @@
       abstract: 'small', headings: { numbering: 'arabic', font: SERIF, upper: false },
       captions: { figure: 'Fig.', table: 'Table', sep: '.', font: SERIF, size: '9pt' },
       keywords: 'Keywords', refs: '9pt',
-      latex: { cls: 'llncs', opts: '', bst: 'splncs04' }
+      latex: { cls: 'llncs', opts: '', bst: 'splncs04' },
+      limits: { abstract: 250, note: 'Abstract 150 to 250 words' }
     },
     {
       id: 'elsevier', name: 'Elsevier', csl: 'elsevier-harvard', page: 'A4', margin: '1in', columns: 1,
@@ -131,7 +145,8 @@
       abstract: 'rule', headings: { numbering: 'arabic', font: SERIF, upper: false },
       captions: { figure: 'Figure', table: 'Table', sep: ':', font: SERIF, size: '9.5pt' },
       keywords: 'Keywords', refs: '9.5pt',
-      latex: { cls: 'elsarticle', opts: 'preprint,12pt', bst: 'elsarticle-harv' }
+      latex: { cls: 'elsarticle', opts: 'preprint,12pt', bst: 'elsarticle-harv' },
+      limits: { abstract: 250, note: 'Abstract typically up to 250 words; varies by journal' }
     },
     {
       id: 'aps', name: 'APS (Physical Review)', csl: 'american-physics-society', page: 'letter', margin: '0.75in 0.7in', columns: 2, gap: '0.25in',
@@ -140,7 +155,8 @@
       abstract: 'narrow', headings: { numbering: 'roman', font: CM, upper: true, center: true },
       captions: { figure: 'FIG.', table: 'TABLE', sep: '.', font: CM, size: '8.5pt' },
       keywords: '', refs: '8.5pt',
-      latex: { cls: 'revtex4-2', opts: 'aps,prl,twocolumn,superscriptaddress', bst: '' }
+      latex: { cls: 'revtex4-2', opts: 'aps,prl,twocolumn,superscriptaddress', bst: '' },
+      limits: { abstractChars: 600, words: 3750, note: 'Letter (PRL): abstract up to 600 characters, about 3,750 words' }
     }
   ];
   const DEFAULT = 'preprint';

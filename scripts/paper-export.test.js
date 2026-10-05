@@ -162,10 +162,10 @@ test('figure layout: placement, both columns, wrapped text and panels, as LaTeX 
   assert.match(md, /<div id="fig:p4">\n!\[Before\]\(figures\/figure-d\.png\)\{#fig:p4-a width=49%\}\n!\[After\]\(figures\/figure-e\.png\)\{#fig:p4-b width=49%\}\n\nBoth\n<\/div>/);
   const html = X.html(m);
   assert.match(html, /<figure id="fig-p3" class="wrap-right" style="--w:33%">/);
-  assert.match(html, /<figure id="fig-p4" class="multi" style="--w:100%"><div class="panels"><div class="panel"><img[^>]+><div class="subcap"><b>\(a\)<\/b> Before<\/div>/);
+  assert.match(html, /<figure id="fig-p4" class="multi" style="--w:100%"><div class="panels"><div class="panel" id="fig-p4-a"><img[^>]+><div class="subcap"><b>\(a\)<\/b> Before<\/div>/);
   assert.match(html, /<figure class="table span" id="tab-t1">/);
   const doc = X.docx(m).find((f) => f.path === 'word/document.xml').content;
-  assert.match(doc, /Figure 4\. <\/w:t><\/w:r><w:bookmarkEnd w:id="\d+"\/><w:r><w:t xml:space="preserve">Both<\/w:t><\/w:r><w:r><w:t xml:space="preserve"> <\/w:t><\/w:r><w:r><w:rPr><w:b\/><\/w:rPr><w:t xml:space="preserve">\(a\) <\/w:t>/);
+  assert.match(doc, /Figure 4\. <\/w:t><\/w:r><w:bookmarkEnd w:id="\d+"\/><w:r><w:t xml:space="preserve">Both<\/w:t><\/w:r><w:r><w:t xml:space="preserve"> <\/w:t><\/w:r><w:bookmarkStart w:id="\d+" w:name="_fig_p4_a"\/><w:r><w:rPr><w:b\/><\/w:rPr><w:t xml:space="preserve">\(a\) <\/w:t>/, 'panel (a) can be linked to');
 });
 
 // every XML part well-formed, by xmllint (macOS and most Linux have it)
@@ -241,4 +241,14 @@ test('EPUB 3: mimetype first and stored, the paper as XHTML, its pictures as fil
   assert.match(files.find((f) => f.path === 'OEBPS/nav.xhtml').content, /<a href="paper\.xhtml#sec-ab12">Introduction<\/a>/);
   assert.ok(files.some((f) => f.path === 'OEBPS/images/figure-cd34.png' && f.base64));
   wellFormed(files);
+});
+
+test('back matter (Acknowledgements, Data availability…) is unnumbered in every format', () => {
+  const m = model();
+  m.blocks.push({ type: 'heading', level: 1, num: '', unnumbered: true, id: 'sec-back1', runs: [T('Acknowledgements')] }, { type: 'para', runs: [T('Thanks.')] });
+  assert.match(X.latex(m).find((f) => f.path === 'paper.tex').content, /\\section\*\{Acknowledgements\}\\label\{sec:back1\}/);
+  assert.match(X.pandoc(m).find((f) => f.path === 'paper.md').content, /# Acknowledgements \{#sec:back1 \.unnumbered\}/);
+  assert.match(X.html(m), /<h2 id="sec-back1">Acknowledgements<\/h2>/);
+  assert.match(X.docx(m).find((f) => f.path === 'word/document.xml').content, /w:name="_sec_back1"\/><w:r><w:t xml:space="preserve">Acknowledgements<\/w:t>/);
+  assert.match(X.text(m), /\nAcknowledgements\n=+\n/);
 });

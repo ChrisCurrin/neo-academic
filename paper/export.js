@@ -193,7 +193,7 @@
     for (const b of m.blocks) {
       if (b.type === 'heading') {
         const cmd = ['section', 'subsection', 'subsubsection'][b.level - 1];
-        lines.push(`\\${cmd}${star}{${texRuns(b.runs)}}\\label{${crossId(b.id)}}`, '');
+        lines.push(`\\${cmd}${b.unnumbered ? '*' : star}{${texRuns(b.runs)}}\\label{${crossId(b.id)}}`, '');
       } else if (b.type === 'para') {
         const text = texRuns(b.runs).trim();
         if (text) lines.push((b.flush ? '\\noindent ' : '') + text, '');
@@ -305,7 +305,7 @@
     y.push('---', '');
     const out = [y.join('\n')];
     for (const b of m.blocks) {
-      if (b.type === 'heading') out.push(`${'#'.repeat(b.level)} ${mdRuns(b.runs).trim()} {#${crossId(b.id)}}`);
+      if (b.type === 'heading') out.push(`${'#'.repeat(b.level)} ${mdRuns(b.runs).trim()} {#${crossId(b.id)}${b.unnumbered ? ' .unnumbered' : ''}}`);
       else if (b.type === 'para') { const s = mdRuns(b.runs).trim(); if (s) out.push(s); }
       else if (b.type === 'equation') out.push(`$$\n${b.tex}\n$$ {#${crossId(b.id)}}`);
       else if (b.type === 'figure') {
@@ -395,16 +395,24 @@ Quarto reads the same file (rename it paper.qmd).
   }
   // print: for the PDF. src(pic): where a picture is (a data: URL unless
   // given). bodyOnly: the page's body, for EPUB.
-  function html(m, { print = false, src = null, bodyOnly = false } = {}) {
+  function html(m, { print = false, src = null, bodyOnly = false, anchors = false } = {}) {
     const font = m.font || 'Georgia, "Times New Roman", serif';
     // a journal sets the page, the numbers and the words of the captions
     const j = m.journal || null;
     const J = j ? Journals() : null;
-    const num = (b) => (m.numbered === false ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    const num = (b) => (m.numbered === false || b.unnumbered ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
     const figWord = j ? j.captions.figure : 'Figure';
     const tabWord = j ? j.captions.table : 'Table';
     const sep = j ? j.captions.sep : '.';
     const body = [];
+    // a draft sent for feedback says first what kind of feedback it asks for
+    if (m.feedback) {
+      body.push(`<aside class="feedback" style="border:1.5px solid #c97c26;border-radius:6px;padding:.8em 1.1em;margin:0 0 2em;font-family:Helvetica,Arial,sans-serif;font-size:10pt;line-height:1.45;column-span:all;text-align:left">`
+        + `<p style="margin:0 0 .4em;text-indent:0;font-weight:bold">${esc(m.feedback.heading)}</p>`
+        + `<p style="margin:0 0 .4em;text-indent:0">${esc(m.feedback.ask)}</p>`
+        + `<ul style="margin:.2em 0 .4em 1.2em;padding:0">${m.feedback.items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>`
+        + `<p style="margin:0;text-indent:0;color:#555">${esc(m.feedback.note)}</p></aside>`);
+    }
     body.push(`<header><h1 class="title">${esc(m.title || '')}</h1>`);
     if (m.subtitle) body.push(`<p class="subtitle">${esc(m.subtitle)}</p>`);
     if (m.authors.length) {
@@ -426,7 +434,7 @@ Quarto reads the same file (rename it paper.qmd).
         const img = (p) => (p.base64 ? `<img src="${src ? esc(src(p)) : `data:${p.mime};base64,${p.base64}`}" alt="${esc(p.alt || '')}">` : '');
         const pics = pictures(b);
         const inner = pics.length > 1
-          ? `<div class="panels">${pics.map((p, i) => `<div class="panel">${img(p)}<div class="subcap"><b>(${panelLetter(i)})</b> ${htmlRuns(p.sub)}</div></div>`).join('')}</div>`
+          ? `<div class="panels">${pics.map((p, i) => `<div class="panel" id="${esc(b.id)}-${panelLetter(i)}">${img(p)}<div class="subcap"><b>(${panelLetter(i)})</b> ${htmlRuns(p.sub)}</div></div>`).join('')}</div>`
           : img(b);
         const cls = [b.wrap ? 'wrap-' + b.wrap : '', b.span ? 'span' : '', pics.length > 1 ? 'multi' : ''].filter(Boolean).join(' ');
         body.push(`<figure id="${esc(b.id)}"${cls ? ` class="${cls}"` : ''}${b.width ? ` style="--w:${b.width}%"` : ''}>${inner}<figcaption><b>${esc(figWord)} ${esc(b.num)}${esc(sep)}</b> ${htmlRuns(b.caption)}</figcaption></figure>`);
@@ -493,6 +501,12 @@ th, td { padding: .25em .7em; text-align: left; vertical-align: top; }
 .references.numeric .csl-entry { display: flex; gap: .6em; }
 .references .csl-left-margin { min-width: 2.2em; }
 .references .csl-right-inline { flex: 1; }`;
+    // a link to every section and figure, unseen: the PDF then records the
+    // page each starts on, so a preview can open where the writer is
+    if (anchors) {
+      const ids = m.blocks.filter((b) => b.id && ['heading', 'figure', 'table', 'equation'].includes(b.type)).map((b) => b.id);
+      body.push(`<nav aria-hidden="true" style="position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;opacity:.01">${ids.map((id) => `<a href="#${esc(id)}">.</a>`).join('')}</nav>`);
+    }
     if (bodyOnly) return body.join('\n');
     const style = j ? J.css(j, { double: m.double }) : css;
     return `<!DOCTYPE html>
@@ -556,7 +570,7 @@ ${body.join('\n')}
     }
     if (m.abstract && m.abstract.length) out.push('ABSTRACT', '', ...m.abstract.map((p) => wrap(textRuns(p)) + '\n'));
     if (m.keywords && m.keywords.length) out.push('Keywords: ' + m.keywords.join(', '), '');
-    const num = (b) => (m.numbered === false ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    const num = (b) => (m.numbered === false || b.unnumbered ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
     for (const b of m.blocks) {
       if (b.type === 'heading') { const h = (num(b) ? num(b) + ' ' : '') + textRuns(b.runs); out.push('', h, (b.level === 1 ? '=' : '-').repeat(Math.min(78, h.length)), ''); }
       else if (b.type === 'para') { const s = textRuns(b.runs).trim(); if (s) out.push(wrap(s), ''); }
@@ -694,7 +708,7 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
     const figWord = j ? j.captions.figure : 'Figure';
     const tabWord = j ? j.captions.table : 'Table';
     const capSep = j ? j.captions.sep : '.';
-    const hnum = (b) => (m.numbered === false ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    const hnum = (b) => (m.numbered === false || b.unnumbered ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
     // the width text runs in (a column's, in two): for equation tabs and pictures
     const cols = j ? j.columns : 1;
     const gap = cols > 1 ? twips(j.gap || '0.25in') : 0;
@@ -743,6 +757,12 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
     const mark = (id, inner) => { bmId++; return `<w:bookmarkStart w:id="${bmId}" w:name="${xml(bm(id))}"/>${inner}<w:bookmarkEnd w:id="${bmId}"/>`; };
     const para = (style, inner, extra = '') => `<w:p><w:pPr><w:pStyle w:val="${style}"/>${extra}</w:pPr>${inner}</w:p>`;
     const body = [];
+    if (m.feedback) {
+      body.push(para('FeedbackNote', run({ text: m.feedback.heading, b: true })));
+      body.push(para('FeedbackNote', run({ text: m.feedback.ask })));
+      for (const i of m.feedback.items) body.push(para('FeedbackNote', run({ text: '•\t' + i })));
+      body.push(para('FeedbackNote', run({ text: m.feedback.note, i: true }), '<w:spacing w:after="360"/>'));
+    }
     body.push(para('Title', run({ text: m.title || '' })));
     if (m.subtitle) body.push(para('Subtitle', run({ text: m.subtitle })));
     if (m.authors.length) {
@@ -804,7 +824,7 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
           return drawing(addImage(src.base64, ext), w, h, p.alt);
         }).filter(Boolean);
         if (art.length) body.push(para('Figure', art.join(run({ text: '  ' }))));
-        const subs = pics.length > 1 ? pics.map((p, i) => run({ text: `(${panelLetter(i)}) `, b: true }) + runsXml(p.sub) + run({ text: ' ' })).join('') : '';
+        const subs = pics.length > 1 ? pics.map((p, i) => mark(`${b.id}-${panelLetter(i)}`, run({ text: `(${panelLetter(i)}) `, b: true })) + runsXml(p.sub) + run({ text: ' ' })).join('') : '';
         body.push(para('Caption', mark(b.id, run({ text: `${figWord} ${b.num}${capSep} `, b: true })) + runsXml(b.caption) + (subs ? run({ text: ' ' }) + subs : '')));
         afterBlock = true;
       } else if (b.type === 'table') {
@@ -840,6 +860,7 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
 <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${xml(font)}" w:hAnsi="${xml(font)}" w:cs="${xml(font)}" w:eastAsia="${xml(font)}"/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/><w:lang w:val="en-US"/></w:rPr></w:rPrDefault>
 <w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="${line}" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
 ${style('Normal', 'Normal', '', '', '<w:qFormat/>')}
+${style('FeedbackNote', 'Feedback Request', '<w:pBdr><w:left w:val="single" w:sz="18" w:space="8" w:color="C97C26"/></w:pBdr><w:ind w:left="240"/><w:spacing w:after="40" w:line="276" w:lineRule="auto"/><w:tabs><w:tab w:val="left" w:pos="480"/></w:tabs>', '<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="20"/>', '<w:basedOn w:val="Normal"/>')}
 ${style('BodyText', 'Body Text', '<w:ind w:firstLine="360"/>', '', '<w:basedOn w:val="Normal"/><w:qFormat/>')}
 ${style('FirstParagraph', 'First Paragraph', '<w:ind w:firstLine="0"/>', '', '<w:basedOn w:val="BodyText"/><w:next w:val="BodyText"/><w:qFormat/>')}
 ${style('Title', 'Title', '<w:jc w:val="center"/><w:spacing w:after="160" w:line="276" w:lineRule="auto"/>', '<w:b/><w:sz w:val="36"/><w:szCs w:val="36"/>', '<w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>')}

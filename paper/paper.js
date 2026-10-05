@@ -117,6 +117,7 @@ async function paperOpen() {
   paper.citeText = new Map();
   paper.linkedStamp = null;
   paper.linkedPath = null;
+  paper.previewing = null;
   // a paper's own pictures and style are its own: nothing carries over from the last one
   for (const url of paper.figures.values()) url.then((u) => { if (u) URL.revokeObjectURL(u); });
   paper.figures = new Map();
@@ -262,10 +263,21 @@ function paperTitlePage(on) {
   wrap.appendChild(abstractGuide(abs));
   page.appendChild(wrap);
   const count = () => {
-    const n = countWords(abs.innerText || '');
-    wrap.querySelector('.tp-abstract-count').textContent = n ? t('{n} words', { n }) : '';
-    wrap.classList.toggle('empty', !abs.textContent.trim() && !abs.querySelector('.math'));
+    const text = (abs.innerText || '').trim();
+    const n = countWords(text);
+    const j = paperJournal();
+    const lim = j.limits || {};
+    const el = wrap.querySelector('.tp-abstract-count');
+    // against the journal's usual limit, when it has one (docs/writing-principles.md, section 1)
+    if (lim.abstractChars) el.textContent = text ? t('{n} / {max} characters', { n: text.length, max: lim.abstractChars }) : '';
+    else if (lim.abstract) el.textContent = n ? t('{n} / {max} words', { n, max: lim.abstract }) : '';
+    else el.textContent = n ? t('{n} words', { n }) : '';
+    el.classList.toggle('over', lim.abstractChars ? text.length > lim.abstractChars : !!lim.abstract && n > lim.abstract);
+    el.title = lim.note ? t('Typical for {journal}: {note}', { journal: j.name, note: lim.note }) : '';
+    wrap.classList.toggle('empty', !text && !abs.querySelector('.math'));
+    paperAbstractMoves(abs, wrap);
   };
+  wrap.recount = count;
   count();
   abs.addEventListener('input', () => {
     if (abs.innerHTML === '<br>') abs.innerHTML = '';
@@ -326,8 +338,37 @@ const PAPER_SECTIONS = {
   intro: { name: tk('Introduction'), asks: tk('Why, who and when: what is known, what is missing, and what this paper does about it.') },
   methods: { name: tk('Methods'), asks: tk('How and where: enough for an expert to do it again.') },
   results: { name: tk('Results'), asks: tk('What you found, and how you know: one finding per paragraph, each leading to the next.') },
-  conclusions: { name: tk('Discussion'), asks: tk('Why it matters: what the results mean, where they fall short, and what comes next.') }
+  conclusions: { name: tk('Discussion'), asks: tk('Why it matters: what the results mean, where they fall short, and what comes next.') },
+  // the back matter journals ask for, unnumbered
+  acknowledgements: { name: tk('Acknowledgements'), asks: tk('Who helped, and who paid for it, with grant numbers.'), back: true },
+  data: { name: tk('Data availability'), asks: tk('Where the data and code are, and how to get them: a repository and its identifier, or why they can’t be shared.'), back: true },
+  contributions: { name: tk('Author contributions'), asks: tk('Who did what, in CRediT’s terms: conceptualisation, methodology, software, investigation, analysis, writing, supervision, funding.'), back: true },
+  competing: { name: tk('Competing interests'), asks: tk('Anything that could be seen to bear on the work, or “The authors declare no competing interests.”'), back: true }
 };
+// a heading for back matter: by its name, in any language NEO writes it in
+const BACK_MATTER = /^\s*(acknowledge?ments?|funding|data( and code)? availability|code availability|availability of data|author contributions?|contributions|competing interests?|conflicts? of interests?|declaration of interests?|declarations?|ethics( statement)?|supplementary( information| material)?|supporting information|appendix|appendices)\b/i;
+const isBackMatter = (h) => BACK_MATTER.test(h.textContent) || Object.values(PAPER_SECTIONS).some((s) => s.back && h.textContent.trim().toLowerCase() === t(s.name).toLowerCase());
+// Which moves the abstract has made so far, read from how its sentences
+// open: a guess, shown only as a tick in the faint strip under the abstract
+// while it's being written, never a warning
+const MOVE_CUES = [
+  null, // status quo: the first sentence, whatever it says
+  /\b(however|but|yet|although|despite|remains? (unclear|unknown|poorly|elusive|open)|little is known|not (yet )?(known|understood|clear)|lacks?|lacking|limited|limitations?|fails?|unresolved|challeng|problem|gap|undermine|mismatch)/i,
+  /\b(could|would|might|requires?|need(s|ed)?|instead|alternative(ly)?|one (way|approach|solution)|in principle|a (promising|natural) (way|approach)|by contrast)\b/i,
+  /\b(here,? we|we (\w+ly |instead |also |then |first |now )?(present|propose|develop|introduce|use|used|build|built|design|designed|record|recorded|measure|measured|analy[sz]e|analy[sz]ed|combine|combined|test|tested|train|trained|describe|derive|model|simulate)|this (paper|study|work|article))\b/i,
+  /\b(we (\w+ly |also |then |further )?(find|found|show|showed|shown|demonstrate|demonstrated|observe|observed|reveal|revealed|identify|identified|discover|discovered|uncover|uncovered|report)|(results?|data|analys[ie]s) (show|shows|indicate|indicates|suggest|reveal|demonstrate)|(was|were) (sufficient|necessary|associated|correlated|higher|lower))\b/i,
+  /\b(implications?|suggests?|paves?|enables?|opens? (up|the)|could be used|promising|showcases?|advanc(e|es|ing)|broad(er|ly)|generali[sz]|future|impact|insights? into|bridge|our (results|findings|work|research|approach)|these (results|findings))\b/i
+];
+function paperAbstractMoves(abs, wrap) {
+  const text = (abs.innerText || '').replace(/\s+/g, ' ').trim();
+  const sentences = text ? text.split(/(?<=[.!?])\s+(?=[A-Z“"(])/) : [];
+  const items = wrap.querySelectorAll('.tp-abstract-guide li');
+  MOVE_CUES.forEach((cue, i) => {
+    const done = i === 0 ? sentences.length > 0 : sentences.slice(1).some((s) => cue.test(s));
+    if (items[i]) items[i].classList.toggle('done', done);
+  });
+}
+
 function abstractGuide(abs) {
   const ol = document.createElement('ol');
   ol.className = 'tp-abstract-guide';
@@ -553,6 +594,9 @@ function paperEditAuthors() {
     if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target.type !== 'checkbox') { e.preventDefault(); bd.querySelector('.m-ok').click(); }
   });
 }
+// the journal the paper is set for
+const paperJournal = () => NeoJournals.get((book && book.paper && book.paper.journal) || NeoJournals.DEFAULT);
+
 // ORCID's own check digit (ISO 7064 11,2)
 function validOrcid(id) {
   if (!/^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$/.test(id)) return false;
@@ -610,6 +654,12 @@ function paperRenumber() {
   const set = (el, v) => { if (el.dataset.num !== v) el.dataset.num = v; };
   for (const el of document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3, #chapters figure.fig, #chapters figure.tbl, #chapters p.eq')) {
     const level = HEADINGS.indexOf(headingOf(el));
+    if (level >= 0 && isBackMatter(el)) {
+      // Acknowledgements, Data availability…: never numbered, nor counted
+      if (el.dataset.num) delete el.dataset.num;
+      targets.set(el.dataset.id, { kind: 'sec', num: '', label: '“' + el.textContent.trim() + '”', el });
+      continue;
+    }
     if (level >= 0) {
       counts[level]++;
       for (let k = level + 1; k < 3; k++) counts[k] = 0;
@@ -625,6 +675,13 @@ function paperRenumber() {
     if (cap) set(cap, num);
     const label = kind === 'fig' ? t('Figure {n}', { n: num }) : kind === 'tbl' ? t('Table {n}', { n: num }) : t('Equation ({n})', { n: num });
     targets.set(el.dataset.id, { kind, num, label, el });
+    // each panel can be referred to on its own: Figure 2b
+    if (kind === 'fig') {
+      el.querySelectorAll(':scope > .panel').forEach((panel, i) => {
+        const pn = num + String.fromCharCode(97 + i);
+        targets.set(el.dataset.id + '-' + String.fromCharCode(97 + i), { kind: 'fig', num: pn, label: t('Figure {n}', { n: pn }), el: panel });
+      });
+    }
   }
   paper.targets = targets;
   paperHints();
@@ -642,6 +699,7 @@ function paperRenumber() {
 // for any other heading, the rhythm a paragraph keeps. Drawn on the empty
 // line under the heading, never saved, gone at the first letter.
 const SECTION_NAMES = [
+  ['acknowledgements', /acknowledg|funding/i], ['data', /availability/i], ['contributions', /contribution/i], ['competing', /competing|conflict|declaration of interest/i],
   ['intro', /intro|background|motivation/i], ['methods', /method|material|approach|procedure|model|design|setup|data/i],
   ['results', /result|finding|experiment|evaluation/i], ['conclusions', /discuss|conclu|summary|outlook|implication/i]
 ];
@@ -657,7 +715,7 @@ function paperHints() {
     }
     if (!empty || !first) return;
     const named = SECTION_NAMES.find(([, re]) => re.test(h.textContent));
-    const hint = named && h.classList.contains('h1') ? t(PAPER_SECTIONS[named[0]].asks)
+    const hint = named && (h.classList.contains('h1') || PAPER_SECTIONS[named[0]].back) ? t(PAPER_SECTIONS[named[0]].asks)
       : t('Open with what is established, say what this paragraph adds, and close with what it means and where it leads.');
     if (first.dataset.hint !== hint) first.dataset.hint = hint;
     keep.add(first);
@@ -689,9 +747,12 @@ function paperHintsSoon() {
       title.after(el);
     }
     const n = title.textContent.trim().length;
-    el.textContent = n ? t('{n} characters', { n }) : '';
+    const j = paperJournal();
+    const max = (j.limits && j.limits.title) || 100;
+    el.textContent = n ? t('{n} / {max} characters', { n, max }) : '';
+    el.title = j.limits && j.limits.title ? t('Typical for {journal}', { journal: j.name }) : t('About what a conference gives a title to interest people');
     el.style.top = (title.offsetTop + title.offsetHeight + 2) + 'px';
-    el.classList.toggle('long', n > 100);
+    el.classList.toggle('long', n > max);
   };
   title.addEventListener('focus', show);
   title.addEventListener('input', show);
@@ -702,7 +763,7 @@ function paperHintsSoon() {
 function paperTargets() {
   paperRenumber();
   return [...(paper.targets || new Map()).entries()].map(([id, x]) => {
-    const cap = x.el.querySelector && x.el.querySelector('figcaption');
+    const cap = x.el.querySelector && x.el.querySelector(':scope > figcaption, :scope > .subcap');
     const text = x.kind === 'sec' ? x.el.textContent.trim() : x.kind === 'eq' ? x.el.textContent.trim() : (cap ? cap.textContent.trim() : '');
     return { id, kind: x.kind, label: x.kind === 'sec' ? t('Section {n}', { n: x.num }) : x.label, text };
   });
@@ -1313,6 +1374,7 @@ function paperCiteNow() {
     paper.cited = out.order;
     paperShowRefs();
     if (currentTab === 'references') paperLibraryRender();
+    if (touched.size) paperPreviewSoon();
   });
   return paperCiting;
 }
@@ -1388,7 +1450,26 @@ function paperSafe(html, { links = false } = {}) {
 
 /* ---- the @ picker: references to cite, and what can be referred to ---- */
 
-const picker = { el: null, body: null, at: null, rows: [], idx: 0, mode: 'all', busy: false };
+const picker = { el: null, body: null, at: null, rows: [], idx: 0, mode: 'all', busy: false, zotero: { q: '', items: [], timer: null, down: 0 } };
+
+// Zotero's library, searched as the @ is typed (paper:zotero in main.js):
+// a moment after the typing pauses, and not again for a minute if Zotero
+// isn't there
+function pickerZotero(q) {
+  const z = picker.zotero;
+  if (!window.neo.paperZotero || q.trim().length < 3 || Date.now() < z.down || picker.mode === 'xref') return;
+  if (z.q === q) return;
+  clearTimeout(z.timer);
+  z.timer = setTimeout(async () => {
+    let found;
+    try { found = await window.neo.paperZotero(q.trim()); } catch { found = null; }
+    if (found === null) { z.down = Date.now() + 60000; return; }
+    z.q = q;
+    // what isn't in the paper's references already
+    z.items = (found || []).filter((it) => it && it.title && !paper.refs.some((r) => (it.id && r.id === it.id) || NeoReferences.sameWork(r, it)));
+    if (picker.el && pickerQuery() === q) pickerUpdate();
+  }, 250);
+}
 
 function pickerOpenOnAt(e, body) {
   const sel = window.getSelection();
@@ -1472,6 +1553,11 @@ function pickerUpdate() {
       .slice(0, want || picker.mode === 'xref' ? 10 : 4)
       .forEach((x) => rows.push({ kind: 'label', target: x }));
   }
+  // from Zotero, under what the paper already has
+  if (picker.mode !== 'xref' && !ident) {
+    pickerZotero(q);
+    if (picker.zotero.q === q) for (const it of picker.zotero.items.slice(0, 5)) rows.push({ kind: 'zotero', item: it });
+  }
   if (!rows.length) {
     // nothing matches, and nothing ever will at this point: the @ is just an @
     if (words.length > 2 && /\s$/.test(q)) { pickerClose(); return; }
@@ -1498,6 +1584,9 @@ function pickerDraw(q) {
     } else if (row.kind === 'label') {
       main.textContent = row.target.label;
       sub.textContent = row.target.text;
+    } else if (row.kind === 'zotero') {
+      main.textContent = t('From Zotero: {ref}', { ref: NeoReferences.shortLabel({ ...row.item, id: row.item.id || '' }) });
+      sub.textContent = row.item.title || '';
     } else if (row.kind === 'lookup') {
       main.textContent = picker.busy ? t('Looking it up…') : (row.ident.type === 'doi' ? t('Look up DOI {id}', { id: row.ident.id }) : t('Look up arXiv {id}', { id: row.ident.id }));
       sub.textContent = picker.busy ? '' : t('Enter adds it to the references and cites it');
@@ -1567,6 +1656,13 @@ async function pickerChoose() {
     return;
   }
   if (row.kind === 'ref') pickerInsert(citeHtml([{ id: row.item.id }]), row.item.id);
+  else if (row.kind === 'zotero') {
+    // into the paper's references (with Zotero's citation key when it has one), then cited
+    const { items, added, updated } = NeoReferences.mergeReferences(paper.refs, [paperTidyLookup(row.item, row.item.DOI || '')], { keepKeys: !!row.item.id });
+    await paperSaveRefs(items);
+    const id = added[0] || updated[0];
+    if (id) pickerInsert(citeHtml([{ id }]), id);
+  }
   else if (row.kind === 'label') pickerInsert(`<span class="xref" contenteditable="false" data-ref="${escHtml(row.target.id)}">${escHtml(row.target.label)}</span>`);
 }
 // The @ and what was typed after it become the citation. One right after
@@ -1730,7 +1826,9 @@ function paperTidyLookup(csl, doi) {
   if (!it.issued && csl['published-print']) it.issued = csl['published-print'];
   if (!it.issued && csl['published-online']) it.issued = csl['published-online'];
   if (it.issued && it.issued['date-parts']) it.issued = { 'date-parts': [it.issued['date-parts'][0].filter((x) => x != null)] };
-  it.DOI = it.DOI || doi;
+  if (it.DOI || doi) it.DOI = it.DOI || doi;
+  // a citation key that came with it (Zotero's), not a DOI or a URL standing in for one
+  if (typeof csl.id === 'string' && NeoReferences.KEY.test(csl.id) && /^[A-Za-z][^/]*$/.test(csl.id)) it.id = csl.id;
   if (it.abstract) it.abstract = it.abstract.replace(/<[^>]+>/g, '').trim();
   if (it.type === 'journal-article') it.type = 'article-journal';
   if (it.type === 'posted-content' || /arxiv/i.test(it.DOI)) {
@@ -2576,6 +2674,16 @@ function renderPaperNav() {
   });
   row(t('References'), '', 'ps-refs', () => { const el = $('#paper-refs'); if (el) el.scrollIntoView({ behavior: scrollBehavior(), block: 'start' }); },
     paper.cited ? paper.cited.length : 0);
+  // the main text against the journal's usual length, when it has one
+  const j = paperJournal();
+  if (j.limits && j.limits.words) {
+    const words = bookWordCount();
+    const foot = document.createElement('div');
+    foot.className = 'paper-limit' + (words > j.limits.words ? ' over' : '');
+    foot.textContent = t('{n} of about {max} words for {journal}', { n: words.toLocaleString(), max: j.limits.words.toLocaleString(), journal: j.name });
+    foot.title = j.limits.note || '';
+    list.appendChild(foot);
+  }
 }
 // the words of a section: from its heading to the next one
 function sectionWords(h, next) {
@@ -2646,7 +2754,7 @@ async function createPaperOnShelf(shelf) {
   const meta = await window.neo.createBook({ author: displayAuthor() });
   const chId = 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
   // the shape of a paper, to start from: each section says what it answers until it's written
-  const sections = ['intro', 'methods', 'results', 'conclusions'].map((k) => `<p class="h1" data-id="${paperId('sec')}">${escHtml(t(PAPER_SECTIONS[k].name))}</p><p><br></p>`);
+  const sections = ['intro', 'methods', 'results', 'conclusions', 'acknowledgements', 'data', 'contributions', 'competing'].map((k) => `<p class="h1" data-id="${paperId('sec')}">${escHtml(t(PAPER_SECTIONS[k].name))}</p><p><br></p>`);
   await window.neo.writeChapter(meta.id, chId, sections.join(''));
   meta.format = 'paper';
   meta.chapterOrder = [chId];
@@ -2697,6 +2805,8 @@ document.addEventListener('selectionchange', () => {
 });
 
 async function paperMenu(msg) {
+  // (the preview window closing needs no paper open)
+  if (msg.command === 'previewClosed') { paper.previewing = null; clearTimeout(paperPreviewTimer); return; }
   if (!book || !isPaper()) { toast(t('Open a paper first')); return; }
   const m = paperMeta();
   const c = msg.command;
@@ -2712,9 +2822,13 @@ async function paperMenu(msg) {
       await paperCiteNow();
     }
     await saveMeta();
+    const wrap = $('#tp-abstract-wrap');
+    if (wrap && wrap.recount) wrap.recount();
+    renderNav();
     const st = NeoCite.STYLES.find((x) => x.id === m.style);
     toast(t('Set for {journal}{style}. File → Preview shows it as printed.', { journal: j.name, style: j.csl && st ? t(', with citations in {style}', { style: st.title }) : '' }), 6000);
   } else if (c === 'preview') paperPreview(msg.value);
+  else if (c === 'feedback') paperFeedback();
   else if (c === 'equation') paperInsertEquation();
   else if (c === 'table') paperInsertTable();
   else if (c === 'figure') {
@@ -2906,7 +3020,7 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
   for (const p of abs.querySelectorAll('p')) if (p.textContent.trim()) model.abstract.push(await runsOf(p));
   for (const body of paperBodies()) {
     for (const el of body.children) {
-      if (el.matches('p.h1, p.h2, p.h3')) model.blocks.push({ type: 'heading', level: HEADINGS.indexOf(headingOf(el)) + 1, num: el.dataset.num || '', id: el.dataset.id, runs: await runsOf(el) });
+      if (el.matches('p.h1, p.h2, p.h3')) model.blocks.push({ type: 'heading', level: HEADINGS.indexOf(headingOf(el)) + 1, num: el.dataset.num || '', unnumbered: isBackMatter(el), id: el.dataset.id, runs: await runsOf(el) });
       else if (el.matches('p.eq')) model.blocks.push({ type: 'equation', id: el.dataset.id, num: el.dataset.num || '', tex: el.textContent, ...(await mathRun(el.textContent, true)) });
       else if (el.matches('figure.fig')) {
         // a picture: its file, and for Word and LaTeX a PNG of an SVG, and its size
@@ -3003,16 +3117,18 @@ async function paperExport(format) {
 // File → Preview (⌥⌘P) and Preview As: the paper as a journal would print
 // it, in a window of its own. Only the look changes: the journal set in
 // Format → Journal stays as it is.
-async function paperPreview(journalId) {
+async function paperPreview(journalId, { quiet = false } = {}) {
   if (!window.neo.paperPreview) { toast(t('Previews are made by the desktop app')); return; }
   const j = NeoJournals.get(journalId || paperMeta().journal || NeoJournals.DEFAULT);
-  const note = setTimeout(() => toast(t('Setting the paper as {journal}…', { journal: j.name })), 300);
+  // the window keeps showing the paper as it's written (paperPreviewSoon)
+  paper.previewing = journalId || '';
+  const note = quiet ? null : setTimeout(() => toast(t('Setting the paper as {journal}…', { journal: j.name })), 300);
   try {
     // in the journal's own citation style when it has one: for the preview only
     const viewing = journalId && journalId !== (paperMeta().journal || NeoJournals.DEFAULT);
     const model = await paperModel({ journal: j.id, style: viewing && j.csl ? j.csl : null });
     const title = (isUntitled(book.title) ? t('Untitled') : book.title) + ' — ' + j.name;
-    await window.neo.paperPreview(NeoPaperExport.html(model, { print: true }), title);
+    await window.neo.paperPreview(NeoPaperExport.html(model, { print: true, anchors: true }), title, { focus: paperCaretAnchor(), quiet });
   } catch (err) {
     window.neo.logError('paper preview: ' + (err && err.stack || err));
     toast(t('Couldn’t make the preview: {error}', { error: plainError(err) }), 8000);
@@ -3020,6 +3136,72 @@ async function paperPreview(journalId) {
     clearTimeout(note);
   }
 }
+
+// File → Draft for Feedback…: the paper as a PDF to comment on, or a Word
+// file to track changes in, opening with the kind of feedback it asks for
+// (docs/writing-principles.md, section 5): reviewers asked for one level
+// give that one, and the writer isn't sent spelling fixes on a draft whose
+// argument is still moving.
+const FEEDBACK_LEVELS = {
+  top: { name: tk('Top-level'), what: tk('The idea and the argument'), items: [tk('Is the idea good, and does it suit where it’s going?'), tk('Is the argument self-consistent and logical?'), tk('Does the story hold: the problem, what was done, what was found, why it matters?')] },
+  coarse: { name: tk('Coarse-grained'), what: tk('The structure and the style'), items: [tk('Does the style suit the venue?'), tk('Is every paragraph there for a reason, and do they talk to each other?'), tk('What can be taken away?'), tk('What should be added?')] },
+  fine: { name: tk('Fine-grained'), what: tk('The sentences'), items: [tk('Spelling and grammar'), tk('Consistency of terms and style'), tk('Anything that reads awkwardly (marking what’s only a preference)')] }
+};
+async function paperFeedback() {
+  const level = await optionModal(t('What feedback do you want?'), t('Asking for one kind at a time gets better answers. The draft opens with your request.'),
+    Object.entries(FEEDBACK_LEVELS).map(([value, l]) => ({ label: t(l.name), desc: t(l.what) + ': ' + l.items.map((i) => t(i)).join(' '), value })));
+  if (!level) return;
+  const format = await optionModal(t('Send it as'), null, [
+    { label: 'PDF', desc: t('To read and comment on'), value: 'pdf' },
+    { label: 'Word (.docx)', desc: t('To edit with tracked changes'), value: 'docx' }
+  ]);
+  if (!format) return;
+  const l = FEEDBACK_LEVELS[level];
+  const model = await paperModel({ png: format === 'docx' });
+  model.feedback = {
+    heading: t('Draft for feedback — {date}', { date: new Date().toLocaleDateString(NeoI18n.getLocale(), { year: 'numeric', month: 'long', day: 'numeric' }) }),
+    ask: t('I’m asking for {level} feedback: {what}.', { level: t(l.name).toLowerCase(), what: t(l.what).toLowerCase() }),
+    items: l.items.map((i) => t(i)),
+    note: t('Please leave the other kinds for a later draft.')
+  };
+  const name = safeName(isUntitled(book.title) ? t('Untitled') : book.title) + '-' + t('for-feedback');
+  try {
+    const saved = await window.neo.exportSave(format === 'pdf'
+      ? { format: 'pdf', defaultName: name, content: NeoPaperExport.html(model, { print: true }), print: 'paper' }
+      : { format: 'docx', defaultName: name, zipEntries: NeoPaperExport.docx(model) });
+    if (saved) toast(t('Exported: {file}', { file: saved.split(/[\\/]/).pop() }));
+  } catch (err) {
+    window.neo.logError('feedback draft: ' + (err && err.stack || err));
+    toast(t('Couldn’t export: {error}', { error: plainError(err) }), 8000);
+  }
+}
+
+// The section (or figure, table, equation) the caret is in or just after
+function paperCaretAnchor() {
+  const sel = window.getSelection();
+  let el = sel && sel.rangeCount ? sel.anchorNode : null;
+  if (el && el.nodeType === 3) el = el.parentElement;
+  const body = el && el.closest ? el.closest('.chapter-body') : null;
+  if (!body) return '';
+  let block = el;
+  while (block && block.parentElement !== body) block = block.parentElement;
+  for (let b = block; b; b = b.previousElementSibling) {
+    if (b.dataset && b.dataset.id && b.matches('p.h1, p.h2, p.h3, figure, p.eq')) return b.dataset.id;
+  }
+  return '';
+}
+// A redraw of an open preview, a few seconds after the writing stops
+let paperPreviewTimer = null;
+function paperPreviewSoon() {
+  if (paper.previewing === undefined || paper.previewing === null || !book || !isPaper()) return;
+  clearTimeout(paperPreviewTimer);
+  paperPreviewTimer = setTimeout(() => {
+    if (paper.previewing !== undefined && paper.previewing !== null && book && isPaper()) paperPreview(paper.previewing, { quiet: true });
+  }, 3000);
+}
+document.addEventListener('input', (e) => {
+  if (e.target && e.target.closest && e.target.closest('#paper')) paperPreviewSoon();
+}, true);
 
 // The email snapshot of a paper, as it prints
 async function paperPrintHtml() {

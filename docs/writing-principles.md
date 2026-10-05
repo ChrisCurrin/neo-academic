@@ -141,11 +141,12 @@ should be enforced while the writer types.
 
 | Principle | Where |
 |---|---|
-| Constraints as opportunities | The abstract's word count; the title's length while it's edited |
-| Abstract mirrors the paper | The abstract guide: six moves in the colours of the sections they preview (`ABSTRACT_MOVES` in `paper/paper.js`) |
-| Same shape at every scale | A new paper starts with Introduction, Methods, Results and Discussion; an empty section shows what it answers and the paragraph rhythm |
-| Consistency is NEO's job | Numbering, cross-references, citation style and journal layout each come from one setting |
-| Separate modes | Guides appear only on empty space; spellcheck runs only as a pass; previews and exports are separate from the page |
+| Constraints as opportunities | The title, abstract and main text counted against the journal's usual limits (`limits` in `paper/journals.js`), shown beside each count and in the section pane |
+| Abstract mirrors the paper | The abstract guide: six moves in the colours of the sections they preview (`ABSTRACT_MOVES` in `paper/paper.js`), each ticked off quietly once a sentence makes it (`MOVE_CUES`) |
+| Same shape at every scale | A new paper starts with Introduction, Methods, Results and Discussion, then the back matter journals ask for (Acknowledgements, Data availability, Author contributions, Competing interests, unnumbered); an empty section shows what it answers and the paragraph rhythm |
+| Consistency is NEO's job | Numbering, cross-references (down to a panel: Figure 2b), citation style and journal layout each come from one setting |
+| Separate modes | Guides appear only on empty space; spellcheck runs only as a pass; previews and exports are separate from the page, and the preview keeps up without taking the focus |
+| Feedback at a level | File → Draft for Feedback asks for top-level, coarse-grained or fine-grained feedback, and the draft opens with that request and its questions |
 | Set expectations for reviewers | Journal previews show the paper laid out as a journal would print it before it's sent |
 
 ## 8. Not built yet (in order of value)
@@ -154,13 +155,9 @@ should be enforced while the writer types.
    spellcheck pass: filler phrases, passive constructions, and
    comparisons without a stated basis, each flagged with the rule it
    breaks.
-2. **Asking for feedback at a level.** When a draft is emailed or
-   exported for a colleague, let the writer say *top-level*,
-   *coarse-grained* or *fine-grained* and put that request on the first
-   page.
-3. **A paragraph check:** does each paragraph open with context and close
+2. **A paragraph check:** does each paragraph open with context and close
    with a conclusion? Shown as an outline of each paragraph's first and
    last sentences, so gaps in the rhythm are visible at a glance.
-4. **From paper to talk:** a slide outline drawn from the paper. The
+3. **From paper to talk:** a slide outline drawn from the paper. The
    abstract moves become the narrative; figure captions become slide
    titles that ask a question, each with one main result.

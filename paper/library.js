@@ -11,7 +11,7 @@
 'use strict';
 
 let libraryFilter = '';
-let libraryTrash = null; // the reference last deleted, for ⌘Z
+let libraryTrash = null; // the references last removed, with where they stood, for ⌘Z
 
 // From switchTab
 function paperShowReferences() {
@@ -116,9 +116,15 @@ function drawTools() {
     }
   }
   if (paper.refs.length) link(t('Export BibTeX…'), () => doExport('bib'));
+  const cited = new Set(paperCitedIds());
+  const uncited = paper.refs.filter((r) => !cited.has(r.id));
+  // before submitting: the list down to what the paper cites
+  if (uncited.length && uncited.length < paper.refs.length) {
+    link(t('Remove {n} uncited', { n: uncited.length }), () => paperRemoveRefs(uncited, t('{n} uncited references', { n: uncited.length })),
+      t('Take out every reference the paper doesn’t cite; {key} brings them back', { key: KZ }));
+  }
   const count = document.createElement('span');
   count.className = 'rl-count';
-  const cited = new Set(paperCitedIds());
   count.textContent = paper.refs.length ? t('{n} references · {c} cited', { n: paper.refs.length, c: paper.refs.filter((r) => cited.has(r.id)).length }) : '';
   box.appendChild(count);
 }
@@ -268,19 +274,26 @@ async function paperDeleteRef(it, cited) {
       [{ label: t('Remove'), value: true, danger: true }]);
     if (!ok) return;
   }
-  libraryTrash = { item: it, at: paper.refs.indexOf(it) };
-  await paperSaveRefs(paper.refs.filter((r) => r !== it));
-  toast(t('Removed {ref} — {key} brings it back', { ref: NeoReferences.shortLabel(it), key: KZ }));
+  await paperRemoveRefs([it], NeoReferences.shortLabel(it));
+}
+// references out of the list, remembered where they stood for ⌘Z
+async function paperRemoveRefs(items, what) {
+  const gone = new Set(items);
+  libraryTrash = paper.refs.map((item, at) => ({ item, at })).filter((x) => gone.has(x.item));
+  await paperSaveRefs(paper.refs.filter((r) => !gone.has(r)));
+  toast(t('Removed {ref} — {key} brings it back', { ref: what, key: KZ }));
   paperLibraryRender();
 }
 document.addEventListener('keydown', async (e) => {
   if (!libraryTrash || currentTab !== 'references' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.code !== 'KeyZ') return;
-  if (e.target && e.target.closest && e.target.closest('textarea, input')) return;
+  // ⌘Z in a box with words in it takes back typing; the search box, empty, is where the caret sits after a removal
+  const box = e.target && e.target.closest && e.target.closest('textarea, input');
+  if (box && box.value) return;
   e.preventDefault();
-  const { item, at } = libraryTrash;
+  const back = libraryTrash;
   libraryTrash = null;
   const items = [...paper.refs];
-  items.splice(Math.min(at, items.length), 0, item);
+  for (const { item, at } of back) items.splice(Math.min(at, items.length), 0, item);
   await paperSaveRefs(items);
   paperLibraryRender();
 });

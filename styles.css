@@ -1982,6 +1982,11 @@ body.night #paper.paper-mode { --sec-title: #c08aa4; --sec-intro: #7fb5bf; --sec
 #tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide li::before { content: '●'; color: var(--sec); font-size: 8px; margin-right: 4px; vertical-align: 1px; }
 #tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide li:not(:last-child)::after { content: '→'; margin: 0 5px; opacity: 0.6; }
 #tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide b { font-weight: 400; }
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide li.done { color: var(--paper-soft); }
+#tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide li.done::before { content: '✓'; font-size: 10px; vertical-align: 0; }
+.tp-abstract-count.over, #tp-title-count.long { color: var(--sec-conclusions); opacity: 1; }
+#nav-pane.paper .paper-limit { padding: 14px 18px; font-size: 11.5px; color: #7d7d7d; }
+#nav-pane.paper .paper-limit.over { color: #d9954a; }
 #tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide span, #tp-abstract-wrap.writing:not(.empty) .tp-abstract-guide em { display: none; }
 #tp-abstract-wrap.empty #tp-abstract:empty::before { font-style: normal; }
 .tp-abstract-count { position: absolute; right: 0; top: 2px; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; color: var(--paper-faint); opacity: 0; transition: opacity 0.15s; }
@@ -1995,7 +2000,6 @@ body.night #paper.paper-mode { --sec-title: #c08aa4; --sec-intro: #7fb5bf; --sec
 body.night #tp-authors.empty, body.night #tp-abstract:empty::before, body.night #tp-keywords:empty::before { color: #5f5b52; }
 
 #tp-title-count { position: absolute; left: 0; right: 0; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; color: var(--paper-faint); text-align: center; pointer-events: none; }
-#tp-title-count.long { color: var(--sec-conclusions); }
 #title-page.paper-title { position: relative; }
 
 /* --- the text --- */
@@ -2131,6 +2135,8 @@ body.light .fig-tools button:hover { background: #f0ede7; color: #1c1a17; }
 .paper-picker .pp-sub { color: #8c877d; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .paper-picker .pp-label .pp-main { color: #cdb98f; }
 .paper-picker .pp-lookup .pp-main { color: var(--accent); }
+.paper-picker .pp-zotero .pp-main { color: #d0a7a7; }
+body.light .paper-picker .pp-zotero .pp-main { color: #a3443c; }
 .paper-picker .pp-hint { cursor: default; }
 .paper-picker .pp-hint .pp-main { color: #aaa; font-style: italic; }
 .paper-picker .pp-hint .pp-sub { white-space: normal; }

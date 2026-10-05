@@ -111,11 +111,14 @@ test('New Paper on a shelf makes a paper and opens it on its title page', async 
   assert.equal(await js(`document.querySelector('.tab[data-tab="references"]').hidden`), false);
   assert.equal(await js(`document.querySelector('.tab[data-tab="outline"]').hidden`), true);
   // the shape of a paper to start from, each empty section saying what it answers
-  assert.deepEqual(await js(`[...document.querySelectorAll('.chapter-body p.h1')].map((h) => h.textContent)`), ['Introduction', 'Methods', 'Results', 'Discussion']);
+  assert.deepEqual(await js(`[...document.querySelectorAll('.chapter-body p.h1')].map((h) => h.textContent)`),
+    ['Introduction', 'Methods', 'Results', 'Discussion', 'Acknowledgements', 'Data availability', 'Author contributions', 'Competing interests']);
+  assert.deepEqual(await js(`[...document.querySelectorAll('.chapter-body p.h1')].map((h) => h.dataset.num || '')`), ['1', '2', '3', '4', '', '', '', ''], 'back matter goes unnumbered');
   assert.match(await js(`document.querySelector('.chapter-body p[data-hint]').dataset.hint`), /^Why, who and when/);
-  assert.equal(await js(`document.querySelectorAll('.chapter-body p[data-hint]').length`), 4);
+  assert.equal(await js(`document.querySelectorAll('.chapter-body p[data-hint]').length`), 8);
+  assert.match(await js(`document.querySelectorAll('.chapter-body p[data-hint]')[5].dataset.hint`), /^Where the data and code are/);
   await type('Inhibition in cortical circuits');
-  assert.equal(await js(`document.getElementById('tp-title-count').textContent`), '31 characters');
+  assert.equal(await js(`document.getElementById('tp-title-count').textContent`), '31 / 100 characters');
   await snap('new-paper');
   const { html } = await saved();
   assert.doesNotMatch(html, /data-hint/, 'the hints are never saved');
@@ -133,9 +136,18 @@ test('the empty abstract shows its six moves; writing it leaves only their names
     ['Status quo', 'Problem', 'Broader solution', 'What we did', 'What we found', 'Implications']);
   assert.equal(await shown(), 'block', 'the scaffold, while the abstract is empty');
   await snap('abstract-empty');
+  BrowserWindow.fromWebContents(wc).focus();
   await js(`document.getElementById('tp-abstract').focus()`);
   await type('Cortex keeps excitation and inhibition in balance.');
   assert.equal(await shown(), 'flex', 'only the names, while writing');
+  assert.equal(await js(`document.querySelectorAll('.tp-abstract-guide li.done').length`), 1, 'one sentence: the status quo');
+  // the workshop's own abstract makes all six moves
+  await js(`(() => {
+    const a = document.getElementById('tp-abstract');
+    a.innerHTML = '<p>Artificial neural networks simplify complex biological circuits into tractable computational models. It is often said that the simplicity of artificial models undermines their applicability to real brain dynamics. Typical efforts to address this mismatch add complexity to increasingly unwieldy models. We instead use simplified cortical cultures derived from human stem cells to compare model and reality. We uncovered surprisingly variable network activity across cultures from families with a common genetic variant. Our research showcases a promising personalised medicine approach for epilepsy.</p>';
+    a.dispatchEvent(new Event('input'));
+  })()`);
+  assert.deepEqual(await js(`[...document.querySelectorAll('.tp-abstract-guide li')].map((l) => l.classList.contains('done'))`), [true, true, true, true, true, true]);
   await snap('abstract-writing');
   await js(`document.getElementById('tp-title').focus()`);
   await tick(100);
@@ -425,11 +437,119 @@ test('a journal sets the page, the citation style and the LaTeX class; Preview A
   await js(`paperPreview()`);
   await tick(2500);
   assert.match(preview.getTitle(), /— IEEE \(two-column\)$/);
+  // it keeps up with the writing, quietly, and opens where the caret is
+  const was = preview.webContents.getURL();
+  BrowserWindow.fromWebContents(wc).focus(); // the writer back at the page
+  await tick(200);
+  await caretAtEnd();
+  await type(' More.');
+  for (let i = 0; i < 40 && preview.webContents.getURL() === was; i++) await tick(200);
+  assert.notEqual(preview.webContents.getURL(), was, 'redrawn after the typing paused');
+  assert.match(preview.webContents.getURL(), /#page=\d+$/, 'at the page of the section being written: ' + (await js('paperCaretAnchor()')) + ' ' + preview.webContents.getURL());
+  assert.equal(BrowserWindow.getFocusedWindow() && BrowserWindow.getFocusedWindow().webContents, wc, 'the page keeps the focus');
   if (SHOTS) fs.writeFileSync(path.join(SHOTS, 'preview-ieee.png'), (await preview.webContents.capturePage()).toPNG());
   preview.close();
   await js(`paperMenu({ command: 'journal', value: 'preprint' })`);
   await js(`paperMenu({ command: 'style', value: 'apa' })`);
   await tick(800);
+});
+
+test('a journal’s limits beside the counts: title, abstract, and the main text in the pane', async () => {
+  BrowserWindow.fromWebContents(wc).focus(); // back from the preview window
+  await tick(200);
+  await js(`paperMenu({ command: 'journal', value: 'nature' })`);
+  await tick(800);
+  assert.match(await js(`(document.querySelector('.tp-abstract-count') || {}).textContent || 'none'`), /^\d+ \/ 200 words$/);
+  await js(`document.getElementById('tp-title').focus()`);
+  await tick(100);
+  assert.equal(await js(`(document.getElementById('tp-title-count') || {}).textContent || 'none'`), '31 / 90 characters');
+  await js(`document.getElementById('nav-pane').classList.add('open'); renderNav()`);
+  await tick(200);
+  assert.match(await js(`(document.querySelector('#nav-list .paper-limit') || {}).textContent || document.getElementById('nav-list').textContent.slice(0, 200)`), /^\d+ of about 4,300 words for Nature$/);
+  await js(`document.getElementById('nav-pane').classList.remove('open')`);
+  await js(`paperMenu({ command: 'journal', value: 'preprint' })`);
+  await js(`paperMenu({ command: 'style', value: 'apa' })`);
+  await tick(800);
+});
+
+test('a panel can be referred to on its own: Figure 1b', async () => {
+  await caretAtEnd();
+  await type(' See @fig');
+  const rows = await js(`[...document.querySelectorAll('.paper-picker .pp-main')].map((r) => r.textContent)`);
+  assert.ok(rows.includes('Figure 1a') && rows.includes('Figure 1b'), rows.join(', '));
+  await key('Down');
+  await key('Down');
+  await key('Enter');
+  await tick(300);
+  assert.match(await js(`document.querySelector('.chapter-body').lastElementChild.innerHTML`), /<span class="xref" contenteditable="false" data-ref="fig-\w+-b">Figure 1b<\/span>/);
+  await type('.');
+});
+
+test('Draft for Feedback: the level asked for, on the first page', async () => {
+  const before = new Set(fs.readdirSync(OUT));
+  await js(`void paperFeedback()`); // it waits on the dialogs, so don't wait on it
+  await tick(300);
+  await js(`[...document.querySelectorAll('.modal-backdrop')].pop().querySelectorAll('.fr-choice')[1].click()`); // coarse-grained
+  await tick(300);
+  await js(`[...document.querySelectorAll('.modal-backdrop')].pop().querySelectorAll('.fr-choice')[1].click()`); // Word
+  for (let i = 0; i < 40 && fs.readdirSync(OUT).filter((f) => !before.has(f)).length < 1; i++) await tick(200);
+  const made = fs.readdirSync(OUT).filter((f) => !before.has(f));
+  assert.deepEqual(made, ['Inhibition-in-cortical-circuits-for-feedback.docx']);
+  const doc = await (await require('jszip').loadAsync(fs.readFileSync(path.join(OUT, made[0])))).file('word/document.xml').async('string');
+  assert.match(doc, /<w:pStyle w:val="FeedbackNote"\/><\/w:pPr><w:r><w:rPr><w:b\/><\/w:rPr><w:t xml:space="preserve">Draft for feedback — /);
+  assert.match(doc, /I’m asking for coarse-grained feedback: the structure and the style\./);
+  assert.match(doc, /What can be taken away\?/);
+  fs.unlinkSync(path.join(OUT, made[0]));
+});
+
+test('remove the references the paper doesn’t cite; ⌘Z brings them back', async () => {
+  await js(`paperImportText('@book{unused2001, author = {Nobody, A.}, title = {Never Cited}, year = {2001}}', 'test')`);
+  await js(`switchTab('references')`);
+  await tick(400);
+  assert.equal(await js(`paper.refs.length`), 3);
+  const tool = `[...document.querySelectorAll('#references-view .rl-tool')].find((b) => /uncited/.test(b.textContent))`;
+  assert.equal(await js(`${tool}.textContent`), 'Remove 1 uncited');
+  await js(`${tool}.click()`);
+  await tick(400);
+  assert.deepEqual(await js(`paper.refs.map((r) => r.id)`), ['smith2020neural', 'doe2019brains']);
+  await key('z', [process.platform === 'darwin' ? 'meta' : 'control']);
+  await tick(400);
+  assert.equal(await js(`paper.refs.length`), 3);
+  await js(`paperRemoveRefs(paper.refs.filter((r) => r.id === 'unused2001'), 'x')`);
+  await js(`switchTab('manuscript')`);
+  await tick(300);
+});
+
+test('@ finds references in Zotero (here, a stand-in answering as Better BibTeX does)', async () => {
+  const http = require('http');
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      const q = (JSON.parse(body || '{}').params || [''])[0];
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: /hub/i.test(q) ? [{ citekey: 'hubel1962receptive', type: 'article-journal', title: 'Receptive fields, binocular interaction and functional architecture in the cat’s visual cortex', author: [{ family: 'Hubel', given: 'David H.' }, { family: 'Wiesel', given: 'Torsten N.' }], 'container-title': 'The Journal of Physiology', issued: { 'date-parts': [[1962]] }, DOI: '10.1113/jphysiol.1962.sp006837' }] : [] }));
+    });
+  });
+  const up = await new Promise((resolve) => { server.once('error', () => resolve(false)); server.listen(23119, '127.0.0.1', () => resolve(true)); });
+  if (!up) { console.log('  (port 23119 is taken, a real Zotero is running: skipped)'); return; }
+  try {
+    await js(`picker.zotero.down = 0`); // the @s typed earlier found no Zotero, and it waits a minute before asking again
+    await caretAtEnd();
+    await type(' Classic work @hube');
+    await tick(900);
+    await js(`pickerUpdate()`);
+    await tick(100);
+    assert.match(await js(`document.querySelector('.paper-picker .pp-zotero .pp-main').textContent`), /From Zotero: Hubel & Wiesel 1962/);
+    await snap('zotero-picker');
+    await js(`(() => { picker.idx = picker.rows.findIndex((r) => r.kind === 'zotero'); return pickerChoose(); })()`);
+    await tick(800);
+    assert.ok(await js(`paper.refs.some((r) => r.id === 'hubel1962receptive')`), 'added with Zotero’s citation key');
+    assert.match(await js(`document.querySelector('.chapter-body').lastElementChild.innerHTML`), /data-cite="\[\{&quot;id&quot;:&quot;hubel1962receptive&quot;\}\]">\(Hubel &amp; Wiesel, 1962\)<\/span>/);
+    await type('.');
+  } finally {
+    server.close();
+  }
 });
 
 test('a numeric style numbers by first citation', async () => {
@@ -453,7 +573,7 @@ test('every way out', async () => {
   const html = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.html'))), 'utf8');
   assert.match(html, /<h1 class="title">Inhibition in cortical circuits<\/h1>/);
   assert.match(html, /\(Doe, 2019; Smith et al\., 2020\)/);
-  assert.match(html, /<figure id="fig-\w+" class="multi"><div class="panels"><div class="panel"><img src="data:image\/png;base64,/);
+  assert.match(html, /<figure id="fig-\w+" class="multi"><div class="panels"><div class="panel" id="fig-\w+-a"><img src="data:image\/png;base64,/);
   assert.match(html, /<div class="eq" id="eq-\w+"><span class="eq-body"><svg/);
   assert.match(html, /Smith, J\., Doe, J\., (&amp;|&#38;) Lee, A\. \(2020\)/);
   const pdf = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.pdf'))));
