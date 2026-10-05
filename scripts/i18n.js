@@ -8,21 +8,15 @@
 //   node scripts/i18n.js check fr-CA   the same for a regional file, which
 //                                      only holds what differs from fr.json
 //
-// Strings are found in t('…'), tk('…'), tr('…'), translate('…'), and
-// (window.)?NeoI18n.t('…') calls in the JavaScript, plus index.html data-i18n*.
+// Strings are found in t('…'), tk('…') and NeoI18n.t('…') calls in the
+// JavaScript, and in the data-i18n* attributes of index.html.
 
 'use strict';
 const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const JS_FILES = [
-  'app.js', 'main.js', 'covers.js',
-  'academic/academic.js', 'academic/academic-assets.js', 'academic/academic-export.js', 'academic/academic-math.js',
-  'academic/academic-model.js', 'academic/academic-objects.js', 'academic/academic-review.js',
-  'academic/academic-search.js', 'academic/academic-ui.js', 'academic/academic-clipboard.js',
-  'academic/references.js', 'academic/csl-renderer.js', 'pdf-render.js'
-];
+const JS_FILES = ['app.js', 'main.js', 'covers.js'];
 const LOCALES = path.join(ROOT, 'locales');
 
 function unescapeJs(s) {
@@ -37,143 +31,6 @@ const decodeHtml = (s) => s
   .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
   .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
 
-function skipStringOrComment(src, i) {
-  const quote = src[i];
-  if (quote === "'" || quote === '"' || quote === '`') {
-    for (let j = i + 1; j < src.length; j++) {
-      if (src[j] === '\\') j++;
-      else if (src[j] === quote) return j + 1;
-    }
-    return src.length;
-  }
-  if (src[i] === '/' && src[i + 1] === '/') {
-    const end = src.indexOf('\n', i + 2);
-    return end < 0 ? src.length : end + 1;
-  }
-  if (src[i] === '/' && src[i + 1] === '*') {
-    const end = src.indexOf('*/', i + 2);
-    return end < 0 ? src.length : end + 2;
-  }
-  return i;
-}
-
-function matchingDelimiter(src, start) {
-  const pairs = { '(': ')', '[': ']', '{': '}' };
-  const stack = [];
-  for (let i = start; i < src.length; i++) {
-    const skipped = skipStringOrComment(src, i);
-    if (skipped !== i) { i = skipped - 1; continue; }
-    if (pairs[src[i]]) stack.push(pairs[src[i]]);
-    else if (src[i] === ')' || src[i] === ']' || src[i] === '}') {
-      if (stack.pop() !== src[i]) return -1;
-      if (!stack.length) return i;
-    }
-  }
-  return -1;
-}
-
-function topLevelIndex(src, target) {
-  const stack = [];
-  for (let i = 0; i < src.length; i++) {
-    const skipped = skipStringOrComment(src, i);
-    if (skipped !== i) { i = skipped - 1; continue; }
-    if (src[i] === target && !stack.length) return i;
-    if (src[i] === '(') stack.push(')');
-    else if (src[i] === '[') stack.push(']');
-    else if (src[i] === '{') stack.push('}');
-    else if (src[i] === ')' || src[i] === ']' || src[i] === '}') stack.pop();
-  }
-  return -1;
-}
-
-function staticString(src) {
-  const value = src.trim();
-  if (value.length < 2 || !["'", '"'].includes(value[0]) || value[value.length - 1] !== value[0]) return null;
-  if (skipStringOrComment(value, 0) !== value.length) return null;
-  return unescapeJs(value.slice(1, -1));
-}
-
-function staticStrings(expression) {
-  const literal = staticString(expression);
-  if (literal !== null) return [literal];
-  const question = topLevelIndex(expression, '?');
-  if (question < 0) return [];
-  const colon = topLevelIndex(expression.slice(question + 1), ':');
-  if (colon < 0) return [];
-  const yes = staticString(expression.slice(question + 1, question + 1 + colon));
-  const no = staticString(expression.slice(question + 2 + colon));
-  return yes === null || no === null ? [] : [yes, no];
-}
-
-function collectStaticProperties(src, property, file, add) {
-  const isStart = (c) => /[A-Za-z_$]/.test(c || '');
-  const isPart = (c) => /[\w$]/.test(c || '');
-  for (let i = 0; i < src.length;) {
-    const skipped = skipStringOrComment(src, i);
-    if (skipped !== i) { i = skipped; continue; }
-    if (!isStart(src[i])) { i++; continue; }
-    const start = i++;
-    while (isPart(src[i])) i++;
-    if (src.slice(start, i) !== property || src[start - 1] === '.') continue;
-    let cursor = i;
-    while (/\s/.test(src[cursor] || '')) cursor++;
-    if (src[cursor] !== ':') continue;
-    const valueStart = cursor + 1;
-    const stack = [];
-    let end = valueStart;
-    for (; end < src.length; end++) {
-      const valueSkipped = skipStringOrComment(src, end);
-      if (valueSkipped !== end) { end = valueSkipped - 1; continue; }
-      if (!stack.length && [',', '}', ']'].includes(src[end])) break;
-      if (src[end] === '(') stack.push(')');
-      else if (src[end] === '[') stack.push(']');
-      else if (src[end] === '{') stack.push('}');
-      else if (src[end] === ')' || src[end] === ']' || src[end] === '}') stack.pop();
-    }
-    for (const value of staticStrings(src.slice(valueStart, end))) add(value, file);
-    i = end;
-  }
-}
-
-function collectAcademicUiStrings(src, file, add) {
-  const isStart = (c) => /[A-Za-z_$]/.test(c || '');
-  const isPart = (c) => /[\w$]/.test(c || '');
-  for (let i = 0; i < src.length;) {
-    const skipped = skipStringOrComment(src, i);
-    if (skipped !== i) { i = skipped; continue; }
-    if (!isStart(src[i])) { i++; continue; }
-    const start = i++;
-    while (isPart(src[i])) i++;
-    const name = src.slice(start, i);
-    if (!['dialog', 'makeButton'].includes(name) || src[start - 1] === '.') continue;
-    let open = i;
-    while (/\s/.test(src[open] || '')) open++;
-    if (src[open] !== '(') continue;
-    const args = src.slice(open + 1);
-    const firstComma = topLevelIndex(args, ',');
-    if (firstComma < 0) continue;
-    const firstArgument = args.slice(0, firstComma);
-    if (name === 'makeButton') {
-      for (const value of staticStrings(firstArgument)) add(value, file);
-      continue;
-    }
-    for (const value of staticStrings(firstArgument)) add(value, file);
-    let fields = args.slice(firstComma + 1).trimStart();
-    if (fields[0] === '[') {
-      const end = matchingDelimiter(fields, 0);
-      if (end < 0) continue;
-      collectStaticProperties(fields.slice(1, end), 'label', file, add);
-      fields = fields.slice(end + 1).trimStart();
-    }
-    if (fields[0] === ',') fields = fields.slice(1).trimStart();
-    const options = fields;
-    if (options[0] === '{') {
-      const end = matchingDelimiter(options, 0);
-      if (end >= 0) collectStaticProperties(options.slice(1, end), 'submit', file, add);
-    }
-  }
-}
-
 function collect() {
   const keys = new Map(); // key -> Set(files)
   const add = (k, f) => {
@@ -181,11 +38,10 @@ function collect() {
     if (!keys.has(k)) keys.set(k, new Set());
     keys.get(k).add(f);
   };
-  const call = /(?<![\w$.])(?:window\.)?(?:NeoI18n\.)?(?:translate|tr|tk?)\(\s*'((?:[^'\\\n]|\\.)*)'/g;
+  const call = /(?<![\w$.])(?:NeoI18n\.)?tk?\(\s*'((?:[^'\\\n]|\\.)*)'/g;
   for (const f of JS_FILES) {
     const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
     for (const m of src.matchAll(call)) add(unescapeJs(m[1]), f);
-    if (f === 'academic/academic.js') collectAcademicUiStrings(src, f, add);
   }
   const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
   for (const tag of html.matchAll(/<(\w+)([^>]*)>([^<]*)/g)) {

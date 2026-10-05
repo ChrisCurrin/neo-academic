@@ -25,12 +25,6 @@ pocket/www/jszip.min.js
 pocket/www/locales/
 pocket/www/hunspell/
 pocket/www/dict/
-pocket/www/academic*.js
-!pocket/www/academic-math-config.js
-pocket/www/references.js
-pocket/www/bibtex-parser.js
-pocket/www/csl-renderer.js
-pocket/www/mathjax/
 
 # working files beside the repo, never part of it
 Claude outputs/

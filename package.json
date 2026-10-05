@@ -10,9 +10,6 @@
     "test:spellcheck": "node --test scripts/spellcheck.test.js",
     "test:dashes": "node --test scripts/dashes.test.js",
     "test:words": "electron scripts/words.e2e.js",
-    "test:academic": "node --test scripts/academic*.test.js scripts/references.test.js",
-    "test:academic:smoke": "electron scripts/academic-electron-smoke.js",
-    "test:academic:app": "electron scripts/academic-app-smoke.js",
     "test": "node --test \"scripts/*.test.js\"",
     "test:coverage": "node --test --experimental-test-coverage \"scripts/*.test.js\"",
     "lint": "oxlint",
@@ -137,7 +134,6 @@
   "devDependencies": {
     "electron": "^43.0.0",
     "electron-builder": "^26.15.3",
-    "linkedom": "^0.18.12",
     "oxlint": "^1.86.0"
   },
   "dependencies": {
@@ -157,10 +153,7 @@
     "dictionary-ru": "^3.0.0",
     "electron-updater": "^6.3.9",
     "jszip": "^3.10.1",
-    "koffi": "2.16.3",
-    "mathjax-full": "^3.2.2",
-    "@napi-rs/canvas": "^0.1.80",
-    "pdfjs-dist": "^5.4.0"
+    "koffi": "2.16.3"
   },
   "allowScripts": {
     "electron@33.4.11": true
