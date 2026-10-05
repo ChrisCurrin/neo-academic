@@ -86,9 +86,119 @@
     <aside id="side-pane">
       <div id="side-head">
         <span>Notes &amp; Comments</span>
+        <button id="academic-toggle" type="button" title="Show academic metadata" aria-expanded="false" aria-controls="academic-panel">Academic</button>
         <button id="side-pin" title="Keep this pane open">&#9737;</button>
       </div>
       <div id="sticky-list"></div>
+      <section id="academic-panel" hidden aria-labelledby="academic-heading">
+        <h2 id="academic-heading">Academic metadata</h2>
+        <label for="academic-abstract">Abstract</label>
+        <textarea id="academic-abstract" rows="7" spellcheck="true"></textarea>
+        <label for="academic-keywords"><span>Keywords</span> <span class="soft">(comma separated)</span></label>
+        <input id="academic-keywords" type="text" autocomplete="off" />
+        <label for="academic-paper-type">Paper type</label>
+        <select id="academic-paper-type">
+          <option value="">Not specified</option>
+          <option value="research">Research article</option>
+          <option value="review">Review article</option>
+          <option value="short-communication">Short communication</option>
+          <option value="case-study">Case study</option>
+          <option value="thesis">Thesis or dissertation</option>
+        </select>
+        <label for="academic-profile">Academic profile</label>
+        <select id="academic-profile">
+          <option value="apa">APA</option>
+          <option value="mla">MLA</option>
+          <option value="chicago">Chicago</option>
+          <option value="ieee">IEEE</option>
+        </select>
+        <label for="academic-citation-style">Citation style</label>
+        <select id="academic-citation-style">
+          <option value="numeric">Numeric [1]</option>
+          <option value="author-date">Author-date (Author, Year)</option>
+          <option value="narrative">Narrative Author (Year)</option>
+        </select>
+        <label for="academic-authors"><span>Authors</span> <span class="soft">(one per line: Name | Affiliation | ORCID)</span></label>
+        <textarea id="academic-authors" rows="4" spellcheck="false"></textarea>
+        <details class="academic-details">
+          <summary>References</summary>
+          <div class="academic-tools">
+            <button id="academic-add-ref" type="button">Add reference</button>
+            <button id="academic-insert-citation" type="button">Insert citation</button>
+          </div>
+          <label for="academic-ref-filter">Filter references</label>
+          <select id="academic-ref-filter">
+            <option value="all">All categories</option>
+          </select>
+          <div id="academic-ref-list" aria-live="polite"></div>
+          <div class="academic-tools academic-import-export">
+            <label class="academic-file-label" for="academic-import-refs">Import references</label>
+            <input id="academic-import-refs" type="file" accept=".bib,.json,application/x-bibtex,application/json" />
+            <button id="academic-export-bib" type="button">Export BibTeX</button>
+            <button id="academic-export-csl" type="button">Export CSL JSON</button>
+          </div>
+          <h3 class="academic-subheading">Bibliography preview</h3>
+          <div id="academic-bibliography" aria-live="polite"></div>
+        </details>
+        <details class="academic-details">
+          <summary>Figures, equations &amp; tables</summary>
+          <div class="academic-tools academic-object-actions">
+            <button id="academic-insert-figure" type="button">Insert figure</button>
+            <button id="academic-insert-equation" type="button">Insert equation</button>
+            <button id="academic-insert-table" type="button">Insert table</button>
+            <button id="academic-insert-xref" type="button">Insert cross-reference</button>
+          </div>
+          <div id="academic-object-list" aria-live="polite"></div>
+        </details>
+        <details class="academic-details">
+          <summary>Review</summary>
+          <label class="academic-check" for="academic-track-changes">
+            <input id="academic-track-changes" type="checkbox" />
+            <span>Track changes</span>
+          </label>
+          <div class="academic-tools">
+            <button id="academic-add-comment" type="button">Add comment</button>
+            <button id="academic-accept-all" type="button">Accept all changes</button>
+            <button id="academic-reject-all" type="button">Reject all changes</button>
+          </div>
+          <div id="academic-review-list" aria-live="polite"></div>
+        </details>
+        <details class="academic-details">
+          <summary>Statistics &amp; outline</summary>
+          <div id="academic-statistics" aria-live="polite"></div>
+          <h3 class="academic-subheading">Outline</h3>
+          <div id="academic-outline"></div>
+        </details>
+        <details class="academic-details">
+          <summary>Export paper</summary>
+          <label for="academic-export-format">Export format</label>
+          <div class="academic-export-row">
+            <select id="academic-export-format">
+              <option value="html">HTML</option>
+              <option value="pdf">PDF</option>
+              <option value="md">Markdown</option>
+              <option value="txt">Text</option>
+              <option value="epub">EPUB</option>
+              <option value="docx">Word (.docx)</option>
+              <option value="tex">LaTeX (.tex)</option>
+              <option value="typ">Typst (.typ)</option>
+            </select>
+            <button id="academic-export" type="button">Export</button>
+          </div>
+        </details>
+        <details class="academic-details academic-shortcuts">
+          <summary>Academic keyboard shortcuts</summary>
+          <ul>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> <span>Insert citation</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> <span>Insert figure in academic mode; Find all in novel mode</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>I</kbd> <span>Insert figure</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>E</kbd> <span>Insert equation</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> <span>Insert table</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> <span>Toggle academic mode</span></li>
+          </ul>
+        </details>
+        <div id="academic-diagnostics" role="status" aria-live="polite"></div>
+      </section>
     </aside>
 
     <!-- The manuscript -->
@@ -120,6 +230,7 @@
         <div class="tab" data-tab="outline">Outline</div>
         <div class="tab darlings" data-tab="darlings" title="Drag any selection here. It's saved, not gone.">Darlings</div>
       </div>
+      <button id="academic-mode-toggle" type="button" title="Toggle academic writing mode" aria-pressed="false" aria-controls="academic-panel">Academic mode</button>
       <div id="counters">
         <span id="goal-counter" title="Today's words — click for goals, sprints, and your progress chart"></span>
         <span id="pos-counter"></span>
@@ -157,11 +268,24 @@
   <!-- Toast — lives at body level so it shows over both views -->
   <div id="hint" hidden></div>
 
+  <script src="academic-math-config.js"></script>
+  <script src="mathjax/es5/tex-svg-full.js"></script>
   <script src="jszip.min.js"></script>
   <script src="i18n.js"></script>
   <script src="pocket-bridge.js"></script>
   <script src="covers.js"></script>
+  <script src="bibtex-parser.js"></script>
+  <script src="csl-renderer.js"></script>
+  <script src="academic-model.js"></script>
+  <script src="references.js"></script>
+  <script src="../academic/academic-objects.js"></script>
+  <script src="../academic/academic-review.js"></script>
+  <script src="../academic/academic-search.js"></script>
+  <script src="../academic/academic-export.js"></script>
   <script src="app.js"></script>
+  <script src="../academic/academic-ui.js"></script>
+  <script src="../academic/academic-clipboard.js"></script>
+  <script src="../academic/academic.js"></script>
   <script>
     // the ☰ button stands in for the desktop's hover-to-reveal chapter pane
     // tap ☰ for chapters; long-press it to toggle the on-screen keyboard

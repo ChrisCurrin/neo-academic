@@ -25,6 +25,11 @@ contextBridge.exposeInMainWorld('neo', {
   emailDraft: (payload) => ipcRenderer.invoke('email:draft', payload),
   logError: (msg) => ipcRenderer.invoke('log:error', msg),
   importPick: () => ipcRenderer.invoke('import:pick'),
+  importAcademicFigure: (bookId) => ipcRenderer.invoke('academic:figure:import', bookId),
+  readAcademicFigure: (bookId, file) => ipcRenderer.invoke('academic:figure:read', bookId, file),
+  copyAcademicFigure: (sourceBookId, targetBookId, figure) => ipcRenderer.invoke('academic:figure:copy', sourceBookId, targetBookId, figure),
+  writeAcademicBibliography: (bookId, text) => ipcRenderer.invoke('academic:bibliography:write', bookId, text),
+  renderAcademicMath: (source, format, display) => ipcRenderer.invoke('academic:math:render', source, format, display),
   libraryPath: () => ipcRenderer.invoke('library:path'),
   pickCover: () => ipcRenderer.invoke('cover:pick'),
   setCover: (bookId, srcPath) => ipcRenderer.invoke('cover:set', bookId, srcPath),
@@ -58,5 +63,6 @@ contextBridge.exposeInMainWorld('neo', {
 
   writingStyleState: (st) => ipcRenderer.send('style:state', st),
   viewState: (st) => ipcRenderer.send('view:state', st),
+  academicState: (on) => ipcRenderer.send('academic:state', !!on),
   onMenu: (cb) => ipcRenderer.on('menu', (_e, msg) => cb(msg))
 });

@@ -4,8 +4,8 @@
 // node scripts/pocket-www.js
 //
 // Fills pocket/www with what NEO Pocket shares with desktop NEO: the editor
-// (app.js, covers.js, styles.css, i18n.js, fonts, locales), JSZip, and the
-// spellchecker (Hunspell's browser build plus the same dictionaries desktop
+// (app.js, covers.js, styles.css, i18n.js, fonts, locales), JSZip, the
+// academic modules with MathJax, and the spellchecker (Hunspell's browser build plus the same dictionaries desktop
 // NEO bundles). The robot build runs this; so does a local Android or iOS
 // build, before `npx cap sync`.
 
@@ -29,6 +29,15 @@ for (const f of ['app.js', 'covers.js', 'styles.css', 'i18n.js']) copy(path.join
 copy(path.join(mods, 'jszip', 'dist', 'jszip.min.js'), path.join(www, 'jszip.min.js'));
 copyDir(path.join(root, 'fonts'), path.join(www, 'fonts'));
 copyDir(path.join(root, 'locales'), path.join(www, 'locales'));
+
+// Academic mode: its modules, laid flat in www/, and MathJax for equations
+const academic = path.join(root, 'academic');
+for (const f of fs.readdirSync(academic)) {
+  if (/^academic.*\.js$/.test(f) || ['references.js', 'bibtex-parser.js', 'csl-renderer.js'].includes(f)) copy(path.join(academic, f), path.join(www, f));
+}
+const mathjax = path.join(mods, 'mathjax-full', 'es5');
+copy(path.join(mathjax, 'tex-svg-full.js'), path.join(www, 'mathjax', 'es5', 'tex-svg-full.js'));
+copy(path.join(mathjax, 'input', 'asciimath.js'), path.join(www, 'mathjax', 'es5', 'input', 'asciimath.js'));
 
 // Hunspell. The package finds its browser build through an import map
 // (#hunspell-glue) that a phone's web view doesn't have, so point it at the

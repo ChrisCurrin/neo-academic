@@ -29,6 +29,9 @@ on:
       - 'locales/**'
       - 'main.js'
       - 'scripts/pocket-www.js'
+      - 'academic/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/pocket.yml'
     tags:
       - 'pocket-v*'

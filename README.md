@@ -75,6 +75,12 @@ Export an industry-format PDF, or a Fountain or Final Draft (.fdx) file. Drop a 
 
 EPUB 3 with a proper table of contents built to KDP's guidelines, Word .docx, PDF with page numbers and bookmarks, HTML, markdown, and plain text. Email a timestamped PDF snapshot to yourself with a SHA-256 fingerprint of the text in the body. Might come in handy someday.
 
+**Academic writing**
+
+Turn on Academic Mode (`Cmd/Ctrl+Shift+M`) when a book is a paper: add an abstract, keywords, authors, affiliations, and validated ORCID IDs; manage references and citations; insert numbered, cross-referenced figures, equations, and tables; and export to EPUB, HTML, PDF, Word, Markdown, plain text, LaTeX, or Typst. APA, MLA, Chicago, IEEE, and plain-text profiles provide practical local formatting, not standards-certified citation processing. Zotero and Mendeley are not connected. See the [academic roadmap](ACADEMIC_ROADMAP.md) for shortcuts, details, and limitations. Academic tools are optional; existing books are not changed just by opening them.
+
+NEO Pocket shares academic metadata and assets and supports equation rendering plus PNG, JPEG, and SVG figures. Full-document exports and PDF preview generation remain desktop-only.
+
 **Import** 
 
 Bring in existing .docx, .txt, and .md manuscripts; chapters and scene breaks are detected automatically. This is still a bit rough and might require you to tweak things. It will try to grab your title and remove that from the body, and it seems to be working okay.

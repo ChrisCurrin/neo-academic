@@ -87,9 +87,161 @@
     <aside id="side-pane" data-i18n-label="Notes &amp; Comments">
       <div id="side-head">
         <span data-i18n>Notes &amp; Comments</span>
+        <button id="academic-toggle" type="button" data-i18n data-i18n-title title="Show academic metadata" aria-expanded="false" aria-controls="academic-panel">Academic</button>
         <button id="side-pin" data-i18n-title title="Keep this pane open" data-i18n-label="Keep this pane open" aria-pressed="false">&#9737;</button>
       </div>
       <div id="sticky-list"></div>
+      <section id="academic-panel" hidden aria-labelledby="academic-heading">
+        <h2 id="academic-heading" data-i18n>Academic metadata</h2>
+        <label for="academic-abstract" data-i18n>Abstract</label>
+        <textarea id="academic-abstract" rows="7" spellcheck="true"></textarea>
+        <label for="academic-keywords"><span data-i18n>Keywords</span> <span class="soft" data-i18n>(comma separated)</span></label>
+        <input id="academic-keywords" type="text" autocomplete="off" />
+        <label for="academic-paper-type" data-i18n>Paper type</label>
+        <select id="academic-paper-type">
+          <option value="" data-i18n>Not specified</option>
+          <option value="research" data-i18n>Research article</option>
+          <option value="review" data-i18n>Review article</option>
+          <option value="short-communication" data-i18n>Short communication</option>
+          <option value="case-study" data-i18n>Case study</option>
+          <option value="thesis" data-i18n>Thesis or dissertation</option>
+        </select>
+        <label for="academic-profile" data-i18n>Academic profile</label>
+        <select id="academic-profile">
+          <option value="apa">APA</option>
+          <option value="mla">MLA</option>
+          <option value="chicago">Chicago</option>
+          <option value="ieee">IEEE</option>
+        </select>
+        <label for="academic-writing-theme" data-i18n>Writing theme</label>
+        <select id="academic-writing-theme">
+          <option value="latex-plain">LaTeX Plain</option>
+          <option value="latex-double">LaTeX Double Space</option>
+          <option value="nature">Nature</option>
+          <option value="nature-communications">Nature Communications</option>
+          <option value="science">Science</option>
+          <option value="cell">Cell</option>
+          <option value="chicago">Chicago Manual</option>
+          <option value="ams">AMS</option>
+          <option value="lncs">LNCS</option>
+          <option value="ieee">IEEE Transactions</option>
+          <option value="acm">ACM Conference</option>
+          <option value="elsevier">Elsevier</option>
+          <option value="springer">Springer</option>
+          <option value="pnas">PNAS</option>
+          <option value="aps">APS Physical Review</option>
+          <option value="plos">PLOS ONE</option>
+          <option value="jama">JAMA</option>
+        </select>
+        <label for="academic-export-theme" data-i18n>Export theme</label>
+        <select id="academic-export-theme">
+          <option value="latex-plain">LaTeX Plain</option>
+          <option value="latex-double">LaTeX Double Space</option>
+          <option value="nature">Nature</option>
+          <option value="nature-communications">Nature Communications</option>
+          <option value="science">Science</option>
+          <option value="cell">Cell</option>
+          <option value="chicago">Chicago Manual</option>
+          <option value="ams">AMS</option>
+          <option value="lncs">LNCS</option>
+          <option value="ieee">IEEE Transactions</option>
+          <option value="acm">ACM Conference</option>
+          <option value="elsevier">Elsevier</option>
+          <option value="springer">Springer</option>
+          <option value="pnas">PNAS</option>
+          <option value="aps">APS Physical Review</option>
+          <option value="plos">PLOS ONE</option>
+          <option value="jama">JAMA</option>
+        </select>
+        <h3 class="academic-subheading" data-i18n>Export preview</h3>
+        <div id="academic-theme-preview" class="academic-theme-preview" aria-live="polite"></div>
+        <label for="academic-citation-style" data-i18n>Citation style</label>
+        <select id="academic-citation-style">
+          <option value="numeric" data-i18n>Numeric [1]</option>
+          <option value="author-date" data-i18n>Author-date (Author, Year)</option>
+          <option value="narrative" data-i18n>Narrative Author (Year)</option>
+        </select>
+        <label for="academic-authors"><span data-i18n>Authors</span> <span class="soft" data-i18n>(one per line: Name | Affiliation | ORCID)</span></label>
+        <textarea id="academic-authors" rows="4" spellcheck="false"></textarea>
+        <details class="academic-details">
+          <summary data-i18n>References</summary>
+          <div class="academic-tools">
+            <button id="academic-add-ref" type="button" data-i18n>Add reference</button>
+            <button id="academic-insert-citation" type="button" data-i18n>Insert citation</button>
+          </div>
+          <label for="academic-ref-filter" data-i18n>Filter references</label>
+          <select id="academic-ref-filter">
+            <option value="all" data-i18n>All categories</option>
+          </select>
+          <div id="academic-ref-list" aria-live="polite"></div>
+          <div class="academic-tools academic-import-export">
+            <label class="academic-file-label" for="academic-import-refs" data-i18n>Import references</label>
+            <input id="academic-import-refs" type="file" accept=".bib,.json,application/x-bibtex,application/json" data-i18n-label="Import references" />
+            <button id="academic-export-bib" type="button" data-i18n>Export BibTeX</button>
+            <button id="academic-export-csl" type="button" data-i18n>Export CSL JSON</button>
+          </div>
+          <h3 class="academic-subheading" data-i18n>Bibliography preview</h3>
+          <div id="academic-bibliography" aria-live="polite"></div>
+        </details>
+        <details class="academic-details">
+          <summary data-i18n>Figures, equations &amp; tables</summary>
+          <div class="academic-tools academic-object-actions">
+            <button id="academic-insert-figure" type="button" data-i18n>Insert figure</button>
+            <button id="academic-insert-equation" type="button" data-i18n>Insert equation</button>
+            <button id="academic-insert-table" type="button" data-i18n>Insert table</button>
+            <button id="academic-insert-xref" type="button" data-i18n>Insert cross-reference</button>
+          </div>
+          <div id="academic-object-list" aria-live="polite"></div>
+        </details>
+        <details class="academic-details">
+          <summary data-i18n>Review</summary>
+          <label class="academic-check" for="academic-track-changes">
+            <input id="academic-track-changes" type="checkbox" />
+            <span data-i18n>Track changes</span>
+          </label>
+          <div class="academic-tools">
+            <button id="academic-add-comment" type="button" data-i18n>Add comment</button>
+            <button id="academic-accept-all" type="button" data-i18n>Accept all changes</button>
+            <button id="academic-reject-all" type="button" data-i18n>Reject all changes</button>
+          </div>
+          <div id="academic-review-list" aria-live="polite"></div>
+        </details>
+        <details class="academic-details">
+          <summary data-i18n>Statistics &amp; outline</summary>
+          <div id="academic-statistics" aria-live="polite"></div>
+          <h3 class="academic-subheading" data-i18n>Outline</h3>
+          <div id="academic-outline"></div>
+        </details>
+        <details class="academic-details">
+          <summary data-i18n>Export paper</summary>
+          <label for="academic-export-format" data-i18n>Export format</label>
+          <div class="academic-export-row">
+            <select id="academic-export-format">
+              <option value="html">HTML</option>
+              <option value="pdf">PDF</option>
+              <option value="md">Markdown</option>
+              <option value="txt" data-i18n>Text</option>
+              <option value="epub">EPUB</option>
+              <option value="docx">Word (.docx)</option>
+              <option value="tex">LaTeX (.tex)</option>
+              <option value="typ">Typst (.typ)</option>
+            </select>
+            <button id="academic-export" type="button" data-i18n>Export</button>
+          </div>
+        </details>
+        <details class="academic-details academic-shortcuts">
+          <summary data-i18n>Academic keyboard shortcuts</summary>
+          <ul>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> <span data-i18n>Insert citation</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> <span data-i18n>Insert figure in academic mode; Find all in novel mode</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>I</kbd> <span data-i18n>Insert figure</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>E</kbd> <span data-i18n>Insert equation</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> <span data-i18n>Insert table</span></li>
+            <li><kbd>⌘/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> <span data-i18n>Toggle academic mode</span></li>
+          </ul>
+        </details>
+        <div id="academic-diagnostics" role="status" aria-live="polite"></div>
+      </section>
     </aside>
 
     <!-- The manuscript -->
@@ -120,6 +272,7 @@
         <div class="tab" role="tab" tabindex="0" aria-selected="false" data-tab="outline" data-i18n>Outline</div>
         <div class="tab darlings" role="tab" tabindex="0" aria-selected="false" data-tab="darlings" data-i18n data-i18n-title title="Drag any selection here. It's saved, not gone.">Darlings</div>
       </div>
+      <button id="academic-mode-toggle" type="button" data-i18n-title title="Toggle academic writing mode" aria-pressed="false" aria-controls="academic-panel" data-i18n>Academic mode</button>
       <div id="counters">
         <span id="goal-counter" role="button" tabindex="0" data-i18n-title title="Today's words — click for goals, sprints, and your progress chart"></span>
         <span id="pos-counter"></span>
@@ -131,6 +284,8 @@
     <!-- Find & replace -->
     <div id="searchbar" hidden>
       <input id="search-input" data-i18n-placeholder placeholder="Find" data-i18n-label="Find" spellcheck="false" />
+      <label class="search-option" for="search-regex"><input id="search-regex" type="checkbox" /><span data-i18n>Regex</span></label>
+      <label class="search-option" for="search-case-sensitive"><input id="search-case-sensitive" type="checkbox" /><span data-i18n>Match case</span></label>
       <span id="search-count"></span>
       <button id="search-prev" data-i18n-title title="Previous (⇧Enter)" data-i18n-label="Previous (⇧Enter)">&#8593;</button>
       <button id="search-next" data-i18n-title title="Next (Enter)" data-i18n-label="Next (Enter)">&#8595;</button>
@@ -147,6 +302,20 @@
 
   <script src="i18n.js"></script>
   <script src="covers.js"></script>
+  <script src="bibtex-parser.js"></script>
+  <script src="academic/bibtex-parser.js"></script>
+  <script src="academic/csl-renderer.js"></script>
+  <script src="academic/references.js"></script>
+  <script src="academic/academic-model.js"></script>
+  <script src="academic/academic-theme.js"></script>
+  <script src="academic/academic-plugin.js"></script>
+  <script src="academic/academic-objects.js"></script>
+  <script src="academic/academic-review.js"></script>
+  <script src="academic/academic-search.js"></script>
+  <script src="academic/academic-export.js"></script>
   <script src="app.js"></script>
+  <script src="academic/academic-ui.js"></script>
+  <script src="academic/academic-clipboard.js"></script>
+  <script src="academic/academic.js"></script>
 </body>
 </html>

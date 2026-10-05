@@ -2,10 +2,12 @@
 // Owns the window and all file-system access. The renderer talks to this
 // through the IPC handlers below (see preload.js for the exposed API).
 
-const { app, BrowserWindow, ipcMain, dialog, Menu, MenuItem, utilityProcess, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, MenuItem, utilityProcess, screen, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const AcademicAssets = require('./academic/academic-assets.js');
+const AcademicMath = require('./academic/academic-math.js');
 
 // Every disk request from the page passes through here: a write the system
 // refuses (see reportBlockedWrite) is explained to the writer, then the error
@@ -333,6 +335,26 @@ function libName(name) {
 function bookDir(bookId) {
   return path.join(LIBRARY_DIR, libName(bookId));
 }
+
+ipcMain.handle('academic:figure:import', async (_event, bookId) => {
+  AcademicAssets.validateName(bookId);
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const result = await dialog.showOpenDialog(win, {
+    title: 'Import academic figure',
+    properties: ['openFile'],
+    filters: [{ name: 'Figures', extensions: ['png', 'jpg', 'jpeg', 'svg', 'pdf'] }]
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return AcademicAssets.importFigure(LIBRARY_DIR, bookId, result.filePaths[0], nativeImage);
+});
+ipcMain.handle('academic:figure:read', (_event, bookId, file) =>
+  AcademicAssets.readFigure(LIBRARY_DIR, bookId, file));
+ipcMain.handle('academic:figure:copy', (_event, sourceBookId, targetBookId, figure) =>
+  AcademicAssets.copyFigure(LIBRARY_DIR, sourceBookId, targetBookId, figure));
+ipcMain.handle('academic:bibliography:write', (_event, bookId, text) =>
+  AcademicAssets.writeBibliography(LIBRARY_DIR, bookId, text));
+ipcMain.handle('academic:math:render', (_event, source, format, display) =>
+  AcademicMath.renderServer(source, format, display));
 
 // A human-readable map of the library, regenerated on every change:
 // which folder is which book, and what shelf it lives on. Sorts to the
@@ -1656,6 +1678,13 @@ ipcMain.on('style:state', (_e, style) => {
   writingStyle = style;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
+let academicModeState = false;
+ipcMain.on('academic:state', (_e, enabled) => {
+  enabled = !!enabled;
+  if (enabled === academicModeState) return;
+  academicModeState = enabled;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
 
 function buildMenu() {
   const isMac = process.platform === 'darwin';
@@ -1734,7 +1763,7 @@ function buildMenu() {
         { type: 'separator' },
         {
           label: t('Import Manuscripts…'),
-          accelerator: 'CmdOrCtrl+Shift+I',
+          accelerator: academicModeState ? undefined : 'CmdOrCtrl+Shift+I',
           click: () => sendToWindow({ type: 'import' })
         },
         { label: t('Reshelve a Book…'), click: () => sendToWindow({ type: 'reshelve' }) },
@@ -1808,7 +1837,7 @@ function buildMenu() {
           label: t('Align Paragraph'),
           submenu: [
             { label: t('Left'), accelerator: 'CmdOrCtrl+Shift+L', type: 'radio', checked: viewState.align === 'left', click: () => sendToWindow({ type: 'align', value: 'left' }) },
-            { label: t('Center'), accelerator: 'CmdOrCtrl+Shift+C', type: 'radio', checked: viewState.align === 'center', click: () => sendToWindow({ type: 'align', value: 'center' }) },
+            { label: t('Center'), accelerator: academicModeState ? undefined : 'CmdOrCtrl+Shift+C', type: 'radio', checked: viewState.align === 'center', click: () => sendToWindow({ type: 'align', value: 'center' }) },
             { label: t('Right'), accelerator: 'CmdOrCtrl+Shift+R', type: 'radio', checked: viewState.align === 'right', click: () => sendToWindow({ type: 'align', value: 'right' }) },
             { label: t('Justify'), accelerator: 'CmdOrCtrl+Shift+J', type: 'radio', checked: viewState.align === 'justify', click: () => sendToWindow({ type: 'align', value: 'justify' }) }
           ]
@@ -1820,7 +1849,7 @@ function buildMenu() {
         { type: 'separator' },
         {
           label: t('Typewriter Scrolling'),
-          accelerator: 'CmdOrCtrl+Shift+T',
+          accelerator: academicModeState ? undefined : 'CmdOrCtrl+Shift+T',
           type: 'checkbox',
           checked: typewriterState,
           click: () => sendToWindow({ type: 'typewriter' })
@@ -1875,7 +1904,7 @@ function buildMenu() {
         { type: 'separator' },
         {
           label: t('Full Screen'),
-          accelerator: 'CmdOrCtrl+Shift+F',
+          accelerator: academicModeState ? undefined : 'CmdOrCtrl+Shift+F',
           click: () => {
             const w = BrowserWindow.getFocusedWindow();
             if (w) w.setFullScreen(!w.isFullScreen());
@@ -1933,6 +1962,22 @@ function buildMenu() {
             click: () => setUiLanguage(lang.code)
           }))
         }
+      ]
+    },
+    {
+      label: t('Academic'),
+      submenu: [
+        {
+          label: t('Academic Mode'),
+          type: 'checkbox',
+          checked: academicModeState,
+          click: () => sendToWindow({ type: 'academicCommand', command: 'mode' })
+        },
+        { type: 'separator' },
+        { label: t('Insert Citation'), enabled: academicModeState, click: () => sendToWindow({ type: 'academicCommand', command: 'citation' }) },
+        { label: t('Insert Figure'), enabled: academicModeState, click: () => sendToWindow({ type: 'academicCommand', command: 'figure' }) },
+        { label: t('Insert Equation'), enabled: academicModeState, click: () => sendToWindow({ type: 'academicCommand', command: 'equation' }) },
+        { label: t('Insert Table'), enabled: academicModeState, click: () => sendToWindow({ type: 'academicCommand', command: 'table' }) }
       ]
     },
     {

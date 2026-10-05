@@ -2241,6 +2241,7 @@ async function openBook(bookId) {
   migrateDarlingAnchors(); // sweep legacy invisible markers out of the prose
   reconcileMarks();        // re-adopt any note marks orphaned by cut/paste
   updateCounters();
+  document.dispatchEvent(new CustomEvent('neo:book-opened'));
 
   // Plotters land in the outline for a brand-new book
   const isNew = book.chapterOrder.length === 0;
@@ -2402,6 +2403,7 @@ function renderChapters() {
     if (document.fonts) document.fonts.load('1em "Courier Prime"').then(() => spSchedule(0)).catch(() => {});
   }
   renderNav();
+  document.dispatchEvent(new CustomEvent('neo:chapters-rendered'));
 }
 
 async function deleteChapterToDarlings(chId) {
@@ -2540,6 +2542,7 @@ function wireChapterBody(body, chId) {
   body.addEventListener('paste', (e) => {
     // a script's lines keep their elements; a script pasted as text is read
     if (isScript() && spPaste(e, body, chId)) return;
+    if (window.NeoAcademic && window.NeoAcademic.handlePaste(e, body)) return;
     e.preventDefault();
     const html = e.clipboardData.getData('text/html');
     const text = e.clipboardData.getData('text/plain');
@@ -3099,6 +3102,7 @@ function guardMarkerDelete(e, body, chId) {
 // keeping only NEO's own marks.
 function stripJunkSpans(el) {
   for (const s of [...el.querySelectorAll('span:not(.ph-mark)')]) {
+    if (s.closest('.academic-citation, .academic-xref, .academic-equation')) continue;
     while (s.firstChild) s.before(s.firstChild);
     s.remove();
   }
@@ -9571,6 +9575,7 @@ async function refreshFromDisk() {
       if (conflicts) toast(t('This chapter also changed on another device. That version is saved as the chapter after it.'), 8000);
       else if (replaced.length) toast(t('Updated from your other device — the text it replaced is in Darlings'), 8000);
       else toast(t('Updated from your other device'));
+      document.dispatchEvent(new CustomEvent('neo:metadata-refreshed'));
     }
 
     // The writer moved on to the other device since last touching this one:
@@ -9610,6 +9615,7 @@ setInterval(() => { if (book) flushAllSaves('tick'); }, 20000);
 async function backToShelf() {
   if (reading) stopReadAloud(false);
   flushAllSaves();
+  document.dispatchEvent(new CustomEvent('neo:book-closed'));
   tabPlaces = {};
   book = null;
   currentChapterId = null;
@@ -9747,8 +9753,14 @@ function resetNativeUndo() {
   restoreCaret(caret);
 }
 
+document.addEventListener('neo:academic-structural-edit', () => {
+  resetNativeUndo();
+  breakRun++;
+});
+
 function snapshotStructure(label, opts) {
   if (!book) return;
+  const academicMeta = opts && opts.academic ? window.NeoAcademicModel.read(book) : null;
   undoStack.push({
     label,
     rejoin: !!(opts && opts.rejoin),
@@ -9763,7 +9775,13 @@ function snapshotStructure(label, opts) {
     looseCards: JSON.parse(JSON.stringify(book.looseCards || [])),
     sceneNotes: { ...(book.sceneNotes || {}) },
     darlings: JSON.parse(JSON.stringify(darlings)),
-    stickies: JSON.parse(JSON.stringify(stickies))
+    stickies: JSON.parse(JSON.stringify(stickies)),
+    academicObjects: academicMeta ? JSON.parse(JSON.stringify({
+      figures: academicMeta.figures,
+      tables: academicMeta.tables,
+      equations: academicMeta.equations,
+      revisions: academicMeta.revisions
+    })) : null
   });
   if (undoStack.length > 10) undoStack.shift();
 }
@@ -9781,6 +9799,7 @@ async function structuralUndo() {
   book.sceneNotes = snap.sceneNotes || {};
   darlings = snap.darlings;
   stickies = snap.stickies;
+  if (snap.academicObjects) book.metadata = { ...(book.metadata || {}), ...snap.academicObjects };
   // resurrect any chapter files the action may have deleted
   for (const chId of book.chapterOrder) {
     await persistChapter(chId, chapterHTML[chId] || '<p><br></p>');
@@ -9797,6 +9816,7 @@ async function structuralUndo() {
   restoreCaret(snap.caret); // back to work, no announcement
   if (snap.rejoin) rejoinAtCaret();
   resetNativeUndo();
+  document.dispatchEvent(new CustomEvent('neo:metadata-refreshed'));
 }
 
 // after undoing a double-Enter break, close the split the gesture made:
@@ -10035,11 +10055,20 @@ document.addEventListener('keydown', (e) => {
 /*  FIND & REPLACE                                                     */
 /* ================================================================== */
 
-let searchState = { matches: [], idx: -1, query: '' };
+let searchState = { matches: [], idx: -1, query: '', tab: currentTab, regex: false, caseSensitive: false };
 // where the caret was on the page when Find opened, and whether vim's / opened
 // it: Esc in the find bar goes back there (see returnFromSearch)
 let searchHome = null;
 let searchFromVim = false;
+
+function searchOptions() {
+  const regex = $('#search-regex');
+  const caseSensitive = $('#search-case-sensitive');
+  return {
+    regex: !!(regex && regex.checked),
+    caseSensitive: !!(caseSensitive && caseSensitive.checked)
+  };
+}
 
 // the editable a range sits in: a chapter, the Notes, an outline line
 function editableOf(range) {
@@ -10064,7 +10093,7 @@ function openSearch(fromVim = false) {
 
 function closeSearch() {
   $('#searchbar').hidden = true;
-  searchState = { matches: [], idx: -1, query: '' };
+  searchState = { matches: [], idx: -1, query: '', tab: currentTab, regex: false, caseSensitive: false };
   searchFromVim = false;
   if (window.CSS && CSS.highlights) {
     CSS.highlights.delete('neo-search');
@@ -10114,111 +10143,254 @@ function searchRoots() {
   return [$('#aux-editor')];
 }
 
-// every place q appears in the tab, in reading order, any case
-function findRanges(q) {
-  const found = [];
-  if (!q) return found;
-  const ql = q.toLowerCase();
-  for (const body of searchRoots()) {
-    if (!body) continue;
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      const tl = node.textContent.toLowerCase();
-      let pos = 0;
-      while ((pos = tl.indexOf(ql, pos)) !== -1) {
-        const range = document.createRange();
-        range.setStart(node, pos);
-        range.setEnd(node, pos + q.length);
-        found.push(range);
-        pos += q.length;
+function searchBlocks(root) {
+  const blockSelector = 'p, li, blockquote, h1, h2, h3, h4, h5, h6, pre, td, th, div';
+  const excludedSelector = '.academic-figure, .academic-table, .academic-equation, .academic-citation, .academic-xref, [contenteditable="false"]';
+  const blocks = [];
+  let activeBlock = null;
+  let activeNodes = [];
+  const flush = () => {
+    if (!activeNodes.length) return;
+    let text = '';
+    const segments = activeNodes.map((textNode) => {
+      const segment = { node: textNode, start: text.length, end: text.length + textNode.data.length };
+      text += textNode.data;
+      return segment;
+    });
+    blocks.push({ block: activeBlock, text, segments });
+    activeNodes = [];
+  };
+  const visit = (node) => {
+    if (node.nodeType === 3) {
+      const parent = node.parentElement;
+      if (!parent || parent.closest(excludedSelector)) {
+        flush();
+        activeBlock = null;
+        return;
       }
+      let block = parent.closest(blockSelector);
+      if (!block || !root.contains(block)) block = root;
+      if (block !== activeBlock) {
+        flush();
+        activeBlock = block;
+      }
+      activeNodes.push(node);
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    if (node !== root && node.matches(excludedSelector)) {
+      flush();
+      activeBlock = null;
+      return;
+    }
+    for (const child of node.childNodes) visit(child);
+  };
+  visit(root);
+  flush();
+  return blocks;
+}
+
+function pointAtOffset(segments, offset, preferEnd) {
+  for (const segment of segments) {
+    if (preferEnd
+      ? offset > segment.start && offset <= segment.end
+      : offset >= segment.start && offset < segment.end) {
+      return { node: segment.node, offset: offset - segment.start };
+    }
+  }
+  const last = segments[segments.length - 1];
+  if (last && offset === last.end) return { node: last.node, offset: last.node.data.length };
+  const first = segments[0];
+  return first ? { node: first.node, offset: 0 } : null;
+}
+
+function rangeForSearchMatch(segments, match) {
+  const start = pointAtOffset(segments, match.index, false);
+  const end = match.length === 0
+    ? start
+    : pointAtOffset(segments, match.index + match.length, true);
+  if (!start || !end) return null;
+  const range = document.createRange();
+  range.setStart(start.node, start.offset);
+  range.setEnd(end.node, end.offset);
+  return range;
+}
+
+function findInSearchRoot(root, query, options) {
+  const found = [];
+  for (const block of searchBlocks(root)) {
+    const matches = window.NeoAcademicSearch.find(block.text, query, options);
+    for (const match of matches) {
+      const range = rangeForSearchMatch(block.segments, match);
+      if (range) found.push({ ...match, range, blockText: block.text, block: block.block });
     }
   }
   return found;
 }
 
+// every place q appears in the tab, in reading order, under the find bar's
+// regex and case options (a bad regex throws)
+function findMatches(q, options = searchOptions()) {
+  const found = [];
+  if (!q) return found;
+  for (const root of searchRoots()) {
+    if (!root) continue;
+    found.push(...findInSearchRoot(root, q, options));
+  }
+  return found;
+}
+
+// the same places as ranges, for vim's n and N; a bad regex finds nothing
+function findRanges(q) {
+  try { return findMatches(q).map((m) => m.range); }
+  catch { return []; }
+}
+
 // Scan the whole tab every time. Matches are highlighted, not selected.
 function runSearch() {
   const q = $('#search-input').value;
-  searchState = { matches: [], idx: -1, query: q, tab: currentTab };
+  const options = searchOptions();
+  searchState = {
+    matches: [], idx: -1, query: q, tab: currentTab,
+    regex: options.regex, caseSensitive: options.caseSensitive
+  };
   $('#searchbar').classList.toggle('find-only', currentTab !== 'manuscript');
   if (!q) {
     $('#search-count').textContent = '';
     paintHighlights();
     return;
   }
-  searchState.matches = findRanges(q).map((range) => ({ range }));
-  const n = searchState.matches.length;
-  $('#search-count').textContent = n ? `${n} found` : 'none';
-  paintHighlights();
+  try {
+    searchState.matches = findMatches(q, options);
+    const n = searchState.matches.length;
+    $('#search-count').textContent = n ? `${n} found` : 'none';
+  } catch (error) {
+    searchState.matches = [];
+    $('#search-count').textContent = '';
+    toast(error && error.message ? error.message : String(error));
+  } finally {
+    paintHighlights();
+  }
 }
 
 // only runs when the user asks (Enter / arrows)
 function gotoMatch(i) {
-  const m = searchState.matches;
-  if (!m.length) return;
-  searchState.idx = ((i % m.length) + m.length) % m.length;
+  const matches = searchState.matches;
+  if (!matches.length) return;
+  searchState.idx = ((i % matches.length) + matches.length) % matches.length;
   paintHighlights();
   try {
-    const rect = m[searchState.idx].range.getBoundingClientRect();
+    const rect = matches[searchState.idx].range.getBoundingClientRect();
     $('#paper-scroll').scrollTop += rect.top - window.innerHeight * 0.45;
   } catch { /* range collapsed by an edit; next search rebuilds */ }
-  $('#search-count').textContent = t('{i} of {n}', { i: searchState.idx + 1, n: m.length });
+  $('#search-count').textContent = t('{i} of {n}', { i: searchState.idx + 1, n: matches.length });
 }
 
 function freshSearchIfStale() {
-  if (searchState.query !== $('#search-input').value || searchState.tab !== currentTab) runSearch();
+  const options = searchOptions();
+  if (searchState.query !== $('#search-input').value ||
+      searchState.tab !== currentTab ||
+      searchState.regex !== options.regex ||
+      searchState.caseSensitive !== options.caseSensitive) runSearch();
+}
+
+function chapterForSearchMatch(match) {
+  return match.range.startContainer.parentElement.closest('.chapter');
+}
+
+function replacementForMatch(match, replacement) {
+  const replacedBlock = window.NeoAcademicSearch.replaceMatch(match.blockText, match, replacement);
+  const unchangedSuffixLength = match.blockText.length - match.index - match.length;
+  return replacedBlock.slice(match.index, replacedBlock.length - unchangedSuffixLength);
+}
+
+function applySearchReplacement(match, replacement) {
+  const inserted = replacementForMatch(match, replacement);
+  match.range.deleteContents();
+  if (inserted) match.range.insertNode(document.createTextNode(inserted));
+}
+
+function captureSearchRevision(body, before) {
+  const academic = window.NeoAcademic;
+  if (academic && typeof academic.captureRevision === 'function') {
+    academic.captureRevision(body, before);
+  }
 }
 
 function replaceCurrent() {
   if (currentTab !== 'manuscript') return;
   freshSearchIfStale();
   if (!searchState.matches.length) { toast(t('No matches')); return; }
-  if (searchState.idx < 0) searchState.idx = 0; // start from the very first match
-  const m = searchState.matches[searchState.idx];
-  const rep = $('#replace-input').value;
-  let chapter = null;
+  if (searchState.idx < 0) searchState.idx = 0;
+  const match = searchState.matches[searchState.idx];
+  const chapter = chapterForSearchMatch(match);
+  const body = chapter && chapter.querySelector('.chapter-body');
+  if (!body) { runSearch(); return; }
+
   try {
-    chapter = m.range.startContainer.parentElement.closest('.chapter');
-    m.range.deleteContents();
-    if (rep) m.range.insertNode(document.createTextNode(rep));
-  } catch {
+    const before = body.innerHTML;
+    const inserted = replacementForMatch(match, $('#replace-input').value);
+    snapshotStructure('replace');
+    match.range.deleteContents();
+    if (inserted) match.range.insertNode(document.createTextNode(inserted));
+    captureSearchRevision(body, before);
+    syncChapter(body, chapter.dataset.id);
+  } catch (error) {
+    toast(error && error.message ? error.message : String(error));
     runSearch();
     return;
   }
-  if (chapter) syncChapter(chapter.querySelector('.chapter-body'), chapter.dataset.id);
   const oldIdx = searchState.idx;
   runSearch();
   if (searchState.matches.length) gotoMatch(Math.min(oldIdx, searchState.matches.length - 1));
 }
 
-// Every chapter, front to back
+// Replace back-to-front so earlier ranges remain valid when later text is edited.
 function replaceAllMatches() {
   const q = $('#search-input').value;
   if (!q || currentTab !== 'manuscript') return;
+  const options = searchOptions();
+  let matches = [];
+  try {
+    for (const chId of book.chapterOrder) {
+      const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+      if (!body) continue;
+      const chapterMatches = findInSearchRoot(body, q, options);
+      chapterMatches.forEach((match) => { match.body = body; match.chapterId = chId; });
+      matches.push(...chapterMatches);
+    }
+  } catch (error) {
+    toast(error && error.message ? error.message : String(error));
+    runSearch();
+    return;
+  }
+
+  if (!matches.length) {
+    toast(t('0 replaced'));
+    runSearch();
+    return;
+  }
+
   snapshotStructure('replace all');
   const rep = $('#replace-input').value;
-  const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-  let n = 0;
-  for (const chId of book.chapterOrder) {
-    const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
-    if (!body) continue;
-    const nodes = [];
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) nodes.push(node);
-    let touched = false;
-    for (const nd of nodes) {
-      if (nd.textContent.toLowerCase().includes(q.toLowerCase())) {
-        nd.textContent = nd.textContent.replace(re, () => { n++; return rep; });
-        touched = true;
-      }
+  const beforeByBody = new Map();
+  try {
+    for (const match of matches.slice().reverse()) {
+      if (!beforeByBody.has(match.body)) beforeByBody.set(match.body, match.body.innerHTML);
+      applySearchReplacement(match, rep);
     }
-    if (touched) syncChapter(body, chId);
+    for (const [body, before] of beforeByBody) {
+      captureSearchRevision(body, before);
+      const chapter = body.closest('.chapter');
+      if (chapter) syncChapter(body, chapter.dataset.id);
+    }
+  } catch (error) {
+    toast(error && error.message ? error.message : String(error));
+    runSearch();
+    return;
   }
-  if (n === 0) undoStack.pop(); // nothing changed, nothing to undo
-  toast(n ? t('{n} replaced across the whole book — {key} to undo', { n, key: KZ }) : t('0 replaced'));
+
+  toast(t('{n} replaced across the whole book — {key} to undo', { n: matches.length, key: KZ }));
   runSearch();
 }
 
@@ -10230,15 +10402,15 @@ $('#search-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); freshSearchIfStale(); gotoMatch(searchState.idx + (e.shiftKey ? -1 : 1)); }
   if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); returnFromSearch(); }
   if (e.key === 'Tab' && !e.shiftKey) {
-    const m = searchState.matches[Math.max(0, searchState.idx)];
-    if (m) {
+    const match = searchState.matches[Math.max(0, searchState.idx)];
+    if (match) {
       e.preventDefault();
       const sel = window.getSelection();
-      const r = m.range.cloneRange();
-      r.collapse(false);
+      const range = match.range.cloneRange();
+      range.collapse(false);
       sel.removeAllRanges();
-      sel.addRange(r);
-      const body = m.range.startContainer.parentElement.closest('[contenteditable="true"]');
+      sel.addRange(range);
+      const body = match.range.startContainer.parentElement.closest('[contenteditable="true"]');
       if (body) body.focus();
     }
   }
@@ -10247,6 +10419,8 @@ $('#replace-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); replaceCurrent(); }
   if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); returnFromSearch(); }
 });
+$('#search-regex').addEventListener('change', runSearch);
+$('#search-case-sensitive').addEventListener('change', runSearch);
 $('#search-next').onclick = () => { freshSearchIfStale(); gotoMatch(searchState.idx + 1); };
 $('#search-prev').onclick = () => { freshSearchIfStale(); gotoMatch(searchState.idx - 1); };
 $('#replace-one').onclick = replaceCurrent;
@@ -11386,6 +11560,7 @@ function shortcutSections() {
   return bookShortcutSections();
 }
 function bookShortcutSections() {
+  const academicMode = !!(book && book.metadata && book.metadata.academicMode);
   return [
     { title: tk('Writing'), rows: [
       [tk('Enter ×2'), tk('Insert a section break')],
@@ -11401,7 +11576,7 @@ function bookShortcutSections() {
       [K('⌘U', 'Ctrl+U'), tk('Underline')],
       [K('⌘⇧S', 'Ctrl+Shift+S'), tk('Strikethrough'), tk('Or ~~…~~ around the words.')],
       [K('⌘⇧L', 'Ctrl+Shift+L'), tk('Align paragraph left')],
-      [K('⌘⇧C', 'Ctrl+Shift+C'), tk('Center paragraph')],
+      ...(!academicMode ? [[K('⌘⇧C', 'Ctrl+Shift+C'), tk('Center paragraph')]] : []),
       [K('⌘⇧R', 'Ctrl+Shift+R'), tk('Align paragraph right')],
       [K('⌘⇧J', 'Ctrl+Shift+J'), tk('Justify paragraph')],
       [K('⌘+', 'Ctrl++'), tk('Larger text')],
@@ -11420,12 +11595,12 @@ function bookShortcutSections() {
     { title: tk('App & files'), rows: [
       [KHELP, tk('Keyboard shortcuts')],
       [K('⌘,', 'Ctrl+,'), tk('Goals and writing sprints')],
-      [K('⌘⇧I', 'Ctrl+Shift+I'), tk('Import manuscripts')],
+      ...(!academicMode ? [[K('⌘⇧I', 'Ctrl+Shift+I'), tk('Import manuscripts')]] : []),
       [K('⌘E', 'Ctrl+E'), tk('Email a draft to yourself')]
     ] },
     { title: tk('View & window'), rows: [
-      [[K('⌘⇧F', 'Ctrl+Shift+F'), K('⌘Enter', 'Ctrl+Enter')], tk('Toggle full screen')],
-      [K('⌘⇧T', 'Ctrl+Shift+T'), tk('Toggle typewriter scrolling')],
+      [academicMode ? K('⌘Enter', 'Ctrl+Enter') : [K('⌘⇧F', 'Ctrl+Shift+F'), K('⌘Enter', 'Ctrl+Enter')], tk('Toggle full screen')],
+      ...(!academicMode ? [[K('⌘⇧T', 'Ctrl+Shift+T'), tk('Toggle typewriter scrolling')]] : []),
       [K('⌘⇧O', 'Ctrl+Shift+O'), tk('Cycle focus mode'), tk('Off → paragraph → sentence → off.')],
       [IS_MAC ? '⌥⌘↓' : ['Ctrl+Alt+↓', 'Ctrl+Page Down'], tk('Go to the next chapter')],
       [IS_MAC ? '⌥⌘↑' : ['Ctrl+Alt+↑', 'Ctrl+Page Up'], tk('Go to the previous chapter')],
@@ -11435,6 +11610,13 @@ function bookShortcutSections() {
         ['⌘⌥H', tk('Hide other apps')]
       ] : [])
     ] },
+    ...(academicMode ? [{ title: tk('Academic'), rows: [
+      [K('⌘⇧C', 'Ctrl+Shift+C'), tk('Insert a citation')],
+      [[K('⌘⇧I', 'Ctrl+Shift+I'), K('⌘⇧F', 'Ctrl+Shift+F')], tk('Insert a figure')],
+      [K('⌘⇧E', 'Ctrl+Shift+E'), tk('Insert an equation')],
+      [K('⌘⇧T', 'Ctrl+Shift+T'), tk('Insert a table')],
+      [K('⌘⇧M', 'Ctrl+Shift+M'), tk('Toggle academic mode')]
+    ] }] : []),
     // only for writers who turned them on (View → Vim Keys)
     ...(vimEnabled ? [{ title: tk('Vim keys'), rows: [
       ['Esc', tk('Stop writing and move around the page'), tk('i, a or o goes back to writing.')],
@@ -12599,6 +12781,14 @@ async function doExport(format, chId = null) {
   if (!book) { toast(t('Open a book first')); return; }
   // a script leaves as a PDF set the way scripts print, or as Fountain
   if (isScript()) { await spExport(['pdf', 'fdx'].includes(format) ? format : 'fountain'); return; }
+  if (window.NeoAcademic && ((book.metadata && book.metadata.academicMode) || window.NeoAcademic.hasContent())) {
+    try { await window.NeoAcademic.export(format, chId); }
+    catch (err) {
+      window.neo.logError('academic export: ' + (err && err.stack || err));
+      toast(t('Couldn’t export: {error}', { error: plainError(err) }), 8000);
+    }
+    return;
+  }
   flushAllSaves();
   const one = chId ? chapterExportData(chId) : null;
   if (chId && !one) return;
@@ -12687,12 +12877,23 @@ async function doEmailDraft() {
   toast(t('Preparing your draft…'));
   const script = isScript();
   const snapshot = script ? null : bookExportData();
+  let html;
+  try {
+    if (script) html = await spPdfHtml();
+    else if (window.NeoAcademic && ((book.metadata && book.metadata.academicMode) || window.NeoAcademic.hasContent())) {
+      const academic = await window.NeoAcademic.payload('pdf');
+      html = academic.content.replace('</body>', `<footer><p>${escHtml(body)}</p></footer></body>`);
+    } else html = buildHtml(snapshot, { stamp: true, fonts: await exportFontFaces(snapshot) });
+  } catch (err) {
+    window.neo.logError('email snapshot: ' + (err && err.stack || err));
+    toast(t('Couldn’t export: {error}', { error: plainError(err) }), 8000);
+    return;
+  }
   const res = await window.neo.emailDraft({
     to: library.emailAddress,
     subject,
     body,
-    // the email snapshot is a provenance record (a script's, as it prints)
-    html: script ? await spPdfHtml() : buildHtml(snapshot, { stamp: true, fonts: await exportFontFaces(snapshot) }),
+    html, // the email snapshot is a provenance record (a script's, as it prints)
     print: script ? 'screenplay' : undefined,
     defaultName: safeName(book.title),
     method: library.emailMethod
@@ -12850,11 +13051,38 @@ async function setEditorFontSize(value) {
   keepReadingPlace(applyFonts);
 }
 
+let lastAcademicMenuState = null;
+function publishAcademicMenuState() {
+  const enabled = !!(book && book.metadata && book.metadata.academicMode);
+  if (enabled === lastAcademicMenuState) return;
+  lastAcademicMenuState = enabled;
+  if (window.neo.academicState) window.neo.academicState(enabled);
+}
+document.addEventListener('neo:book-opened', publishAcademicMenuState);
+document.addEventListener('neo:book-closed', publishAcademicMenuState);
+new MutationObserver(publishAcademicMenuState).observe(document.body, {
+  attributes: true,
+  attributeFilter: ['class']
+});
+publishAcademicMenuState();
+
 window.neo.onMenu(async (msg) => {
   // full screen and focus mode together hide the bottom bar until hovered
   // (styles.css); the window says when it goes in and out, whatever is open
   if (msg.type === 'fullScreen') { document.body.classList.toggle('full-screen', !!msg.value); return; }
   if ($('#keyboard-shortcuts') && msg.type !== 'help') return;
+  if (msg.type === 'academicCommand') {
+    if (!book) { toast(t('Open a book first')); return; }
+    const active = !!(book.metadata && book.metadata.academicMode);
+    if (msg.command !== 'mode' && !active) return;
+    if (!window.NeoAcademic || typeof window.NeoAcademic.command !== 'function') {
+      toast(t('Academic commands are unavailable.'));
+      return;
+    }
+    await window.NeoAcademic.command(msg.command);
+    publishAcademicMenuState();
+    return;
+  }
   // a window the menu opens (⌘, for Goals, say) never stacks on one that's
   // already open: pressing it again used to pile up overlays
   const WINDOWS = ['stats', 'about', 'emailSettings', 'coverArt', 'reshelve', 'checkUpdate'];

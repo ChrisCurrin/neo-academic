@@ -1,10 +1,10 @@
 # NEO Pocket
 
 The Android and iOS companion to NEO: open a WIP, write, close. The
-manuscript editor is desktop NEO's own code (`app.js` / `styles.css`, copied
-in at build time), running in a Capacitor shell with a pocket-sized
-implementation of the `window.neo` bridge (`www/pocket-bridge.js`). Same
-plain files as the desktop, no accounts.
+manuscript editor and academic tools use desktop NEO's code copied in at
+build time, running in a Capacitor shell with a pocket-sized implementation
+of the `window.neo` bridge (`www/pocket-bridge.js`). Same plain files as the
+desktop, no accounts.
 
 - **Android:** files live in `Documents/NEO Library`, shared with the desktop
   via Syncthing.
@@ -17,9 +17,9 @@ plain files as the desktop, no accounts.
 
 ## Building
 
-Robots build it. Every push to `main` that touches `pocket/`, `app.js`, or
-`styles.css` produces a fresh, signed APK and drops it on the rolling
-**pocket-latest** pre-release:
+Robots build it. Every push to `main` that touches `pocket/`, the desktop
+editor, or academic modules produces a fresh, signed APK and drops it on
+the rolling **pocket-latest** pre-release:
 
     https://github.com/hughhowey/neo/releases/download/pocket-latest/neo-pocket.apk
 
@@ -81,6 +81,16 @@ and on Android the on-screen keyboard stays down — long-press ☰ (or use the
 ⋯ sheet) to summon it. On iPad the keyboard behaves normally and hides
 itself when a hardware keyboard is attached.
 
+Academic figure images can be imported from PNG, JPEG, or SVG files. Pocket
+reduces imported raster images to at most 2400 pixels on the longest edge and
+stores them in each book's `figures/` folder; SVG is checked and rasterized
+locally. Math equations render offline using the bundled MathJax runtime.
+PDF preview generation remains desktop-only; importing a PDF in desktop NEO
+creates a safe PNG preview that Pocket can display. The mobile bridge writes
+the desktop-compatible `bibliography.bib` sidecar. Academic papers can be
+exported as plain text or EPUB and sent through the system share sheet; PDF
+academic export remains desktop-only.
+
 Punch list, in rough order:
 - Verify pocket-v0.1.5 fixed: dead Shelf button + system bars overlapping
   the UI (both were edge-to-edge enforcement; now targeting SDK 35 with
@@ -99,3 +109,5 @@ Punch list, in rough order:
 
 Email and import stay on the desktop. Pocket is
 the writing chair, not the cockpit.
+Pocket also supports the academic plain-text and EPUB export formats
+through the system share sheet.
