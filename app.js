@@ -4218,6 +4218,7 @@ function frenchTypography() {
 document.addEventListener('keydown', (e) => {
   const el = e.target;
   if (e.defaultPrevented || !el || !el.isContentEditable || el.closest('.chapter-body')) return;
+  if (el.closest('.math, .eq')) return; // a paper's TeX is typed as it is
   smartKeys(e, el);
 }, true);
 
@@ -12743,7 +12744,7 @@ async function doEmailDraft() {
     body,
     // the email snapshot is a provenance record (a script's, as it prints)
     html: script ? await spPdfHtml() : isPaper() ? await paperPrintHtml() : buildHtml(snapshot, { stamp: true, fonts: await exportFontFaces(snapshot) }),
-    print: script ? 'screenplay' : undefined,
+    print: script ? 'screenplay' : isPaper() ? 'paper' : undefined,
     defaultName: safeName(book.title),
     method: library.emailMethod
   });

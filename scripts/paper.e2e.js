@@ -110,9 +110,21 @@ test('New Paper on a shelf makes a paper and opens it on its title page', async 
   assert.equal(await js(`document.activeElement.id`), 'tp-title');
   assert.equal(await js(`document.querySelector('.tab[data-tab="references"]').hidden`), false);
   assert.equal(await js(`document.querySelector('.tab[data-tab="outline"]').hidden`), true);
-  assert.match(await bodyHtml(), /<p class="h1" data-id="sec-\w+"[^>]*>Introduction<\/p>/);
+  // the shape of a paper to start from, each empty section saying what it answers
+  assert.deepEqual(await js(`[...document.querySelectorAll('.chapter-body p.h1')].map((h) => h.textContent)`), ['Introduction', 'Methods', 'Results', 'Discussion']);
+  assert.match(await js(`document.querySelector('.chapter-body p[data-hint]').dataset.hint`), /^Why, who and when/);
+  assert.equal(await js(`document.querySelectorAll('.chapter-body p[data-hint]').length`), 4);
   await type('Inhibition in cortical circuits');
+  assert.equal(await js(`document.getElementById('tp-title-count').textContent`), '31 characters');
   await snap('new-paper');
+  const { html } = await saved();
+  assert.doesNotMatch(html, /data-hint/, 'the hints are never saved');
+  // the rest of these steps write into the Introduction alone
+  await js(`(() => {
+    const body = document.querySelector('.chapter-body');
+    while (body.children.length > 2) body.lastElementChild.remove();
+    syncChapter(body, body.closest('.chapter').dataset.id);
+  })()`);
 });
 
 test('the empty abstract shows its six moves; writing it leaves only their names', async () => {
@@ -305,17 +317,35 @@ test('a citation, clicked, takes a page and can name its authors', async () => {
   await tick(300);
 });
 
-test('maths, clicked, opens its TeX with a live preview', async () => {
-  await js(`openMathEditor(document.querySelector('.chapter-body .math'))`);
+test('maths, clicked, turns into its TeX in the line, drawn live beside it', async () => {
+  await js(`editMath(document.querySelector('.chapter-body .math'), { caret: 'end' })`);
   await tick(200);
-  assert.equal(await js(`document.querySelector('.math-pop .mp-src').value`), 'E = I');
-  await js(`(() => { const t = document.querySelector('.math-pop .mp-src'); t.value = 'E \\\\approx I'; t.dispatchEvent(new Event('input')); })()`);
-  await tick(200);
-  assert.equal(await js(`!!document.querySelector('.math-pop .mp-preview svg')`), true);
-  await snap('math-editor');
+  assert.equal(await js(`document.querySelector('.chapter-body .math').classList.contains('editing')`), true);
+  assert.equal(await js(`document.querySelector('.chapter-body .math').contains(getSelection().anchorNode)`), true, 'the caret is in its TeX');
+  for (let i = 0; i < 3; i++) await key('Backspace'); // 'E = I' → 'E '
+  await type('\\approx I');
+  assert.equal(await js(`document.querySelector('.chapter-body .math').textContent`), 'E \\approx I');
+  assert.equal(await js(`!!document.querySelector('.chapter-body .math').shadowRoot.querySelector('.pv svg')`), true, 'drawn as it is typed');
+  const { html: mid } = await saved();
+  assert.match(mid, /<span class="math" contenteditable="false">E \\approx I<\/span>/, 'saved as maths while it is being written');
+  await snap('math-inline-edit');
   await key('Enter');
   await tick(300);
+  assert.equal(await js(`document.querySelector('.chapter-body .math').classList.contains('editing')`), false);
+  assert.equal(await js(`!!document.querySelector('.chapter-body .math').shadowRoot.querySelector('.m svg')`), true);
+  // Esc leaves it as it was
+  await js(`editMath(document.querySelector('.chapter-body .math'))`);
+  await type('xyz');
+  await key('Escape');
+  await tick(300);
   assert.equal(await js(`document.querySelector('.chapter-body .math').textContent`), 'E \\approx I');
+  // and an equation shows its TeX over its drawing
+  await js(`editMath(document.querySelector('.chapter-body .eq'))`);
+  await tick(200);
+  assert.equal(await js(`!!document.querySelector('.chapter-body .eq').shadowRoot.querySelector('.ded .pv svg')`), true);
+  await snap('equation-inline-edit');
+  await key('Escape');
+  await tick(200);
 });
 
 test('the authors dialog and the pane of sections', async () => {
@@ -343,6 +373,65 @@ test('a section moved in the pane takes everything under it, and the numbers fol
   assert.deepEqual(await js(`[...document.querySelectorAll('.chapter-body p.h1')].map((h) => h.textContent)`), ['Introduction', 'Methods'], '⌘Z puts it back');
 });
 
+test('figure layout: width, text wrapped beside it, a second panel, pinned in place', async () => {
+  const fig = `document.querySelector('.chapter-body figure.fig')`;
+  // the toolbar shows over a figure the pointer is on
+  await js(`${fig}.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))`);
+  await tick(150);
+  assert.equal(await js(`!document.querySelector('.fig-tools').hidden`), true);
+  await snap('figure-toolbar');
+  await js(`setFigureLayout(${fig}, { width: '33', wrap: 'right' })`);
+  assert.deepEqual(await js(`(() => { const d = ${fig}.dataset; return [d.width, d.wrap]; })()`), ['33', 'right']);
+  await js(`setFigureLayout(${fig}, { wrap: '' , width: '100', place: 'H' })`);
+  await js(`(async () => {
+    const c = new OffscreenCanvas(200, 120);
+    const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, 200, 120); g.fillStyle = '#c33'; g.fillRect(40, 30, 120, 60);
+    await addPanel(${fig}, new File([await c.convertToBlob({ type: 'image/png' })], 'b.png', { type: 'image/png' }));
+  })()`);
+  await tick(600);
+  assert.equal(await js(`${fig}.querySelectorAll(':scope > .panel').length`), 2);
+  assert.equal(await js(`${fig}.hasAttribute('data-src')`), false, 'its one picture became panel (a)');
+  await js(`(() => { const s = ${fig}.querySelectorAll('.subcap'); s[0].textContent = 'Layer 2/3'; s[1].textContent = 'Layer 5'; const b = document.querySelector('.chapter-body'); syncChapter(b, b.closest('.chapter').dataset.id); })()`);
+  const { html } = await saved();
+  assert.match(html, /<figure class="fig" contenteditable="false" data-id="fig-\w+" data-place="H"><div class="panel" data-src="figure-\w+\.png"><img alt=""><span class="subcap" contenteditable="true">Layer 2\/3<\/span><\/div><div class="panel" data-src="figure-\w+\.png"><img alt=""><span class="subcap" contenteditable="true">Layer 5<\/span><\/div><figcaption/);
+  await js(`document.querySelector('.fig-tools').hidden = true`);
+  await js(`${fig}.scrollIntoView({ block: 'center' })`);
+  await snap('figure-panels');
+});
+
+test('a journal sets the page, the citation style and the LaTeX class; Preview As shows another', async () => {
+  await js(`paperMenu({ command: 'journal', value: 'ieee' })`);
+  await tick(800);
+  assert.equal(await js(`paperMeta().journal`), 'ieee');
+  assert.equal(await js(`paperMeta().style`), 'ieee');
+  assert.equal(await js(`document.querySelector('.chapter-body .cite').textContent`), '[1], [2]');
+  const model = await js(`paperModel().then((m) => ({ journal: m.journal.id, html: NeoPaperExport.html(m, { print: true }), tex: NeoPaperExport.latex(m).find((f) => f.path === 'paper.tex').content }))`);
+  assert.equal(model.journal, 'ieee');
+  assert.match(model.html, /column-count: 2/);
+  assert.match(model.html, /<h2 id="sec-\w+"><span class="num">I\.<\/span> Introduction<\/h2>/);
+  assert.match(model.html, /<b>Fig\. 1\.<\/b>/);
+  assert.match(model.tex, /\\documentclass\[conference\]\{IEEEtran\}/);
+  assert.match(model.tex, /\\IEEEauthorblockN\{Ada Lovelace\}/);
+  assert.match(model.tex, /\\bibliographystyle\{IEEEtranN\}/);
+  // a preview in another journal's look and citation style leaves the page as it is
+  await js(`paperPreview('nature')`);
+  for (let i = 0; i < 40 && BrowserWindow.getAllWindows().length < 2; i++) await tick(200);
+  const preview = BrowserWindow.getAllWindows().find((w) => w.webContents !== wc);
+  assert.ok(preview, 'a preview window opens');
+  assert.match(preview.getTitle(), /— Nature$/);
+  assert.equal(await js(`document.querySelector('.chapter-body .cite').textContent`), '[1], [2]', 'the page keeps its own style');
+  await tick(1500);
+  if (SHOTS) fs.writeFileSync(path.join(SHOTS, 'preview-nature.png'), (await preview.webContents.capturePage()).toPNG());
+  await js(`paperPreview()`);
+  await tick(2500);
+  assert.match(preview.getTitle(), /— IEEE \(two-column\)$/);
+  if (SHOTS) fs.writeFileSync(path.join(SHOTS, 'preview-ieee.png'), (await preview.webContents.capturePage()).toPNG());
+  preview.close();
+  await js(`paperMenu({ command: 'journal', value: 'preprint' })`);
+  await js(`paperMenu({ command: 'style', value: 'apa' })`);
+  await tick(800);
+});
+
 test('a numeric style numbers by first citation', async () => {
   await js(`paperMenu({ command: 'style', value: 'ieee' })`);
   await tick(800);
@@ -364,7 +453,7 @@ test('every way out', async () => {
   const html = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.html'))), 'utf8');
   assert.match(html, /<h1 class="title">Inhibition in cortical circuits<\/h1>/);
   assert.match(html, /\(Doe, 2019; Smith et al\., 2020\)/);
-  assert.match(html, /<figure id="fig-\w+"><img src="data:image\/png;base64,/);
+  assert.match(html, /<figure id="fig-\w+" class="multi"><div class="panels"><div class="panel"><img src="data:image\/png;base64,/);
   assert.match(html, /<div class="eq" id="eq-\w+"><span class="eq-body"><svg/);
   assert.match(html, /Smith, J\., Doe, J\., (&amp;|&#38;) Lee, A\. \(2020\)/);
   const pdf = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.pdf'))));
@@ -380,7 +469,7 @@ test('every way out', async () => {
   const md = await JSZip.loadAsync(fs.readFileSync(path.join(OUT, files.find((f) => /-markdown\.zip$/.test(f)))));
   const text = await md.file('paper.md').async('string');
   assert.match(text, /\[@smith2020neural; @doe2019brains\]|\[@doe2019brains; @smith2020neural\]/);
-  assert.match(text, /\{#fig:\w+\}/);
+  assert.match(text, /<div id="fig:\w+">/);
   assert.ok(md.file('apa.csl'));
   const docx = await JSZip.loadAsync(fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.docx')))));
   const doc = await docx.file('word/document.xml').async('string');

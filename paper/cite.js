@@ -24,7 +24,17 @@
     { id: 'ieee', title: 'IEEE', file: 'ieee.csl', numeric: true },
     { id: 'elsevier-vancouver', title: 'Vancouver', file: 'elsevier-vancouver.csl', numeric: true },
     { id: 'nature', title: 'Nature', file: 'nature.csl', numeric: true },
-    { id: 'american-medical-association', title: 'AMA', file: 'american-medical-association.csl', numeric: true }
+    { id: 'american-medical-association', title: 'AMA', file: 'american-medical-association.csl', numeric: true },
+    // a journal's own, chosen with the journal (Format → Journal)
+    { id: 'science', title: 'Science', file: 'science.csl', numeric: true, journal: true },
+    { id: 'pnas', title: 'PNAS', file: 'pnas.csl', numeric: true, journal: true },
+    { id: 'cell', title: 'Cell Press', file: 'cell.csl', numeric: true, journal: true },
+    { id: 'plos', title: 'PLOS', file: 'plos.csl', numeric: true, journal: true },
+    { id: 'elife', title: 'eLife', file: 'elife.csl', numeric: false, journal: true },
+    { id: 'association-for-computing-machinery', title: 'ACM', file: 'association-for-computing-machinery.csl', numeric: true, journal: true },
+    { id: 'springer-lecture-notes-in-computer-science', title: 'Springer LNCS', file: 'springer-lecture-notes-in-computer-science.csl', numeric: true, journal: true },
+    { id: 'elsevier-harvard', title: 'Elsevier (Harvard)', file: 'elsevier-harvard.csl', numeric: false, journal: true },
+    { id: 'american-physics-society', title: 'APS', file: 'american-physics-society.csl', numeric: true, journal: true }
   ];
   const DEFAULT_STYLE = 'apa';
 

@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('neo', {
   paperLink: (bookId) => ipcRenderer.invoke('paper:link', bookId),
   paperLinked: (bookId, since) => ipcRenderer.invoke('paper:linked', bookId, since),
   paperUnlink: (bookId) => ipcRenderer.invoke('paper:unlink', bookId),
+  paperPreview: (html, title) => ipcRenderer.invoke('paper:preview', html, title),
   libraryPath: () => ipcRenderer.invoke('library:path'),
   pickCover: () => ipcRenderer.invoke('cover:pick'),
   setCover: (bookId, srcPath) => ipcRenderer.invoke('cover:set', bookId, srcPath),

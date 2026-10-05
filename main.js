@@ -741,6 +741,33 @@ ipcMain.handle('paper:linked', (_e, bookId, since) => {
   }
 });
 
+// A paper as its journal would print it, in a window of its own: one
+// window, reused, its title naming the journal
+let previewWin = null;
+ipcMain.handle('paper:preview', async (_e, html, title) => {
+  const pdf = await renderPDF(String(html), 'paper');
+  const file = path.join(app.getPath('temp'), `neo-preview-${process.pid}-${Date.now()}.pdf`);
+  fs.writeFileSync(file, pdf);
+  if (!previewWin || previewWin.isDestroyed()) {
+    const main = BrowserWindow.getFocusedWindow();
+    const at = main ? main.getBounds() : null;
+    previewWin = new BrowserWindow({
+      width: 860, height: Math.min(1100, at ? at.height : 1000), x: at ? at.x + 40 : undefined, y: at ? at.y + 20 : undefined,
+      backgroundColor: '#3a3a3a', show: false,
+      webPreferences: { plugins: true, sandbox: true, contextIsolation: true, nodeIntegration: false }
+    });
+    previewWin.on('page-title-updated', (e) => e.preventDefault());
+    previewWin.on('closed', () => { previewWin = null; });
+  }
+  const old = previewWin.neoFile;
+  previewWin.neoFile = file;
+  previewWin.setTitle(String(title || 'Preview'));
+  await previewWin.loadFile(file);
+  previewWin.show();
+  if (old) { try { fs.unlinkSync(old); } catch { /* gone */ } }
+  return true;
+});
+
 ipcMain.handle('cover:read', (_e, bookId, fname) => {
   try {
     if (!/^(cover|art)-\d+\.(png|jpg|webp)$/.test(fname)) return null;
@@ -869,6 +896,18 @@ ipcMain.handle('fullscreen:escape', (e) => {
 // A script prints on US letter whatever the country (the industry's page),
 // with the margins laid out in the page itself
 const SCREENPLAY_PRINT = { pageSize: 'Letter', margins: { top: 0, bottom: 0, left: 0, right: 0 }, printBackground: false, preferCSSPageSize: true, generateTaggedPDF: true, generateDocumentOutline: false };
+// A paper's page is its journal's: the size and margins come from its
+// @page rule, and the page numbers sit in the bottom margin
+const PAPER_PRINT = {
+  preferCSSPageSize: true,
+  printBackground: true,
+  displayHeaderFooter: true,
+  headerTemplate: '<div></div>',
+  footerTemplate: '<div style="width:100%;text-align:center;font:8px Helvetica,Arial,sans-serif;color:#555"><span class="pageNumber"></span></div>',
+  generateTaggedPDF: true,
+  generateDocumentOutline: true
+};
+
 async function renderPDF(html, print) {
   // The book reaches the PDF printer as a file, not as a data: URL. A URL
   // stops at 2 MB, and a long novel is bigger than that once it's encoded; a
@@ -880,7 +919,7 @@ async function renderPDF(html, print) {
   const pdfWin = new BrowserWindow({ show: false, webPreferences: { sandbox: true } });
   // Letter is a North American habit; most of the world prints A4.
   const letterCountries = ['US', 'CA', 'MX', 'PH'];
-  const options = print === 'screenplay' ? SCREENPLAY_PRINT : {
+  const options = print === 'screenplay' ? SCREENPLAY_PRINT : print === 'paper' ? PAPER_PRINT : {
     pageSize: letterCountries.includes(app.getLocaleCountryCode()) ? 'Letter' : 'A4',
     margins: { top: 1, bottom: 1, left: 1, right: 1 },
     printBackground: false,
@@ -1672,12 +1711,14 @@ ipcMain.on('script:state', (_e, st) => {
 });
 // A paper's menus: Insert, its citation style, its heading levels
 const NeoCite = require('./paper/cite.js');
-let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false };
+const NeoJournals = require('./paper/journals.js');
+let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false, journal: 'preprint' };
 ipcMain.on('paper:state', (_e, st) => {
   st = st || {};
   const next = {
     on: !!st.on, style: typeof st.style === 'string' ? st.style : null, custom: typeof st.custom === 'string' ? st.custom : '',
-    heading: ['h1', 'h2', 'h3'].includes(st.heading) ? st.heading : '', numbered: st.numbered !== false, double: !!st.double, linked: !!st.linked
+    heading: ['h1', 'h2', 'h3'].includes(st.heading) ? st.heading : '', numbered: st.numbered !== false, double: !!st.double, linked: !!st.linked,
+    journal: NeoJournals.get(st.journal).id
   };
   if (JSON.stringify(next) === JSON.stringify(paperState)) return;
   paperState = next;
@@ -1810,6 +1851,16 @@ function buildMenu() {
             }
           ]
         },
+        ...(paperState.on ? [
+          { label: t('Preview'), accelerator: 'CmdOrCtrl+Alt+P', click: () => sendToWindow({ type: 'paper', command: 'preview' }) },
+          {
+            label: t('Preview As'),
+            submenu: NeoJournals.JOURNALS.map((j) => ({
+              label: j.name, type: 'radio', checked: paperState.journal === j.id,
+              click: () => sendToWindow({ type: 'paper', command: 'preview', value: j.id })
+            }))
+          }
+        ] : []),
         { type: 'separator' },
         {
           label: t('Email Draft to Myself'),
@@ -1899,13 +1950,25 @@ function buildMenu() {
         },
         ...(paperState.on ? [
           {
+            label: t('Journal'),
+            submenu: NeoJournals.JOURNALS.map((j) => ({
+              label: j.name, type: 'radio', checked: paperState.journal === j.id,
+              click: () => sendToWindow({ type: 'paper', command: 'journal', value: j.id })
+            }))
+          },
+          {
             label: t('Citation Style'),
             submenu: [
-              ...NeoCite.STYLES.map((st) => ({
+              ...NeoCite.STYLES.filter((st) => !st.journal).map((st) => ({
                 label: st.title, type: 'radio', checked: paperState.style === st.id,
                 click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
               })),
-              ...(paperState.custom ? [{ label: paperState.custom, type: 'radio', checked: paperState.style === 'custom', click: () => sendToWindow({ type: 'paper', command: 'style', value: 'custom' }) }] : []),
+              { type: 'separator' },
+              ...NeoCite.STYLES.filter((st) => st.journal).map((st) => ({
+                label: st.title, type: 'radio', checked: paperState.style === st.id,
+                click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
+              })),
+              ...(paperState.custom ? [{ type: 'separator' }, { label: paperState.custom, type: 'radio', checked: paperState.style === 'custom', click: () => sendToWindow({ type: 'paper', command: 'style', value: 'custom' }) }] : []),
               { type: 'separator' },
               { label: t('Other Style (.csl)…'), click: () => sendToWindow({ type: 'paper', command: 'styleFile' }) }
             ]

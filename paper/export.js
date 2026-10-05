@@ -24,12 +24,13 @@
 // png is { base64, w, h } (pixels at 2x) where a picture had to be drawn for Word.
 
 (function (root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module === 'object' && module.exports && !root.document) module.exports = api;
   else root.NeoPaperExport = api;
-})(typeof self !== 'undefined' ? self : this, function () {
+})(typeof self !== 'undefined' ? self : this, function (root) {
   'use strict';
 
+  const Journals = () => root.NeoJournals || (typeof require === 'function' ? require('./journals.js') : null);
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   // markup gone, entities read (citeproc writes &#38; &#60; and friends)
   const plain = (html) => String(html).replace(/<[^>]+>/g, '')
@@ -39,6 +40,13 @@
   // our ids (fig-ab12) as the labels each tool expects (fig:ab12)
   const crossId = (id) => { const m = /^(fig|tab|eq|sec)-(.+)$/.exec(id || ''); return m ? (m[1] === 'tab' ? 'tbl' : m[1]) + ':' + m[2] : id; };
   const figName = (b) => 'figures/' + (b.png && b.mime === 'image/svg+xml' ? b.name.replace(/\.svg$/, '.png') : b.name);
+  // a figure's pictures: one, or one per panel
+  const pictures = (b) => (b.panels && b.panels.length ? b.panels : [b]);
+  const pictureFiles = (m) => m.blocks.filter((b) => b.type === 'figure').flatMap(pictures).filter((p) => p.base64)
+    .map((p) => ({ path: figName(p), content: p.png && p.mime === 'image/svg+xml' ? p.png.base64 : p.base64, base64: true }));
+  const panelLetter = (i) => String.fromCharCode(97 + i);
+  // LaTeX's float placement: [htbp] unless the writer chose; figure* takes no [H] or [h]
+  const floatOpt = (b) => (b.place && !(b.span && /[Hh]/.test(b.place)) ? `[${b.place}]` : b.span ? '[tp]' : '[htbp]');
 
   // ---------------------------------------------------------------------
   // LaTeX
@@ -83,31 +91,81 @@
 
   function latex(m) {
     const numeric = m.style && m.style.numeric;
+    const L = (m.journal && m.journal.latex) || { cls: 'article', opts: '11pt' };
+    const cls = L.cls;
+    const used = (test) => m.blocks.some(test);
+    const panels = used((b) => b.type === 'figure' && b.panels && b.panels.length > 1);
+    const pinned = used((b) => (b.type === 'figure' || b.type === 'table') && b.place === 'H');
+    const wrapped = used((b) => b.type === 'figure' && b.wrap);
+    const article = cls === 'article';
+    const opts = [L.opts, cls === 'elsarticle' && !numeric ? 'authoryear' : ''].filter(Boolean).join(',');
+    // the classes that bring natbib (and acmart, hyperref) with them
+    const ownNatbib = ['acmart', 'elsarticle', 'revtex4-2'].includes(cls);
     const lines = [];
-    lines.push('% Written in NEO. Compile with pdflatex and bibtex (Overleaf does both).',
-      '% To submit to a journal, swap \\documentclass for its class and',
-      '% \\bibliographystyle for its .bst; the citations are natbib\'s.',
-      '\\documentclass[11pt]{article}',
-      '\\usepackage[utf8]{inputenc}', '\\usepackage[T1]{fontenc}', '\\usepackage{lmodern}',
-      '\\usepackage{amsmath,amssymb}', '\\usepackage{graphicx}', '\\usepackage{booktabs}',
-      '\\usepackage{authblk}', '\\usepackage[margin=1in]{geometry}',
-      '\\usepackage[skip=6pt]{caption}', '\\captionsetup[table]{position=top}',
-      numeric ? '\\usepackage[numbers,square,sort&compress]{natbib}' : '\\usepackage[round]{natbib}',
-      ...(m.double ? ['\\usepackage{setspace}', '\\doublespacing'] : []),
-      '\\usepackage[hidelinks]{hyperref}', '');
-    lines.push(`\\title{${texEsc(m.title || '')}${m.subtitle ? `\\\\[0.4em]\\large ${texEsc(m.subtitle)}` : ''}}`);
-    m.authors.forEach((a) => {
-      const marks = (a.affiliations || []).map((n) => n + 1).join(',');
-      const extra = [a.corresponding && a.email ? `\\thanks{Correspondence: \\href{mailto:${a.email}}{${texEsc(a.email)}}}` : '',
-        a.orcid ? `\\thanks{ORCID: \\href{https://orcid.org/${a.orcid}}{${a.orcid}}}` : ''].join('');
-      lines.push(`\\author${marks ? `[${marks}]` : ''}{${texEsc(a.name)}${extra}}`);
-    });
-    m.affiliations.forEach((f, i) => lines.push(`\\affil[${i + 1}]{${texEsc(f)}}`));
-    lines.push('\\date{}', '', '\\begin{document}', '\\maketitle', '');
-    if (m.abstract && m.abstract.length) {
-      lines.push('\\begin{abstract}', m.abstract.map(texRuns).join('\n\n'), '\\end{abstract}', '');
+    lines.push(`% Written in NEO${m.journal ? ` for ${m.journal.name}` : ''}. Compile with pdflatex and bibtex (Overleaf does both).`,
+      '% The citations are natbib\'s (\\citep, \\citet), so a journal\'s .bst sets them in its style.',
+      `\\documentclass${opts ? `[${opts}]` : ''}{${cls}}`,
+      '\\usepackage[utf8]{inputenc}', '\\usepackage[T1]{fontenc}',
+      ...(article ? ['\\usepackage{lmodern}'] : []),
+      // acmart brings its own maths fonts and symbols
+      cls === 'acmart' ? '\\usepackage{amsmath}' : '\\usepackage{amsmath,amssymb}', '\\usepackage{graphicx}', '\\usepackage{booktabs}',
+      ...(article ? ['\\usepackage{authblk}', L.textwidth ? `\\usepackage[textwidth=${L.textwidth},top=1in,bottom=1in]{geometry}` : '\\usepackage[margin=1in]{geometry}',
+        '\\usepackage[skip=6pt]{caption}', '\\captionsetup[table]{position=top}'] : []),
+      ...(panels ? ['\\usepackage{subcaption}'] : []),
+      ...(pinned ? ['\\usepackage{float}'] : []),
+      ...(wrapped ? ['\\usepackage{wrapfig}'] : []),
+      ...(ownNatbib ? [] : [numeric || !article ? '\\usepackage[numbers,square,sort&compress]{natbib}' : '\\usepackage[round]{natbib}']),
+      ...(m.double && article ? ['\\usepackage{setspace}', '\\doublespacing'] : []),
+      ...(cls === 'acmart' ? ['\\settopmatter{printacmref=false}', '\\setcopyright{none}', '\\renewcommand\\footnotetextcopyrightpermission[1]{}'] : ['\\usepackage[hidelinks]{hyperref}']),
+      '');
+    const title = `\\title{${texEsc(m.title || '')}${m.subtitle ? (article ? `\\\\[0.4em]\\large ${texEsc(m.subtitle)}` : `: ${texEsc(m.subtitle)}`) : ''}}`;
+    const abstract = m.abstract && m.abstract.length ? ['\\begin{abstract}', m.abstract.map(texRuns).join('\n\n'), '\\end{abstract}'] : [];
+    const kw = (m.keywords || []).map(texEsc);
+    const affil = (a) => (a.affiliations || []).map((n) => texEsc(m.affiliations[n]));
+    // each class takes its authors, affiliations and keywords its own way
+    if (cls === 'IEEEtran') {
+      lines.push(title, '\\author{' + m.authors.map((a) => `\\IEEEauthorblockN{${texEsc(a.name)}}\\IEEEauthorblockA{${[...affil(a).map((f) => `\\textit{${f}}`), a.email ? texEsc(a.email) : ''].filter(Boolean).join(' \\\\ ')}}`).join('\n\\and\n') + '}',
+        '', '\\begin{document}', '\\maketitle', ...abstract, ...(kw.length ? ['\\begin{IEEEkeywords}', kw.join(', '), '\\end{IEEEkeywords}'] : []), '');
+    } else if (cls === 'acmart') {
+      lines.push(title);
+      for (const a of m.authors) {
+        lines.push(`\\author{${texEsc(a.name)}}`);
+        for (const f of affil(a).length ? affil(a) : ['']) lines.push(`\\affiliation{\\institution{${f}}\\country{}}`);
+        if (a.email) lines.push(`\\email{${texEsc(a.email)}}`);
+        if (a.orcid) lines.push(`\\orcid{${a.orcid}}`);
+      }
+      lines.push('', '\\begin{document}', ...abstract, ...(kw.length ? [`\\keywords{${kw.join(', ')}}`] : []), '\\maketitle', '');
+    } else if (cls === 'llncs') {
+      lines.push(title, '\\author{' + m.authors.map((a) => `${texEsc(a.name)}${a.affiliations.length ? `\\inst{${a.affiliations.map((n) => n + 1).join(',')}}` : ''}${a.orcid ? `\\orcidID{${a.orcid}}` : ''}`).join(' \\and ') + '}',
+        '\\authorrunning{' + texEsc(m.authors.length > 2 ? m.authors[0].name + ' et al.' : m.authors.map((a) => a.name).join(' and ')) + '}',
+        '\\institute{' + (m.affiliations.map((f) => texEsc(f)).join(' \\and ') || ' ') + '}',
+        '', '\\begin{document}', '\\maketitle',
+        ...(abstract.length ? [abstract[0], abstract[1], ...(kw.length ? [`\\keywords{${kw.join(' \\and ')}}`] : []), abstract[2]] : []), '');
+    } else if (cls === 'elsarticle') {
+      lines.push('', '\\begin{document}', '\\begin{frontmatter}', title);
+      for (const a of m.authors) lines.push(`\\author[${a.affiliations.map((n) => 'a' + (n + 1)).join(',') || 'a0'}]{${texEsc(a.name)}}${a.email ? `\\ead{${texEsc(a.email)}}` : ''}`);
+      m.affiliations.forEach((f, i) => lines.push(`\\affiliation[a${i + 1}]{organization={${texEsc(f)}}}`));
+      lines.push(...abstract, ...(kw.length ? ['\\begin{keyword}', kw.join(' \\sep '), '\\end{keyword}'] : []), '\\end{frontmatter}', '');
+    } else if (cls === 'revtex4-2') {
+      lines.push('', '\\begin{document}', title);
+      for (const a of m.authors) {
+        lines.push(`\\author{${texEsc(a.name)}}`);
+        if (a.email) lines.push(`\\email{${texEsc(a.email)}}`);
+        for (const f of affil(a)) lines.push(`\\affiliation{${f}}`);
+      }
+      lines.push('', ...abstract, '\\maketitle', '');
+    } else {
+      lines.push(title);
+      m.authors.forEach((a) => {
+        const marks = (a.affiliations || []).map((n) => n + 1).join(',');
+        const extra = [a.corresponding && a.email ? `\\thanks{Correspondence: \\href{mailto:${a.email}}{${texEsc(a.email)}}}` : '',
+          a.orcid ? `\\thanks{ORCID: \\href{https://orcid.org/${a.orcid}}{${a.orcid}}}` : ''].join('');
+        lines.push(`\\author${marks ? `[${marks}]` : ''}{${texEsc(a.name)}${extra}}`);
+      });
+      m.affiliations.forEach((f, i) => lines.push(`\\affil[${i + 1}]{${texEsc(f)}}`));
+      lines.push('\\date{}', '', '\\begin{document}', '\\maketitle', '', ...abstract, '');
+      if (kw.length) lines.push(`\\noindent\\textbf{Keywords:} ${kw.join(', ')}`, '');
     }
-    if (m.keywords && m.keywords.length) lines.push(`\\noindent\\textbf{Keywords:} ${m.keywords.map(texEsc).join(', ')}`, '');
     const star = m.numbered === false ? '*' : '';
     for (const b of m.blocks) {
       if (b.type === 'heading') {
@@ -125,12 +183,26 @@
           lines.push('\\begin{equation}', tex, `\\label{${crossId(b.id)}}`, '\\end{equation}', '');
         }
       } else if (b.type === 'figure') {
-        const w = b.width ? (b.width / 100).toFixed(2) : '1';
-        lines.push('\\begin{figure}[htbp]', '\\centering', `\\includegraphics[width=${w === '1.00' || w === '1' ? '' : w}\\linewidth]{${figName(b)}}`,
-          `\\caption{${texRuns(b.caption)}}`, `\\label{${crossId(b.id)}}`, '\\end{figure}', '');
+        const share = b.width ? b.width / 100 : 1;
+        const pics = pictures(b);
+        // wrapped: the text runs beside it (wrapfig); otherwise a float,
+        // across both columns as figure*
+        const env = b.wrap ? 'wrapfigure' : b.span ? 'figure*' : 'figure';
+        lines.push(b.wrap ? `\\begin{wrapfigure}{${b.wrap === 'left' ? 'l' : 'r'}}{${share.toFixed(2)}\\linewidth}` : `\\begin{${env}}${floatOpt(b)}`, '\\centering');
+        const inner = b.wrap ? 1 : share;
+        if (pics.length > 1) {
+          const each = ((inner * 0.96) / pics.length).toFixed(2);
+          pics.forEach((p, i) => {
+            lines.push(`\\begin{subfigure}[t]{${each}\\linewidth}`, '\\centering', `\\includegraphics[width=\\linewidth]{${figName(p)}}`,
+              `\\caption{${texRuns(p.sub)}}`, `\\label{${crossId(b.id)}-${panelLetter(i)}}`, '\\end{subfigure}' + (i < pics.length - 1 ? '\\hfill' : ''));
+          });
+        } else {
+          lines.push(`\\includegraphics[width=${inner === 1 ? '' : inner.toFixed(2)}\\linewidth]{${figName(b)}}`);
+        }
+        lines.push(`\\caption{${texRuns(b.caption)}}`, `\\label{${crossId(b.id)}}`, `\\end{${env}}`, '');
       } else if (b.type === 'table') {
         const cols = Math.max(1, ...b.rows.map((r) => r.length));
-        lines.push('\\begin{table}[htbp]', '\\centering', `\\caption{${texRuns(b.caption)}}`, `\\label{${crossId(b.id)}}`,
+        lines.push(`\\begin{${b.span ? 'table*' : 'table'}}${floatOpt(b)}`, '\\centering', `\\caption{${texRuns(b.caption)}}`, `\\label{${crossId(b.id)}}`,
           `\\begin{tabular}{${'l'.repeat(cols)}}`, '\\toprule');
         b.rows.forEach((r, i) => {
           const cells = [];
@@ -138,16 +210,18 @@
           lines.push(cells.join(' & ') + ' \\\\');
           if (i === 0 && b.header) lines.push('\\midrule');
         });
-        lines.push('\\bottomrule', '\\end{tabular}', '\\end{table}', '');
+        lines.push('\\bottomrule', '\\end{tabular}', `\\end{${b.span ? 'table*' : 'table'}}`, '');
       }
     }
-    lines.push(`\\bibliographystyle{${numeric ? 'unsrtnat' : 'plainnat'}}`, '\\bibliography{references}', '', '\\end{document}', '');
+    const bst = L.bst !== undefined ? L.bst : numeric ? 'unsrtnat' : 'plainnat';
+    const style = cls === 'elsarticle' ? (numeric ? 'elsarticle-num' : 'elsarticle-harv') : bst;
+    lines.push(...(style ? [`\\bibliographystyle{${style}}`] : []), '\\bibliography{references}', '', '\\end{document}', '');
     const entries = [
       { path: 'paper.tex', content: lines.join('\n') },
       { path: 'references.bib', content: m.bibtex || '' },
       { path: 'README.txt', content: readme('latex', m) }
     ];
-    for (const b of m.blocks) if (b.type === 'figure' && b.base64) entries.push({ path: figName(b), content: b.png && b.mime === 'image/svg+xml' ? b.png.base64 : b.base64, base64: true });
+    entries.push(...pictureFiles(m));
     return entries;
   }
 
@@ -211,7 +285,16 @@
       if (b.type === 'heading') out.push(`${'#'.repeat(b.level)} ${mdRuns(b.runs).trim()} {#${crossId(b.id)}}`);
       else if (b.type === 'para') { const s = mdRuns(b.runs).trim(); if (s) out.push(s); }
       else if (b.type === 'equation') out.push(`$$\n${b.tex}\n$$ {#${crossId(b.id)}}`);
-      else if (b.type === 'figure') out.push(`![${mdRuns(b.caption).trim()}](${figName(b)}){#${crossId(b.id)}${b.width ? ` width=${b.width}%` : ''}}`);
+      else if (b.type === 'figure') {
+        // fig-pos is Quarto's placement (and Pandoc's LaTeX writer reads it too)
+        const attrs = `${b.width ? ` width=${b.width}%` : ''}${b.place ? ` fig-pos="${b.place}"` : ''}`;
+        if (pictures(b).length > 1) {
+          // pandoc-crossref's subfigures: the panels, then the caption, in one div
+          const each = Math.floor((b.width || 100) / pictures(b).length) - 1;
+          out.push(`<div id="${crossId(b.id)}">\n` + pictures(b).map((p, i) => `![${mdRuns(p.sub).trim()}](${figName(p)}){#${crossId(b.id)}-${panelLetter(i)} width=${each}%}`).join('\n')
+            + `\n\n${mdRuns(b.caption).trim()}\n</div>`);
+        } else out.push(`![${mdRuns(b.caption).trim()}](${figName(b)}){#${crossId(b.id)}${attrs}}`);
+      }
       else if (b.type === 'table') {
         const cols = Math.max(1, ...b.rows.map((r) => r.length));
         const cell = (r, k) => mdRuns(r[k] || []).replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
@@ -228,7 +311,7 @@
       { path: 'README.txt', content: readme('pandoc', m) }
     ];
     if (m.style && m.style.xml) entries.push({ path: (m.style.id || 'style') + '.csl', content: m.style.xml });
-    for (const b of m.blocks) if (b.type === 'figure' && b.base64) entries.push({ path: figName(b), content: b.png && b.mime === 'image/svg+xml' ? b.png.base64 : b.base64, base64: true });
+    entries.push(...pictureFiles(m));
     return entries;
   }
 
@@ -289,6 +372,13 @@ Quarto reads the same file (rename it paper.qmd).
   }
   function html(m, { print = false } = {}) {
     const font = m.font || 'Georgia, "Times New Roman", serif';
+    // a journal sets the page, the numbers and the words of the captions
+    const j = m.journal || null;
+    const J = j ? Journals() : null;
+    const num = (b) => (m.numbered === false ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    const figWord = j ? j.captions.figure : 'Figure';
+    const tabWord = j ? j.captions.table : 'Table';
+    const sep = j ? j.captions.sep : '.';
     const body = [];
     body.push(`<header><h1 class="title">${esc(m.title || '')}</h1>`);
     if (m.subtitle) body.push(`<p class="subtitle">${esc(m.subtitle)}</p>`);
@@ -301,25 +391,36 @@ Quarto reads the same file (rename it paper.qmd).
     }
     body.push('</header>');
     if (m.abstract && m.abstract.length) body.push(`<section class="abstract"><h2>Abstract</h2>${m.abstract.map((p) => `<p>${htmlRuns(p)}</p>`).join('')}</section>`);
-    if (m.keywords && m.keywords.length) body.push(`<p class="keywords"><b>Keywords:</b> ${m.keywords.map(esc).join(', ')}</p>`);
+    if (m.keywords && m.keywords.length && (!j || j.keywords)) body.push(`<p class="keywords"><b>${esc(j ? j.keywords : 'Keywords')}${j && j.abstract === 'inline' ? '—' : ':'}</b> ${m.keywords.map(esc).join(', ')}</p>`);
     body.push('<main>');
     for (const b of m.blocks) {
-      if (b.type === 'heading') body.push(`<h${b.level + 1} id="${esc(b.id)}">${m.numbered !== false && b.num ? `<span class="num">${esc(b.num)}</span> ` : ''}${htmlRuns(b.runs)}</h${b.level + 1}>`);
+      if (b.type === 'heading') body.push(`<h${b.level + 1} id="${esc(b.id)}">${num(b) ? `<span class="num">${esc(num(b))}</span> ` : ''}${htmlRuns(b.runs)}</h${b.level + 1}>`);
       else if (b.type === 'para') { const s = htmlRuns(b.runs); if (runsText(b.runs).trim() || /<(img|svg)/.test(s)) body.push(`<p${b.flush ? ' class="flush"' : ''}>${s}</p>`); }
       else if (b.type === 'equation') body.push(`<div class="eq" id="${esc(b.id)}"><span class="eq-body">${b.svg || esc(b.tex)}</span><span class="eq-num">(${esc(b.num)})</span></div>`);
-      else if (b.type === 'figure') body.push(`<figure id="${esc(b.id)}"${b.width ? ` style="--w:${b.width}%"` : ''}>${b.base64 ? `<img src="data:${b.mime};base64,${b.base64}" alt="${esc(b.alt || '')}">` : ''}<figcaption><b>Figure ${esc(b.num)}.</b> ${htmlRuns(b.caption)}</figcaption></figure>`);
+      else if (b.type === 'figure') {
+        const img = (p) => (p.base64 ? `<img src="data:${p.mime};base64,${p.base64}" alt="${esc(p.alt || '')}">` : '');
+        const pics = pictures(b);
+        const inner = pics.length > 1
+          ? `<div class="panels">${pics.map((p, i) => `<div class="panel">${img(p)}<div class="subcap"><b>(${panelLetter(i)})</b> ${htmlRuns(p.sub)}</div></div>`).join('')}</div>`
+          : img(b);
+        const cls = [b.wrap ? 'wrap-' + b.wrap : '', b.span ? 'span' : '', pics.length > 1 ? 'multi' : ''].filter(Boolean).join(' ');
+        body.push(`<figure id="${esc(b.id)}"${cls ? ` class="${cls}"` : ''}${b.width ? ` style="--w:${b.width}%"` : ''}>${inner}<figcaption><b>${esc(figWord)} ${esc(b.num)}${esc(sep)}</b> ${htmlRuns(b.caption)}</figcaption></figure>`);
+      }
       else if (b.type === 'table') {
         const rows = b.rows.map((r, i) => `<tr>${r.map((c) => (i === 0 && b.header ? `<th>${htmlRuns(c)}</th>` : `<td>${htmlRuns(c)}</td>`)).join('')}</tr>`);
         const head = b.header && rows.length ? `<thead>${rows.shift()}</thead>` : '';
-        body.push(`<figure class="table" id="${esc(b.id)}"><figcaption><b>Table ${esc(b.num)}.</b> ${htmlRuns(b.caption)}</figcaption><table>${head}<tbody>${rows.join('')}</tbody></table></figure>`);
+        body.push(`<figure class="table${b.span ? ' span' : ''}" id="${esc(b.id)}"><figcaption><b>${esc(tabWord)} ${tabWord === 'TABLE' && j && j.headings.numbering === 'roman' ? esc(J.headingNumber({ headings: { numbering: 'roman' } }, b.num, 1)).replace(/\.$/, '') : esc(b.num)}${esc(sep)}</b> ${htmlRuns(b.caption)}</figcaption><table>${head}<tbody>${rows.join('')}</tbody></table></figure>`);
       }
     }
-    body.push('</main>');
+    // in two columns the reference list runs on in them
+    const twoCol = j && j.columns > 1;
+    if (!twoCol) body.push('</main>');
     const bib = m.bibliography;
     if (bib && bib.entries.length) {
       body.push(`<section class="references${bib.hanging ? ' hanging' : ''}${bib.numeric ? ' numeric' : ''}"><h2>References</h2>`
         + bib.entries.map((e) => `<div class="entry" id="ref-${esc(e.id)}">${e.html}</div>`).join('') + '</section>');
     }
+    if (twoCol) body.push('</main>');
     const css = `
 @page { margin: 2.5cm 2.5cm; }
 html { -webkit-print-color-adjust: exact; }
@@ -347,6 +448,15 @@ a { color: inherit; text-decoration: none; }
 .eq-num { position: absolute; right: 0; }
 figure { margin: 1.5em auto; text-align: center; break-inside: avoid; }
 figure img { width: var(--w, 100%); max-width: 100%; height: auto; }
+figure.wrap-left, figure.wrap-right { width: var(--w, 50%); margin: .3em 0 .6em; }
+figure.wrap-left { float: left; margin-right: 1.4em; } figure.wrap-right { float: right; margin-left: 1.4em; }
+figure.wrap-left img, figure.wrap-right img { width: 100%; }
+figure.multi { width: var(--w, 100%); }
+figure .panels { display: flex; gap: 3%; align-items: flex-start; }
+figure .panel { flex: 1 1 0; min-width: 0; }
+figure .panel img { width: 100%; }
+figure .subcap { font-size: .85em; margin-top: .3em; }
+figure.span, figure.table.span { column-span: all; }
 figcaption { text-align: left; font-size: .9em; margin-top: .5em; line-height: 1.4; }
 figure.table figcaption { margin: 0 0 .5em; }
 table { border-collapse: collapse; margin: 0 auto; font-size: .9em; border-top: 1.5px solid #000; border-bottom: 1.5px solid #000; }
@@ -358,9 +468,10 @@ th, td { padding: .25em .7em; text-align: left; vertical-align: top; }
 .references.numeric .csl-entry { display: flex; gap: .6em; }
 .references .csl-left-margin { min-width: 2.2em; }
 .references .csl-right-inline { flex: 1; }`;
+    const style = j ? J.css(j, { double: m.double }) : css;
     return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(m.title || 'Paper')}</title><style>${css}</style></head>
+<title>${esc(m.title || 'Paper')}</title><style>${style}</style></head>
 <body>
 ${body.join('\n')}
 </body></html>
@@ -464,15 +575,19 @@ ${body.join('\n')}
         body.push(para('Equation', mark(b.id, `<w:r><w:tab/></w:r>${pic}<w:r><w:tab/></w:r>${run({ text: `(${b.num})` })}`)));
         afterBlock = true;
       } else if (b.type === 'figure') {
-        const src = b.png || (b.base64 && b.mime !== 'image/svg+xml' ? { base64: b.base64, w: b.w, h: b.h } : null);
-        if (src) {
-          const maxW = 6.0 * 96 * (b.width ? b.width / 100 : 1);
-          const w = Math.min(maxW, src.w || maxW);
+        const pics = pictures(b);
+        const room = (6.0 * 96 * (b.width ? b.width / 100 : 1)) / pics.length - (pics.length > 1 ? 8 : 0);
+        const art = pics.map((p) => {
+          const src = p.png || (p.base64 && p.mime !== 'image/svg+xml' ? { base64: p.base64, w: p.w, h: p.h } : null);
+          if (!src) return '';
+          const w = Math.min(room, src.w || room);
           const h = src.w ? (src.h || src.w) * (w / src.w) : w * 0.6;
-          const ext = b.png ? 'png' : b.mime === 'image/jpeg' ? 'jpeg' : b.mime.split('/')[1];
-          body.push(para('Figure', drawing(addImage(src.base64, ext), w, h, b.alt)));
-        }
-        body.push(para('Caption', mark(b.id, run({ text: `Figure ${b.num}. `, b: true })) + runsXml(b.caption)));
+          const ext = p.png ? 'png' : p.mime === 'image/jpeg' ? 'jpeg' : p.mime.split('/')[1];
+          return drawing(addImage(src.base64, ext), w, h, p.alt);
+        }).filter(Boolean);
+        if (art.length) body.push(para('Figure', art.join(run({ text: '  ' }))));
+        const subs = pics.length > 1 ? pics.map((p, i) => run({ text: `(${panelLetter(i)}) `, b: true }) + runsXml(p.sub) + run({ text: ' ' })).join('') : '';
+        body.push(para('Caption', mark(b.id, run({ text: `Figure ${b.num}. `, b: true })) + runsXml(b.caption) + (subs ? run({ text: ' ' }) + subs : '')));
         afterBlock = true;
       } else if (b.type === 'table') {
         body.push(para('TableCaption', mark(b.id, run({ text: `Table ${b.num}. `, b: true })) + runsXml(b.caption)));

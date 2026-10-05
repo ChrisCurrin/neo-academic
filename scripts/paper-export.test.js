@@ -134,3 +134,36 @@ test('edge cases: align as written, line breaks in cells and the abstract, entit
   assert.match(md, /abstract: \|\n {2}line one\n {2}line two: x\n/);
   assert.equal(X.htmlToRuns('p &#60; 0.05 &#38; more').map((r) => r.text).join(''), 'p < 0.05 & more');
 });
+
+test('figure layout: placement, both columns, wrapped text and panels, as LaTeX lays them out', () => {
+  const m = model();
+  const pic = (name) => ({ name, mime: 'image/png', base64: 'AAAA', w: 100, h: 50 });
+  m.blocks = [
+    { type: 'figure', id: 'fig-p1', num: '1', place: 'H', caption: [T('Pinned')], ...pic('figure-a.png') },
+    { type: 'figure', id: 'fig-p2', num: '2', span: true, place: 'H', caption: [T('Wide')], ...pic('figure-b.png') },
+    { type: 'figure', id: 'fig-p3', num: '3', wrap: 'right', width: 33, caption: [T('Beside')], ...pic('figure-c.png') },
+    { type: 'figure', id: 'fig-p4', num: '4', width: 100, caption: [T('Both')], ...pic('figure-d.png'),
+      panels: [{ ...pic('figure-d.png'), sub: [T('Before')] }, { ...pic('figure-e.png'), sub: [T('After')] }] },
+    { type: 'table', id: 'tab-t1', num: '1', span: true, place: 't', caption: [T('T')], header: true, rows: [[[T('a')]]] }
+  ];
+  const files = X.latex(m);
+  const tex = files.find((f) => f.path === 'paper.tex').content;
+  assert.match(tex, /\\usepackage\{subcaption\}\n\\usepackage\{float\}\n\\usepackage\{wrapfig\}/);
+  assert.match(tex, /\\begin\{figure\}\[H\]\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-a\.png\}/);
+  assert.match(tex, /\\begin\{figure\*\}\[tp\][\s\S]*?\\end\{figure\*\}/, 'a figure across both columns takes no [H]');
+  assert.match(tex, /\\begin\{wrapfigure\}\{r\}\{0\.33\\linewidth\}\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-c\.png\}/);
+  assert.match(tex, /\\begin\{subfigure\}\[t\]\{0\.48\\linewidth\}\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-d\.png\}\n\\caption\{Before\}\n\\label\{fig:p4-a\}\n\\end\{subfigure\}\\hfill\n\\begin\{subfigure\}/);
+  assert.match(tex, /\\caption\{After\}\n\\label\{fig:p4-b\}\n\\end\{subfigure\}\n\\caption\{Both\}/);
+  assert.match(tex, /\\begin\{table\*\}\[t\][\s\S]*?\\end\{table\*\}/);
+  assert.deepEqual(files.filter((f) => f.path.startsWith('figures/')).map((f) => f.path),
+    ['figures/figure-a.png', 'figures/figure-b.png', 'figures/figure-c.png', 'figures/figure-d.png', 'figures/figure-e.png']);
+  const md = X.pandoc(m).find((f) => f.path === 'paper.md').content;
+  assert.match(md, /\{#fig:p1 fig-pos="H"\}/);
+  assert.match(md, /<div id="fig:p4">\n!\[Before\]\(figures\/figure-d\.png\)\{#fig:p4-a width=49%\}\n!\[After\]\(figures\/figure-e\.png\)\{#fig:p4-b width=49%\}\n\nBoth\n<\/div>/);
+  const html = X.html(m);
+  assert.match(html, /<figure id="fig-p3" class="wrap-right" style="--w:33%">/);
+  assert.match(html, /<figure id="fig-p4" class="multi" style="--w:100%"><div class="panels"><div class="panel"><img[^>]+><div class="subcap"><b>\(a\)<\/b> Before<\/div>/);
+  assert.match(html, /<figure class="table span" id="tab-t1">/);
+  const doc = X.docx(m).find((f) => f.path === 'word/document.xml').content;
+  assert.match(doc, /Figure 4\. <\/w:t><\/w:r><w:bookmarkEnd w:id="\d+"\/><w:r><w:t xml:space="preserve">Both<\/w:t><\/w:r><w:r><w:t xml:space="preserve"> <\/w:t><\/w:r><w:r><w:rPr><w:b\/><\/w:rPr><w:t xml:space="preserve">\(a\) <\/w:t>/);
+});
