@@ -5,13 +5,16 @@
  * JSON; or link the file a reference manager keeps (Zotero's Better BibTeX
  * writes one and keeps it current), which NEO reads again whenever it comes
  * back into view. Each reference shows how often the paper cites it; a
- * click edits it. Loaded after paper/paper.js.
+ * click edits it. Beside them, the paper's symbols (symbols.json): each
+ * with its TeX, meaning, value, unit and sources, and how often it's used.
+ * Loaded after paper/paper.js.
  */
 
 'use strict';
 
 let libraryFilter = '';
-let libraryTrash = null; // the references last removed, with where they stood, for ⌘Z
+let libraryView = 'refs'; // the tab shows the references, or the symbols
+let libraryTrash = null; // the references last removed, with where they stood and from which paper, for ⌘Z
 
 // From switchTab
 function paperShowReferences() {
@@ -34,6 +37,8 @@ function paperHideReferences() {
 function paperLibraryRender(fresh = false) {
   const view = $('#references-view');
   if (!view || view.hidden || !book || !isPaper()) return;
+  $('#aux-title').textContent = libraryView === 'symbols' ? t('Symbols') : t('References');
+  if (libraryView === 'symbols') { drawSymbols(view, fresh); return; }
   if (fresh || !view.querySelector('.rl-add')) {
     view.innerHTML = `
       <div class="rl-top">
@@ -41,6 +46,7 @@ function paperLibraryRender(fresh = false) {
         <div class="rl-tools"></div>
       </div>
       <div class="rl-list" role="list"></div>`;
+    view.querySelector('.rl-top').prepend(libraryViews());
     const add = view.querySelector('.rl-add');
     add.placeholder = t('Paste a DOI, an arXiv ID or BibTeX to add it · or type to search');
     add.setAttribute('aria-label', t('Add or search references'));
@@ -107,9 +113,12 @@ function drawTools() {
       const name = paper.linkedPath.split(/[\\/]/).pop();
       const span = document.createElement('span');
       span.className = 'rl-linked';
-      span.textContent = t('Linked to {file}', { file: name });
+      // said here, where the writer looks at references, not over the page while they type
+      const missing = paper.linkedStamp === 'missing';
+      span.textContent = missing ? t('The linked library {file} isn’t where it was', { file: name }) : t('Linked to {file}', { file: name });
       span.title = paper.linkedPath;
       box.appendChild(span);
+      if (missing) link(t('Link a reference library…'), paperLinkLibrary);
       link(t('Unlink'), () => paperMenu({ command: 'unlinkLibrary' }).then(drawTools));
     } else {
       link(t('Link a reference library…'), paperLinkLibrary, t('A .bib file your reference manager keeps up to date (Zotero with Better BibTeX can). NEO reads it again whenever you come back.'));
@@ -120,20 +129,127 @@ function drawTools() {
   const uncited = paper.refs.filter((r) => !cited.has(r.id));
   // before submitting: the list down to what the paper cites
   if (uncited.length && uncited.length < paper.refs.length) {
-    link(t('Remove {n} uncited', { n: uncited.length }), () => paperRemoveRefs(uncited, t('{n} uncited references', { n: uncited.length })),
+    link(t('Remove {n} uncited', { n: uncited.length }), () => paperRemoveRefs(uncited, uncited.length === 1
+      ? t('Removed the one uncited reference — {key} here brings it back', { key: KZ })
+      : t('Removed {n} uncited references — {key} here brings them back', { n: uncited.length, key: KZ })),
       t('Take out every reference the paper doesn’t cite; {key} brings them back', { key: KZ }));
   }
   const count = document.createElement('span');
   count.className = 'rl-count';
-  count.textContent = paper.refs.length ? t('{n} references · {c} cited', { n: paper.refs.length, c: paper.refs.filter((r) => cited.has(r.id)).length }) : '';
+  const incomplete = paper.refs.filter((r) => cited.has(r.id) && refGaps(r).length).length;
+  count.textContent = paper.refs.length ? t('{n} references · {c} cited', { n: paper.refs.length, c: paper.refs.filter((r) => cited.has(r.id)).length })
+    + (incomplete ? ' · ' + t('{n} cited with something missing', { n: incomplete }) : '') : '';
   box.appendChild(count);
 }
 
-// How often each reference is cited, from the page itself
+// How often each reference is cited, from the page itself (and as a
+// symbol's source, which the table of symbols cites)
 function paperCitedIds() {
   const ids = [];
   for (const n of document.querySelectorAll('#chapters .cite')) for (const x of citeData(n)) ids.push(x.id);
+  for (const sym of paper.symbols) for (const x of sym.cite || []) ids.push(x.id);
   return ids;
+}
+
+// References · Symbols, at the top of either
+function libraryViews() {
+  const bar = document.createElement('div');
+  bar.className = 'rl-views';
+  bar.setAttribute('role', 'tablist');
+  for (const [v, label] of [['refs', tk('References')], ['symbols', tk('Symbols')]]) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'tab');
+    b.setAttribute('aria-selected', String(libraryView === v));
+    b.className = 'rl-view' + (libraryView === v ? ' on' : '');
+    b.textContent = t(label);
+    b.onclick = () => { libraryView = v; paperLibraryRender(true); };
+    bar.appendChild(b);
+  }
+  return bar;
+}
+
+// The paper's symbols: each drawn, with what it stands for, its value and
+// where that comes from, and how often the paper uses it; a click edits it
+function drawSymbols(view, fresh) {
+  view.innerHTML = `<div class="rl-top"><div class="rl-tools"></div></div><div class="rl-list" role="list"></div>`;
+  view.querySelector('.rl-top').prepend(libraryViews());
+  const tools = view.querySelector('.rl-tools');
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'rl-tool';
+  add.textContent = t('New Symbol…');
+  add.onclick = async () => { await paperEditSymbol(); paperLibraryRender(); };
+  tools.appendChild(add);
+  const uses = new Map();
+  for (const n of document.querySelectorAll('#chapters .sym, #tp-abstract .sym')) uses.set(n.dataset.sym, (uses.get(n.dataset.sym) || 0) + 1);
+  const count = document.createElement('span');
+  count.className = 'rl-count';
+  count.textContent = paper.symbols.length ? t('{n} symbols · {t} in the table', { n: paper.symbols.length, t: paper.symbols.filter((x) => x.table !== false).length }) : '';
+  tools.appendChild(count);
+  const list = view.querySelector('.rl-list');
+  if (!paper.symbols.length) {
+    const empty = document.createElement('div');
+    empty.className = 'rl-empty';
+    empty.innerHTML = '<p></p><p class="soft"></p>';
+    empty.firstChild.textContent = t('No symbols yet.');
+    empty.lastChild.textContent = t('A symbol is notation defined once: V_m, the membrane potential, −65 mV (Hodgkin & Huxley, 1952). Then \\Vm and a space puts it in the paper, and /symbols makes a table of them. Select some maths and press ⇧F10 to define one from it.');
+    list.appendChild(empty);
+    if (fresh) add.focus({ preventScroll: true });
+    return;
+  }
+  for (const sym of NeoSymbols.sortSymbols(paper.symbols)) {
+    const row = document.createElement('div');
+    row.className = 'rl-row ps-row' + (uses.get(sym.id) ? '' : ' uncited');
+    row.setAttribute('role', 'listitem');
+    row.tabIndex = 0;
+    const glyph = document.createElement('div');
+    glyph.className = 'ps-glyph';
+    const svg = mathReady() ? texSvg(sym.tex, false) : null;
+    if (svg) glyph.appendChild(svg); else glyph.textContent = sym.tex;
+    const main = document.createElement('div');
+    main.className = 'rl-main';
+    const sources = (sym.cite || []).map((x) => { const it = paper.refs.find((r) => r.id === x.id); return it ? NeoReferences.shortLabel(it) : '@' + x.id; });
+    main.innerHTML = `<span class="rl-title"></span> <span class="ps-value"></span> <span class="ps-kind"></span> <span class="rl-doi"></span>`;
+    main.querySelector('.rl-title').textContent = sym.meaning || t('(what it stands for)');
+    main.querySelector('.ps-value').textContent = [sym.value, sym.unit].filter(Boolean).join(' ');
+    main.querySelector('.ps-kind').textContent = sym.kind ? t(KIND_NAMES[sym.kind]) : '';
+    main.querySelector('.rl-doi').textContent = sources.join('; ');
+    const side = document.createElement('div');
+    side.className = 'rl-side';
+    const key = document.createElement('code');
+    key.textContent = '\\' + sym.id;
+    const n = uses.get(sym.id) || 0;
+    const used = document.createElement('span');
+    used.className = 'rl-used';
+    used.textContent = (n ? t('used {n}×', { n }) : t('not used')) + (sym.table === false ? '' : ' · ' + t('in the table'));
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'rl-del';
+    del.textContent = '×';
+    del.title = t('Remove this symbol');
+    del.setAttribute('aria-label', del.title);
+    del.onclick = (e) => { e.stopPropagation(); paperDeleteSymbol(sym, n); };
+    side.append(key, used, del);
+    row.append(glyph, main, side);
+    const edit = async () => { await paperEditSymbol(symbolOf(sym.id) || sym); paperLibraryRender(); };
+    row.onclick = edit;
+    row.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); edit(); } };
+    list.appendChild(row);
+  }
+  if (fresh) add.focus({ preventScroll: true });
+}
+// A symbol out of the list. Where the paper uses it, it stays as its
+// maths, marked, until it's defined again (its menu offers that)
+async function paperDeleteSymbol(sym, used) {
+  if (used) {
+    const ok = await optionModal(t('Remove \\{name}?', { name: sym.id }),
+      t('The paper uses it {n} times. Each stays as its maths, marked, until a symbol of that name is defined again.', { n: used }),
+      [{ label: t('Remove'), value: true, danger: true }]);
+    if (!ok) return;
+  }
+  await paperSaveSymbols(paper.symbols.filter((s) => s.id !== sym.id));
+  paperLibraryRender();
 }
 
 function drawList() {
@@ -180,6 +296,15 @@ function drawList() {
     del.title = t('Remove from the references');
     del.setAttribute('aria-label', del.title);
     del.onclick = (e) => { e.stopPropagation(); paperDeleteRef(it, n); };
+    // what the reference list would print as missing: said here, before it's sent
+    const gaps = refGaps(it);
+    if (gaps.length) {
+      const g = document.createElement('span');
+      g.className = 'rl-gaps';
+      g.textContent = gaps.join(', ');
+      g.title = t('What the reference list would show as missing. Click the reference to fill it in.');
+      side.prepend(g);
+    }
     side.append(key, used, del);
     row.append(main, side);
     row.onclick = () => paperEditRef(it);
@@ -192,6 +317,16 @@ function drawList() {
     none.textContent = t('Nothing matches “{q}”', { q });
     list.appendChild(none);
   }
+}
+// What a reference lacks that its entry in the list would show
+function refGaps(it) {
+  const gaps = [];
+  if (!(it.author || it.editor || []).length) gaps.push(t('no authors'));
+  if (!NeoReferences.yearOf(it)) gaps.push(t('no year'));
+  if (!it.title) gaps.push(t('no title'));
+  if (it.type === 'article-journal' && !it['container-title']) gaps.push(t('no journal'));
+  if ((it.type === 'book' || it.type === 'chapter') && !it.publisher) gaps.push(t('no publisher'));
+  return gaps;
 }
 const refSortKey = (it) => (((it.author || it.editor || [])[0] || {}).family || it.title || it.id).toLowerCase() + NeoReferences.yearOf(it);
 
@@ -244,7 +379,9 @@ async function paperLinkLibrary() {
 }
 // The linked file, read again if it changed since NEO last looked. What it
 // holds updates the references by key; nothing is taken away for being
-// gone from it (the paper may still cite it).
+// gone from it (the paper may still cite it). This runs while the writer
+// may be typing, so it speaks only on the References tab; a file gone
+// missing is said there too, in the tools, for as long as it's gone.
 async function paperRefreshLinked() {
   if (!book || !isPaper() || !window.neo.paperLinked) return;
   const bookId = book.id;
@@ -255,16 +392,26 @@ async function paperRefreshLinked() {
   paper.linkedPath = got ? got.path : null;
   if (was !== paper.linkedPath) { paperReportState(); if (currentTab === 'references') drawTools(); }
   if (!got) return;
+  const looking = currentTab === 'references';
   if (got.missing) {
-    if (paper.linkedStamp !== 'missing') toast(t('The linked reference library isn’t where it was: {file}', { file: got.path }), 8000);
-    paper.linkedStamp = 'missing';
+    if (paper.linkedStamp !== 'missing') {
+      paper.linkedStamp = 'missing';
+      if (looking) {
+        drawTools();
+        toast(t('The linked reference library isn’t where it was: {file}', { file: got.path }), 8000);
+      }
+    }
     return;
   }
   const first = paper.linkedStamp === null;
+  const wasMissing = paper.linkedStamp === 'missing';
   paper.linkedStamp = got.mtime;
+  if (wasMissing && looking) drawTools();
   if (got.same || !got.text) return;
   const { added, updated } = await paperImportText(got.text, got.path.split(/[\\/]/).pop(), { keepKeys: true, quiet: true });
-  if (!first && (added.length || updated.length)) toast(t('Reference library read again: {n} new', { n: added.length }));
+  if (!first && looking && (added.length || updated.length)) {
+    toast(t('Reference library read again: {n} new · {u} updated', { n: added.length, u: updated.length }));
+  }
 }
 
 async function paperDeleteRef(it, cited) {
@@ -274,26 +421,30 @@ async function paperDeleteRef(it, cited) {
       [{ label: t('Remove'), value: true, danger: true }]);
     if (!ok) return;
   }
-  await paperRemoveRefs([it], NeoReferences.shortLabel(it));
+  await paperRemoveRefs([it], t('Removed {ref} — {key} brings it back', { ref: NeoReferences.shortLabel(it), key: KZ }));
 }
-// references out of the list, remembered where they stood for ⌘Z
-async function paperRemoveRefs(items, what) {
+// references out of the list, remembered where they stood for ⌘Z on this
+// tab, with the sentence that says what went and how it comes back
+async function paperRemoveRefs(items, said) {
   const gone = new Set(items);
-  libraryTrash = paper.refs.map((item, at) => ({ item, at })).filter((x) => gone.has(x.item));
+  libraryTrash = { bookId: book.id, rows: paper.refs.map((item, at) => ({ item, at })).filter((x) => gone.has(x.item)) };
   await paperSaveRefs(paper.refs.filter((r) => !gone.has(r)));
-  toast(t('Removed {ref} — {key} brings it back', { ref: what, key: KZ }));
+  toast(said, 8000);
   paperLibraryRender();
 }
 document.addEventListener('keydown', async (e) => {
   if (!libraryTrash || currentTab !== 'references' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.code !== 'KeyZ') return;
+  // another paper's references never come back into this one
+  if (!book || libraryTrash.bookId !== book.id) { libraryTrash = null; return; }
   // ⌘Z in a box with words in it takes back typing; the search box, empty, is where the caret sits after a removal
   const box = e.target && e.target.closest && e.target.closest('textarea, input');
   if (box && box.value) return;
   e.preventDefault();
-  const back = libraryTrash;
+  const back = libraryTrash.rows;
   libraryTrash = null;
   const items = [...paper.refs];
-  for (const { item, at } of back) items.splice(Math.min(at, items.length), 0, item);
+  // (one added again since, by hand or from the linked file, isn't doubled)
+  for (const { item, at } of back) if (!items.some((r) => r.id === item.id)) items.splice(Math.min(at, items.length), 0, item);
   await paperSaveRefs(items);
   paperLibraryRender();
 });

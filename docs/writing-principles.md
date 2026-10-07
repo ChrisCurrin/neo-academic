@@ -148,16 +148,17 @@ should be enforced while the writer types.
 | Separate modes | Guides appear only on empty space; spellcheck runs only as a pass; previews and exports are separate from the page, and the preview keeps up without taking the focus |
 | Feedback at a level | File → Draft for Feedback asks for top-level, coarse-grained or fine-grained feedback, and the draft opens with that request and its questions |
 | Set expectations for reviewers | Journal previews show the paper laid out as a journal would print it before it's sent |
+| Language rules, on demand | Edit → Editing Pass (`paper/editing.js`): filler, the passive, comparisons with no stated basis, long sentences, and what consistency asks (acronyms defined once and before use, one spelling of a word throughout, a space between a number and its unit, en-dash ranges, figures and tables referred to in order). Marked like the spellcheck pass, only when asked; each says its rule, and offers the fix where there is one |
+| The paragraph's rhythm | View → First and Last Sentences dims the middle of every paragraph, so a paragraph without context or a conclusion shows at a glance |
+| Paper to talk | File → Export → Talk Outline: slides whose narrative is the abstract's moves, one slide per figure with its question and main result in the speaker notes, for Pandoc (PowerPoint, reveal.js, Beamer) or Marp |
+| Review as the venue asks | File → Anonymous for Review leaves the authors and the sections that name them out of every preview and export, for double-blind review; the References tab says which cited references lack a year, title, authors or journal |
 
 ## 8. Not built yet (in order of value)
 
-1. **An editing pass for the language rules in section 6**, run like the
-   spellcheck pass: filler phrases, passive constructions, and
-   comparisons without a stated basis, each flagged with the rule it
-   breaks.
-2. **A paragraph check:** does each paragraph open with context and close
-   with a conclusion? Shown as an outline of each paragraph's first and
-   last sentences, so gaps in the rhythm are visible at a glance.
-3. **From paper to talk:** a slide outline drawn from the paper. The
-   abstract moves become the narrative; figure captions become slide
-   titles that ask a question, each with one main result.
+1. **Venue-aware editing:** the pass's rules weighted by the journal (a
+   word limit, a house style for units or numbers) rather than one set
+   for every paper.
+2. **Supplementary material:** a part of the paper numbered on its own
+   (Figure S1, Table S1), sent with it or apart.
+3. **The talk's questions:** captions that ask the question their figure
+   answers, offered as a rewrite during the editing pass.

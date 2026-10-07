@@ -9,6 +9,8 @@
 //                    labels), references.bib, the citation style, figures/
 //   html(model)    → one self-contained page (also what the PDF is printed from)
 //   docx(model)    → zip entries for a Word document
+//   talk(model)    → zip entries: talk.md (Pandoc slides), talk-marp.md (Marp),
+//                    figures/, README
 //
 // The model:
 //   { title, subtitle, authors: [{ name, affiliations: [n], email, orcid, corresponding }],
@@ -18,10 +20,19 @@
 //     blocks: [ { type: 'heading', level, num, id, runs } | { type: 'para', runs, flush }
 //             | { type: 'equation', id, num, tex, svg, png }
 //             | { type: 'figure', id, num, caption: runs, name, base64, mime, png, width, alt, w, h }
-//             | { type: 'table', id, num, caption: runs, header, rows: [[runs]] } ] }
+//             | { type: 'table', id, num, caption: runs, header, rows: [[runs]] }
+//             | { type: 'item', list: 'ul' | 'ol', level: 1–3, runs }
+//             | { type: 'symbols', kind, rows: [{ id, tex, meaning, unit, value, kind, svg, png, mml, cite }] } ],
+//     symbols: [{ id, tex }],
+//     moves: [{ move: 'status' | 'problem' | 'solution' | 'did' | 'found' | 'impact', text }] }
 //   runs: [ { text, b, i, u, s, sup, sub } | { cite: [{ id, locator, label, prefix, suffix }], narrative, html }
-//         | { xref, kind, num, label } | { math, svg, png } ]
+//         | { xref, kind, num, label } | { math, svg, png, mml } | { sym, math, svg, png, mml } ]
 // png is { base64, w, h } (pixels at 2x) where a picture had to be drawn for Word.
+// Consecutive items make one list; a deeper item nests in the one before
+// it. A symbol in the text (sym: its macro name) is inline maths everywhere
+// but LaTeX, which defines \Vm once in the preamble. The table of symbols'
+// rows come sorted; a row's cite is a citation run, or null. Text may hold
+// μ, ≤, °: LaTeX writes them as commands (NeoSymbols.texText).
 
 (function (root, factory) {
   const api = factory(root);
@@ -32,6 +43,7 @@
 
   const Journals = () => root.NeoJournals || (typeof require === 'function' ? require('./journals.js') : null);
   const Omml = () => root.NeoOmml || (typeof require === 'function' ? require('./omml.js') : null);
+  const Symbols = () => root.NeoSymbols || (typeof require === 'function' ? require('./symbols.js') : null);
   // CSS lengths (in, mm, pt) as Word's twentieths of a point
   const twips = (v) => {
     const m = /^([\d.]+)(in|mm|cm|pt)?$/.exec(String(v).trim());
@@ -68,6 +80,70 @@
   const pictureFiles = (m) => m.blocks.filter((b) => b.type === 'figure').flatMap(pictures).filter((p) => p.base64)
     .map((p) => ({ path: figName(p), content: p.png && p.mime === 'image/svg+xml' ? p.png.base64 : p.base64, base64: true }));
   const panelLetter = (i) => String.fromCharCode(97 + i);
+  // A figure's panels in rows, as the page sets them: so many columns to a
+  // row (all in one row unless the writer chose: b.cols), each panel
+  // taking one or more of them (p.colspan), a gap between. A panel's share
+  // is of the figure's own width, its gaps inside it; a row not full is
+  // centred. The page is set the same way (styles.css): 3% gaps, equal columns.
+  const PANEL_GAP = 0.03;
+  function panelRows(b) {
+    const pics = pictures(b);
+    const units = b.cols || pics.reduce((n, p) => n + (p.colspan || 1), 0);
+    const gap = units > 1 ? PANEL_GAP : 0;
+    const unit = (1 - gap * (units - 1)) / units;
+    const rows = [];
+    let row = [];
+    let used = 0;
+    pics.forEach((p, i) => {
+      const span = Math.min(p.colspan || 1, units);
+      if (used + span > units) { rows.push(row); row = []; used = 0; }
+      row.push({ p, i, span, share: unit * span + gap * (span - 1) });
+      used += span;
+    });
+    if (row.length) rows.push(row);
+    return { rows, units, gap };
+  }
+  // Lists as each format opens and closes them: called with each block in
+  // turn (and null at the end), it says which lists close before the block
+  // and which open for it, innermost last, and how deep the item sits. An
+  // item one level deeper nests in the item before; another kind at the
+  // same depth starts another list.
+  function lister() {
+    const open = [];
+    return (b) => {
+      const item = b && b.type === 'item';
+      const list = item && b.list === 'ol' ? 'ol' : 'ul';
+      const depth = item ? Math.max(1, Math.min(b.level || 1, open.length + 1, 3)) : 0;
+      const close = [];
+      const opens = [];
+      // deeper lists close, and at its own depth a list of another kind
+      const keep = depth && open.length >= depth && open[depth - 1] !== list ? depth - 1 : depth;
+      while (open.length > keep) close.push({ list: open.pop(), depth: open.length + 1 });
+      while (open.length < depth) { open.push(list); opens.push({ list, depth: open.length }); }
+      return { close, open: opens, depth, list };
+    };
+  }
+  // The table of symbols as rows of runs, its header first. Value, unit and
+  // source only when some row has one. The header's words are English, as
+  // the captions' are.
+  const SYMBOL_HEADS = { symbol: 'Symbol', meaning: 'Meaning', value: 'Value', unit: 'Unit', source: 'Source' };
+  const macroName = (id) => /^[A-Za-z]{1,30}$/.test(id || '');
+  function symbolColumns(b) {
+    const has = (k) => b.rows.some((r) => (k === 'source' ? r.cite && r.cite.cite && r.cite.cite.length : String(r[k] || '').trim()));
+    return ['symbol', 'meaning', 'value', 'unit', 'source'].filter((k) => k === 'symbol' || k === 'meaning' || has(k));
+  }
+  function symbolTable(b) {
+    const cols = symbolColumns(b);
+    const cell = (r, k) => {
+      if (k === 'symbol') return [{ ...(macroName(r.id) ? { sym: r.id } : {}), math: r.tex || '', svg: r.svg, png: r.png, mml: r.mml }];
+      if (k === 'source') return r.cite && r.cite.cite && r.cite.cite.length ? [r.cite] : [];
+      return r[k] ? [{ text: String(r[k]) }] : [];
+    };
+    return { cols, rows: [cols.map((k) => [{ text: SYMBOL_HEADS[k] }]), ...b.rows.map((r) => cols.map((k) => cell(r, k)))] };
+  }
+  // every run in the paper, wherever it is
+  const allRuns = (m) => [...(m.abstract || []).flat(), ...m.blocks.flatMap((b) => [
+    ...(b.runs || []), ...(b.caption || []), ...(b.type === 'table' ? b.rows.flat(2) : []), ...(b.panels || []).flatMap((p) => p.sub || [])])];
   // LaTeX's float placement: [htbp] unless the writer chose; figure* takes no [H] or [h]
   const floatOpt = (b) => (b.place && !(b.span && /[Hh]/.test(b.place)) ? `[${b.place}]` : b.span ? '[tp]' : '[htbp]');
 
@@ -75,9 +151,10 @@
   // LaTeX
   // ---------------------------------------------------------------------
   const TEX_ESC = { '\\': '\\textbackslash{}', '{': '\\{', '}': '\\}', $: '\\$', '&': '\\&', '#': '\\#', '%': '\\%', _: '\\_', '~': '\\textasciitilde{}', '^': '\\textasciicircum{}', '\u00a0': '~' };
-  const texEsc = (s) => String(s).replace(/[\\{}$&#%_~^\u00a0]/g, (c) => TEX_ESC[c]);
+  // and μ, ≤ or ° as commands, which pdflatex can set
+  const texEsc = (s) => Symbols().texText(String(s).replace(/[\\{}$&#%_~^\u00a0]/g, (c) => TEX_ESC[c]));
 
-  function texRuns(runs) {
+  function texRuns(runs, journal) {
     return (runs || []).map((r) => {
       if (r.text !== undefined) {
         // a line break inside a caption or a cell: LaTeX takes a space there
@@ -89,11 +166,12 @@
         if (r.b) s = `\\textbf{${s}}`;
         return s;
       }
+      if (r.sym && macroName(r.sym)) return `\\${r.sym}{}`;
       if (r.math !== undefined) return `\\(${r.math}\\)`;
       if (r.xref) {
         const label = crossId(r.xref);
-        if (r.kind === 'eq') return `Equation~\\eqref{${label}}`;
-        const word = { fig: 'Figure', tbl: 'Table', sec: 'Section' }[r.kind] || '';
+        const word = Journals().refWord(journal, r.kind);
+        if (r.kind === 'eq') return `${word}~\\eqref{${label}}`;
         return r.kind ? `${word}~\\ref{${label}}` : texEsc(r.label || '');
       }
       if (r.cite) return texCite(r);
@@ -120,6 +198,13 @@
     const panels = used((b) => b.type === 'figure' && b.panels && b.panels.length > 1);
     const pinned = used((b) => (b.type === 'figure' || b.type === 'table') && b.place === 'H');
     const wrapped = used((b) => b.type === 'figure' && b.wrap);
+    const symTable = used((b) => b.type === 'symbols' && b.rows.length);
+    // the paper's own symbols, each a command (robust, so a name LaTeX
+    // already has can't stop the compile), with any the text uses
+    const defs = new Map();
+    for (const s of m.symbols || []) if (macroName(s.id)) defs.set(s.id, s.tex);
+    for (const b of m.blocks) if (b.type === 'symbols') for (const r of b.rows) if (macroName(r.id) && !defs.has(r.id)) defs.set(r.id, r.tex);
+    for (const r of allRuns(m)) if (r.sym && macroName(r.sym) && !defs.has(r.sym)) defs.set(r.sym, r.math);
     const article = cls === 'article';
     const opts = [L.opts, cls === 'elsarticle' && !numeric ? 'authoryear' : ''].filter(Boolean).join(',');
     // the classes that bring natbib (and acmart, hyperref) with them
@@ -137,9 +222,11 @@
       ...(panels ? ['\\usepackage{subcaption}'] : []),
       ...(pinned ? ['\\usepackage{float}'] : []),
       ...(wrapped ? ['\\usepackage{wrapfig}'] : []),
+      ...(symTable ? ['\\usepackage{tabularx}'] : []),
       ...(ownNatbib ? [] : [numeric || !article ? '\\usepackage[numbers,square,sort&compress]{natbib}' : '\\usepackage[round]{natbib}']),
       ...(m.double && article ? ['\\usepackage{setspace}', '\\doublespacing'] : []),
       ...(cls === 'acmart' ? ['\\settopmatter{printacmref=false}', '\\setcopyright{none}', '\\renewcommand\\footnotetextcopyrightpermission[1]{}'] : ['\\usepackage[hidelinks]{hyperref}']),
+      ...(defs.size ? ['', '% The paper\'s symbols', ...[...defs].map(([id, tex]) => `\\DeclareRobustCommand{\\${id}}{\\ensuremath{${String(tex || '').replace(/#/g, '##')}}}`)] : []),
       '');
     const title = `\\title{${texEsc(m.title || '')}${m.subtitle ? (article ? `\\\\[0.4em]\\large ${texEsc(m.subtitle)}` : `: ${texEsc(m.subtitle)}`) : ''}}`;
     const abstract = m.abstract && m.abstract.length ? ['\\begin{abstract}', m.abstract.map(texRuns).join('\n\n'), '\\end{abstract}'] : [];
@@ -190,12 +277,33 @@
       if (kw.length) lines.push(`\\noindent\\textbf{Keywords:} ${kw.join(', ')}`, '');
     }
     const star = m.numbered === false ? '*' : '';
+    const list = lister();
+    const ENV = { ul: 'itemize', ol: 'enumerate' };
+    // closing a list: the paragraph after it runs on unindented, as after a figure
+    const closeLists = (ls) => ls.close.forEach((c) => lines.push(`${'  '.repeat(c.depth - 1)}\\end{${ENV[c.list]}}`));
     for (const b of m.blocks) {
-      if (b.type === 'heading') {
+      const ls = list(b);
+      closeLists(ls);
+      if (b.type === 'item') {
+        for (const o of ls.open) lines.push(`${'  '.repeat(o.depth - 1)}\\begin{${ENV[o.list]}}`);
+        lines.push(`${'  '.repeat(ls.depth)}\\item ${texRuns(b.runs, m.journal).trim()}`);
+      } else if (b.type === 'symbols') {
+        if (!b.rows.length) continue;
+        // a plain tabular (nomencl and glossaries need another run), as wide
+        // as the column, the meaning and source wrapping in it
+        const { cols, rows } = symbolTable(b);
+        const spec = cols.map((k) => (k === 'meaning' || k === 'source' ? '>{\\raggedright\\arraybackslash}X' : 'l')).join('');
+        lines.push('\\begin{center}', `\\begin{tabularx}{\\linewidth}{@{}${spec}@{}}`, '\\toprule');
+        rows.forEach((r, i) => {
+          lines.push(r.map((c) => texRuns(c, m.journal).replace(/\s*\n\s*/g, ' ').trim()).join(' & ') + ' \\\\');
+          if (i === 0) lines.push('\\midrule');
+        });
+        lines.push('\\bottomrule', '\\end{tabularx}', '\\end{center}', '');
+      } else if (b.type === 'heading') {
         const cmd = ['section', 'subsection', 'subsubsection'][b.level - 1];
-        lines.push(`\\${cmd}${b.unnumbered ? '*' : star}{${texRuns(b.runs)}}\\label{${crossId(b.id)}}`, '');
+        lines.push(`\\${cmd}${b.unnumbered ? '*' : star}{${texRuns(b.runs, m.journal)}}\\label{${crossId(b.id)}}`, '');
       } else if (b.type === 'para') {
-        const text = texRuns(b.runs).trim();
+        const text = texRuns(b.runs, m.journal).trim();
         if (text) lines.push((b.flush ? '\\noindent ' : '') + text, '');
       } else if (b.type === 'equation') {
         // align, gather and multline are environments of their own: as written, labeled inside
@@ -214,28 +322,35 @@
         lines.push(b.wrap ? `\\begin{wrapfigure}{${b.wrap === 'left' ? 'l' : 'r'}}{${share.toFixed(2)}\\linewidth}` : `\\begin{${env}}${floatOpt(b)}`, '\\centering');
         const inner = b.wrap ? 1 : share;
         if (pics.length > 1) {
-          const each = ((inner * 0.96) / pics.length).toFixed(2);
-          pics.forEach((p, i) => {
-            lines.push(`\\begin{subfigure}[t]{${each}\\linewidth}`, '\\centering', `\\includegraphics[width=\\linewidth]{${figName(p)}}`,
-              `\\caption{${texRuns(p.sub)}}`, `\\label{${crossId(b.id)}-${panelLetter(i)}}`, '\\end{subfigure}' + (i < pics.length - 1 ? '\\hfill' : ''));
+          // row by row, a fixed gap between panels, a row not full centred
+          const { rows, gap } = panelRows(b);
+          rows.forEach((row, r) => {
+            row.forEach(({ p, i, share }, k) => {
+              lines.push(`\\begin{subfigure}[t]{${(inner * share).toFixed(3)}\\linewidth}`, '\\centering', `\\includegraphics[width=\\linewidth]{${figName(p)}}`,
+                `\\caption{${texRuns(p.sub, m.journal)}}`, `\\label{${crossId(b.id)}-${panelLetter(i)}}`, '\\end{subfigure}' + (k < row.length - 1 ? `\\hspace{${(inner * gap).toFixed(3)}\\linewidth}` : '%'));
+            });
+            if (r < rows.length - 1) lines.push('', '\\medskip');
           });
         } else {
           lines.push(`\\includegraphics[width=${inner === 1 ? '' : inner.toFixed(2)}\\linewidth]{${figName(b)}}`);
         }
-        lines.push(`\\caption{${texRuns(b.caption)}}`, `\\label{${crossId(b.id)}}`, `\\end{${env}}`, '');
+        lines.push(`\\caption{${texRuns(b.caption, m.journal)}}`, `\\label{${crossId(b.id)}}`, `\\end{${env}}`, '');
       } else if (b.type === 'table') {
         const cols = Math.max(1, ...b.rows.map((r) => r.length));
-        lines.push(`\\begin{${b.span ? 'table*' : 'table'}}${floatOpt(b)}`, '\\centering', `\\caption{${texRuns(b.caption)}}`, `\\label{${crossId(b.id)}}`,
+        lines.push(`\\begin{${b.span ? 'table*' : 'table'}}${floatOpt(b)}`, '\\centering', `\\caption{${texRuns(b.caption, m.journal)}}`, `\\label{${crossId(b.id)}}`,
           `\\begin{tabular}{${'l'.repeat(cols)}}`, '\\toprule');
         b.rows.forEach((r, i) => {
           const cells = [];
-          for (let k = 0; k < cols; k++) cells.push(texRuns(r[k] || []));
+          for (let k = 0; k < cols; k++) cells.push(texRuns(r[k] || [], m.journal));
           lines.push(cells.join(' & ') + ' \\\\');
           if (i === 0 && b.header) lines.push('\\midrule');
         });
         lines.push('\\bottomrule', '\\end{tabular}', `\\end{${b.span ? 'table*' : 'table'}}`, '');
       }
     }
+    const end = list(null);
+    closeLists(end);
+    if (end.close.length) lines.push('');
     const bst = L.bst !== undefined ? L.bst : numeric ? 'unsrtnat' : 'plainnat';
     const style = cls === 'elsarticle' ? (numeric ? 'elsarticle-num' : 'elsarticle-harv') : bst;
     lines.push(...(style ? [`\\bibliographystyle{${style}}`] : []), '\\bibliography{references}', '', '\\end{document}', '');
@@ -304,18 +419,30 @@
     if (m.double) y.push('linestretch: 2');
     y.push('---', '');
     const out = [y.join('\n')];
+    const list = lister();
+    // a pipe table's row
+    const pipeRow = (cells) => '| ' + cells.map((c) => mdRuns(c).replace(/\|/g, '\\|').replace(/\n/g, ' ').trim()).join(' | ') + ' |';
     for (const b of m.blocks) {
-      if (b.type === 'heading') out.push(`${'#'.repeat(b.level)} ${mdRuns(b.runs).trim()} {#${crossId(b.id)}${b.unnumbered ? ' .unnumbered' : ''}}`);
+      const ls = list(b);
+      if (b.type === 'item') {
+        // a list is one block: its items a line each, four spaces deeper for each level
+        const line = '    '.repeat(ls.depth - 1) + (ls.list === 'ol' ? '1. ' : '- ') + mdRuns(b.runs).replace(/\s*\n\s*/g, ' ').trim();
+        if (ls.open.some((o) => o.depth === 1)) out.push(line);
+        else out[out.length - 1] += '\n' + line;
+      } else if (b.type === 'symbols') {
+        if (!b.rows.length) continue;
+        const { cols, rows } = symbolTable(b);
+        out.push([pipeRow(rows[0]), '|' + ' --- |'.repeat(cols.length), ...rows.slice(1).map(pipeRow)].join('\n'));
+      } else if (b.type === 'heading') out.push(`${'#'.repeat(b.level)} ${mdRuns(b.runs).trim()} {#${crossId(b.id)}${b.unnumbered ? ' .unnumbered' : ''}}`);
       else if (b.type === 'para') { const s = mdRuns(b.runs).trim(); if (s) out.push(s); }
       else if (b.type === 'equation') out.push(`$$\n${b.tex}\n$$ {#${crossId(b.id)}}`);
       else if (b.type === 'figure') {
         // fig-pos is Quarto's placement (and Pandoc's LaTeX writer reads it too)
         const attrs = `${b.width ? ` width=${b.width}%` : ''}${b.place ? ` fig-pos="${b.place}"` : ''}`;
         if (pictures(b).length > 1) {
-          // pandoc-crossref's subfigures: the panels, then the caption, in one div
-          const each = Math.floor((b.width || 100) / pictures(b).length) - 1;
-          out.push(`<div id="${crossId(b.id)}">\n` + pictures(b).map((p, i) => `![${mdRuns(p.sub).trim()}](${figName(p)}){#${crossId(b.id)}-${panelLetter(i)} width=${each}%}`).join('\n')
-            + `\n\n${mdRuns(b.caption).trim()}\n</div>`);
+          // pandoc-crossref's subfigures: the panels, a paragraph to a row, then the caption, in one div
+          const rows = panelRows(b).rows.map((row) => row.map(({ p, i, share }) => `![${mdRuns(p.sub).trim()}](${figName(p)}){#${crossId(b.id)}-${panelLetter(i)} width=${Math.floor((b.width || 100) * share)}%}`).join('\n'));
+          out.push(`<div id="${crossId(b.id)}">\n` + rows.join('\n\n') + `\n\n${mdRuns(b.caption).trim()}\n</div>`);
         } else out.push(`![${mdRuns(b.caption).trim()}](${figName(b)}){#${crossId(b.id)}${attrs}}`);
       }
       else if (b.type === 'table') {
@@ -339,6 +466,28 @@
   }
 
   function readme(kind, m) {
+    if (kind === 'talk') {
+      return `${m.title || 'Paper'} — a talk outline, written in NEO
+
+talk.md            the slides, in Pandoc's Markdown
+talk-marp.md       the same slides, for Marp
+figures/           the figures
+
+The story first: why it matters, what we did, then a slide for each figure,
+titled with the question it answers, then what we found and what it means.
+The speaker notes say what to show and what comes next. Make it yours, then
+with pandoc:
+
+  pandoc talk.md -o talk.pptx                            PowerPoint or Keynote
+  pandoc talk.md -t revealjs -s --mathjax -o talk.html   reveal.js, in a browser
+  pandoc talk.md -t beamer -o talk.pdf                   Beamer (needs LaTeX)
+
+or with Marp (or open talk-marp.md in VS Code with the Marp extension):
+
+  npx @marp-team/marp-cli talk-marp.md --pptx --allow-local-files
+  npx @marp-team/marp-cli talk-marp.md --pdf --allow-local-files
+`;
+    }
     if (kind === 'latex') {
       return `${m.title || 'Paper'} — LaTeX, written in NEO
 
@@ -401,9 +550,7 @@ Quarto reads the same file (rename it paper.qmd).
     const j = m.journal || null;
     const J = j ? Journals() : null;
     const num = (b) => (m.numbered === false || b.unnumbered ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
-    const figWord = j ? j.captions.figure : 'Figure';
-    const tabWord = j ? j.captions.table : 'Table';
-    const sep = j ? j.captions.sep : '.';
+    const { figure: figWord, table: tabWord, sep } = Journals().captions(j);
     const body = [];
     // a draft sent for feedback says first what kind of feedback it asks for
     if (m.feedback) {
@@ -426,15 +573,32 @@ Quarto reads the same file (rename it paper.qmd).
     if (m.abstract && m.abstract.length) body.push(`<section class="abstract"><h2>Abstract</h2>${m.abstract.map((p) => `<p>${htmlRuns(p)}</p>`).join('')}</section>`);
     if (m.keywords && m.keywords.length && (!j || j.keywords)) body.push(`<p class="keywords"><b>${esc(j ? j.keywords : 'Keywords')}${j && j.abstract === 'inline' ? '—' : ':'}</b> ${m.keywords.map(esc).join(', ')}</p>`);
     body.push('<main>');
+    const list = lister();
+    // each item's <li> stays open until the next, so a deeper list sits inside it
+    const closeLists = (ls) => ls.close.map((c) => `</li></${c.list}>`).join('');
     for (const b of m.blocks) {
-      if (b.type === 'heading') body.push(`<h${b.level + 1} id="${esc(b.id)}">${num(b) ? `<span class="num">${esc(num(b))}</span> ` : ''}${htmlRuns(b.runs)}</h${b.level + 1}>`);
+      const ls = list(b);
+      if (b.type === 'item') {
+        body.push(closeLists(ls) + (ls.open.length ? ls.open.map((o) => `<${o.list}>`).join('') : '</li>') + `<li>${htmlRuns(b.runs)}`);
+        continue;
+      }
+      if (ls.close.length) body.push(closeLists(ls));
+      if (b.type === 'symbols') {
+        if (!b.rows.length) continue;
+        const { rows } = symbolTable(b);
+        body.push(`<table class="symbols"><thead><tr>${rows[0].map((c) => `<th>${htmlRuns(c)}</th>`).join('')}</tr></thead>`
+          + `<tbody>${rows.slice(1).map((r) => `<tr>${r.map((c) => `<td>${htmlRuns(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`);
+      }
+      else if (b.type === 'heading') body.push(`<h${b.level + 1} id="${esc(b.id)}">${num(b) ? `<span class="num">${esc(num(b))}</span> ` : ''}${htmlRuns(b.runs)}</h${b.level + 1}>`);
       else if (b.type === 'para') { const s = htmlRuns(b.runs); if (runsText(b.runs).trim() || /<(img|svg)/.test(s)) body.push(`<p${b.flush ? ' class="flush"' : ''}>${s}</p>`); }
       else if (b.type === 'equation') body.push(`<div class="eq" id="${esc(b.id)}"><span class="eq-body">${b.svg || esc(b.tex)}</span><span class="eq-num">(${esc(b.num)})</span></div>`);
       else if (b.type === 'figure') {
         const img = (p) => (p.base64 ? `<img src="${src ? esc(src(p)) : `data:${p.mime};base64,${p.base64}`}" alt="${esc(p.alt || '')}">` : '');
         const pics = pictures(b);
+        // the panels as the page sets them: each its share of the width, in
+        // rows that wrap where the writer's rows end, a row not full centred
         const inner = pics.length > 1
-          ? `<div class="panels">${pics.map((p, i) => `<div class="panel" id="${esc(b.id)}-${panelLetter(i)}">${img(p)}<div class="subcap"><b>(${panelLetter(i)})</b> ${htmlRuns(p.sub)}</div></div>`).join('')}</div>`
+          ? `<div class="panels" style="flex-wrap:wrap;justify-content:center;row-gap:.6em">${panelRows(b).rows.flat().map(({ p, i, share }) => `<div class="panel" id="${esc(b.id)}-${panelLetter(i)}" style="flex:0 0 ${(share * 100 - 0.1).toFixed(2)}%">${img(p)}<div class="subcap"><b>(${panelLetter(i)})</b> ${htmlRuns(p.sub)}</div></div>`).join('')}</div>`
           : img(b);
         const cls = [b.wrap ? 'wrap-' + b.wrap : '', b.span ? 'span' : '', pics.length > 1 ? 'multi' : ''].filter(Boolean).join(' ');
         body.push(`<figure id="${esc(b.id)}"${cls ? ` class="${cls}"` : ''}${b.width ? ` style="--w:${b.width}%"` : ''}>${inner}<figcaption><b>${esc(figWord)} ${esc(b.num)}${esc(sep)}</b> ${htmlRuns(b.caption)}</figcaption></figure>`);
@@ -442,9 +606,11 @@ Quarto reads the same file (rename it paper.qmd).
       else if (b.type === 'table') {
         const rows = b.rows.map((r, i) => `<tr>${r.map((c) => (i === 0 && b.header ? `<th>${htmlRuns(c)}</th>` : `<td>${htmlRuns(c)}</td>`)).join('')}</tr>`);
         const head = b.header && rows.length ? `<thead>${rows.shift()}</thead>` : '';
-        body.push(`<figure class="table${b.span ? ' span' : ''}" id="${esc(b.id)}"><figcaption><b>${esc(tabWord)} ${tabWord === 'TABLE' && j && j.headings.numbering === 'roman' ? esc(J.headingNumber({ headings: { numbering: 'roman' } }, b.num, 1)).replace(/\.$/, '') : esc(b.num)}${esc(sep)}</b> ${htmlRuns(b.caption)}</figcaption><table>${head}<tbody>${rows.join('')}</tbody></table></figure>`);
+        body.push(`<figure class="table${b.span ? ' span' : ''}" id="${esc(b.id)}"><figcaption><b>${esc(tabWord)} ${esc(Journals().tableNumber(j, b.num))}${esc(sep)}</b> ${htmlRuns(b.caption)}</figcaption><table>${head}<tbody>${rows.join('')}</tbody></table></figure>`);
       }
     }
+    const end = list(null);
+    if (end.close.length) body.push(closeLists(end));
     // in two columns the reference list runs on in them
     const twoCol = j && j.columns > 1;
     if (!twoCol) body.push('</main>');
@@ -472,7 +638,10 @@ h2, h3, h4 { line-height: 1.3; margin: 1.6em 0 .5em; break-after: avoid; }
 h2 { font-size: 1.25em; } h3 { font-size: 1.08em; } h4 { font-size: 1em; font-style: italic; }
 h2 .num, h3 .num, h4 .num { margin-right: .4em; }
 p { margin: 0; text-indent: 1.5em; text-align: ${print ? 'justify' : 'left'}; hyphens: auto; }
-h2 + p, h3 + p, h4 + p, figure + p, .eq + p, p.flush { text-indent: 0; }
+h2 + p, h3 + p, h4 + p, figure + p, .eq + p, ul + p, ol + p, table + p, p.flush { text-indent: 0; }
+ul, ol { margin: .4em 0 .6em; padding-left: 1.8em; }
+li ul, li ol { margin: .2em 0; }
+li { text-align: ${print ? 'justify' : 'left'}; hyphens: auto; }
 header p, p.keywords { text-indent: 0; text-align: center; }
 p.keywords { text-align: left; }
 a { color: inherit; text-decoration: none; }
@@ -495,6 +664,8 @@ figure.table figcaption { margin: 0 0 .5em; }
 table { border-collapse: collapse; margin: 0 auto; font-size: .9em; border-top: 1.5px solid #000; border-bottom: 1.5px solid #000; }
 th { border-bottom: 1px solid #000; font-weight: bold; }
 th, td { padding: .25em .7em; text-align: left; vertical-align: top; }
+table.symbols { margin: 1em auto; break-inside: avoid; }
+table.symbols td:first-child { white-space: nowrap; }
 .references h2 { margin-top: 2em; }
 .references .entry { margin: 0 0 .5em; font-size: .95em; line-height: 1.4; }
 .references.hanging .entry { padding-left: 2em; text-indent: -2em; }
@@ -537,6 +708,156 @@ ${body.join('\n')}
   }
 
   // ---------------------------------------------------------------------
+  // A talk: the paper as slides. The abstract's moves tell the story (why
+  // it matters, what we did, what we found, what it means), each figure a
+  // slide titled with the question it answers, and every slide's notes say
+  // what comes next. talk.md is Pandoc's (PowerPoint, reveal.js, Beamer);
+  // talk-marp.md is the same slides for Marp, which reads neither Pandoc's
+  // notes nor its columns. Citations are as set: a talk has no reference list.
+  // ---------------------------------------------------------------------
+  const talkRuns = (runs, marp) => (runs || []).map((r) => {
+    if (r.cite) return mdEsc(plain(r.html || ''));
+    if (r.xref) return mdEsc(r.label || '');
+    // Marp's Markdown has no ^sup^, ~sub~ or [u]{.underline}
+    return mdRuns([marp && r.text !== undefined ? { ...r, sup: false, sub: false, u: false } : r]);
+  }).join('').replace(/\s*\n\s*/g, ' ').trim();
+  // A caption's sentences, as runs. One ends at . ? or ! before a space and a
+  // capital, a number or an opening bracket, but not after Fig., e.g. or al.
+  const SENTENCE_END = /[.?!]['"’”)]*\s+(?=[\p{Lu}\p{N}([“‘"'])/gu;
+  const ABBREV = /\b(?:Figs?|Eqs?|Refs?|Secs?|Tabs?|al|vs|cf|ca|approx|resp|No|e\.g|i\.e)$/i;
+  function sentences(runs) {
+    const out = [[]];
+    (runs || []).forEach((r, k) => {
+      if (r.text === undefined) { out[out.length - 1].push(r); return; }
+      // the next run's first letter decides an ending at this run's end
+      const next = runs[k + 1];
+      const s = r.text + (next && next.text !== undefined ? next.text.trimStart().charAt(0) : '');
+      SENTENCE_END.lastIndex = 0;
+      let from = 0;
+      let mm;
+      while ((mm = SENTENCE_END.exec(s)) && mm.index < r.text.length) {
+        if (ABBREV.test(r.text.slice(from, mm.index))) continue;
+        out[out.length - 1].push({ ...r, text: r.text.slice(from, mm.index + mm[0].trimEnd().length) });
+        out.push([]);
+        from = Math.min(r.text.length, mm.index + mm[0].length);
+      }
+      if (from < r.text.length) out[out.length - 1].push({ ...r, text: r.text.slice(from) });
+    });
+    return out.filter((x) => runsText(x).trim());
+  }
+  // The slides, as plain parts: a title, paragraphs, points, a figure, notes
+  function talkSlides(m, marp) {
+    const say = (s) => mdEsc(String(s).replace(/\s+/g, ' ').trim());
+    const moves = (m.moves || []).filter((x) => String(x.text || '').trim());
+    const said = (move) => moves.filter((x) => x.move === move).map((x) => say(x.text));
+    const slides = [];
+    // the Methods' own sections: what was done, in the paper's order
+    const methods = [];
+    let inMethods = false;
+    for (const b of m.blocks) {
+      if (b.type !== 'heading') continue;
+      if (b.level === 1) inMethods = /method|approach|model|material|design/i.test(runsText(b.runs));
+      else if (b.level === 2 && inMethods) methods.push(talkRuns(b.runs, marp));
+    }
+    if (moves.length) {
+      slides.push({ title: 'Why it matters', paras: said('status'), points: [...said('problem'), ...said('solution')] });
+      slides.push({ title: 'What we did', paras: said('did'), points: methods });
+    } else {
+      // no moves sorted: the abstract opens, the paper's sections say what's coming
+      slides.push({ title: 'In brief', paras: (m.abstract || []).map((p) => talkRuns(p, marp)).filter(Boolean) });
+      slides.push({ title: 'Outline', points: m.blocks.filter((b) => b.type === 'heading' && b.level === 1 && !b.unnumbered).map((b) => talkRuns(b.runs, marp)).filter(Boolean) });
+      slides.push({ title: 'What we did', points: methods });
+    }
+    for (const b of m.blocks) {
+      if (b.type !== 'figure') continue;
+      const [first = [], second = [], ...rest] = sentences(b.caption);
+      const lead = talkRuns(first, marp);
+      const ask = /\?$/.test(lead);
+      slides.push({
+        title: ask ? lead : `Figure ${b.num}${lead ? ': ' + lead.replace(/\.$/, '') : ''}`,
+        fig: b,
+        notes: [
+          ...(ask ? [] : [`Ask the question this figure answers, then show the answer: ${talkRuns(second, marp) || 'its one main result.'}`]),
+          ...(ask ? [second, ...rest] : rest).map((x) => talkRuns(x, marp)).filter(Boolean)
+        ]
+      });
+    }
+    if (moves.length) {
+      slides.push({ title: 'What we found', points: said('found') });
+      slides.push({ title: 'What it means', points: said('impact') });
+    }
+    const kept = slides.filter((s) => (s.paras || []).length || (s.points || []).length || s.fig);
+    // each slide's notes end with the next: the audience hears what's coming
+    kept.forEach((s, i) => { s.notes = [...(s.notes || []), `Next: ${i + 1 < kept.length ? kept[i + 1].title : 'Thank you'}`]; });
+    const emails = m.authors.filter((a) => a.email).map((a) => mdEsc(a.email));
+    kept.push({ title: 'Thank you', paras: [m.title ? `*${mdEsc(m.title)}*` : '', emails.join(' · ')].filter(Boolean) });
+    return kept;
+  }
+  // the panels that have a picture
+  const talkPanels = (b) => pictures(b).map((p, i) => ({ p, i })).filter(({ p }) => p.base64);
+  function talkPandoc(m, date) {
+    const y = ['---', `title: ${yamlStr(m.title || '')}`];
+    if (m.subtitle) y.push(`subtitle: ${yamlStr(m.subtitle)}`);
+    if (m.authors.length) y.push('author:', ...m.authors.map((a) => `  - ${yamlStr(a.name)}`));
+    if (m.affiliations.length) y.push(`institute: ${yamlStr(m.affiliations.join('; '))}`);
+    y.push(`date: ${yamlStr(date)}`, '---');
+    const out = [];
+    for (const s of talkSlides(m, false)) {
+      const parts = [`## ${s.title}`, ...(s.paras || [])];
+      if ((s.points || []).length) parts.push(s.points.map((x) => '- ' + x).join('\n'));
+      if (s.fig && pictures(s.fig).length > 1) {
+        // the panels in two columns (PowerPoint keeps no third), read across:
+        // (a) (b), then (c) (d). Each panel's words above it, and the rest of
+        // the caption in the notes: PowerPoint moves words after a picture
+        // to a slide of their own.
+        const pics = talkPanels(s.fig);
+        const height = pics.length > 2 ? 30 : 55;
+        const column = (k) => pics.filter(({ i }) => i % 2 === k).map(({ p, i }) => `**(${panelLetter(i)})** ${talkRuns(p.sub, false)}`.trim() + `\n\n![](${figName(p)}){height=${height}%}`).join('\n\n');
+        if (pics.length) parts.push(`:::: columns\n${[0, 1].filter((k) => pics.some(({ i }) => i % 2 === k)).map((k) => `::: {.column width="48%"}\n${column(k)}\n:::`).join('\n')}\n::::`);
+      } else if (s.fig && s.fig.base64) parts.push(`![](${figName(s.fig)}){height=70%}`);
+      if ((s.notes || []).length) parts.push(`::: notes\n${s.notes.join('\n\n')}\n:::`);
+      out.push(parts.join('\n\n'));
+    }
+    // a rule before each slide's heading starts no slide of its own
+    return y.join('\n') + '\n\n' + out.join('\n\n---\n\n') + '\n';
+  }
+  function talkMarp(m, date) {
+    const y = ['---', 'marp: true', 'paginate: true', `title: ${yamlStr(m.title || '')}`];
+    if (m.authors.length) y.push(`author: ${yamlStr(m.authors.map((a) => a.name).join(', '))}`);
+    y.push('---');
+    const front = [`# ${mdEsc(m.title || '')}`, m.subtitle ? mdEsc(m.subtitle) : '', m.authors.map((a) => mdEsc(a.name)).join(', '), mdEsc(m.affiliations.join('; ')), date].filter(Boolean);
+    // pictures fitted to a 1280 × 720 slide under its title
+    const fit = (p, w, h) => (p.w && p.h ? `w:${Math.round(p.w * Math.min(w / p.w, h / p.h))}` : `h:${Math.round(h)}`);
+    // a presenter note is a comment, which --> would end
+    const note = (s) => s.replace(/-->/g, '→');
+    const out = [front.join('\n\n')];
+    for (const s of talkSlides(m, true)) {
+      const parts = [`## ${s.title}`, ...(s.paras || [])];
+      if ((s.points || []).length) parts.push(s.points.map((x) => '- ' + x).join('\n'));
+      if (s.fig && pictures(s.fig).length > 1) {
+        const pics = talkPanels(s.fig);
+        const rows = Math.ceil(pics.length / 2);
+        for (let r = 0; r < rows; r++) {
+          const row = pics.slice(r * 2, r * 2 + 2);
+          parts.push(row.map(({ p }) => `![${fit(p, 540, 400 / rows - 40)}](${figName(p)})`).join(' '));
+          parts.push(row.map(({ p, i }) => `**(${panelLetter(i)})** ${talkRuns(p.sub, true)}`.trim()).join(' · '));
+        }
+      } else if (s.fig && s.fig.base64) parts.push(`![${fit(s.fig, 1100, 420)}](${figName(s.fig)})`);
+      if ((s.notes || []).length) parts.push(`<!--\n${note(s.notes.join('\n\n'))}\n-->`);
+      out.push(parts.join('\n\n'));
+    }
+    return y.join('\n') + '\n\n' + out.join('\n\n---\n\n') + '\n';
+  }
+  function talk(m, { date = new Date().toISOString().slice(0, 10) } = {}) {
+    return [
+      { path: 'talk.md', content: talkPandoc(m, date) },
+      { path: 'talk-marp.md', content: talkMarp(m, date) },
+      { path: 'README.txt', content: readme('talk', m) },
+      ...pictureFiles(m)
+    ];
+  }
+
+  // ---------------------------------------------------------------------
   // Plain text: the words, the citations as set, maths as TeX
   // ---------------------------------------------------------------------
   function wrap(s, width = 78) {
@@ -571,23 +892,39 @@ ${body.join('\n')}
     if (m.abstract && m.abstract.length) out.push('ABSTRACT', '', ...m.abstract.map((p) => wrap(textRuns(p)) + '\n'));
     if (m.keywords && m.keywords.length) out.push('Keywords: ' + m.keywords.join(', '), '');
     const num = (b) => (m.numbered === false || b.unnumbered ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
+    // a table in columns, a rule under its header
+    const columns = (cells, header) => {
+      const widths = [];
+      for (const r of cells) r.forEach((c, k) => { widths[k] = Math.max(widths[k] || 0, c.length); });
+      cells.forEach((r, i) => {
+        out.push(r.map((c, k) => c.padEnd(widths[k])).join('  ').trimEnd());
+        if (i === 0 && header) out.push(widths.map((w) => '-'.repeat(w)).join('  '));
+      });
+      out.push('');
+    };
+    const list = lister();
+    const counts = [];
     for (const b of m.blocks) {
-      if (b.type === 'heading') { const h = (num(b) ? num(b) + ' ' : '') + textRuns(b.runs); out.push('', h, (b.level === 1 ? '=' : '-').repeat(Math.min(78, h.length)), ''); }
+      const ls = list(b);
+      if (ls.close.length && (!ls.depth || ls.open.some((o) => o.depth === 1))) out.push('');
+      if (b.type === 'item') {
+        // two spaces deeper a level; a numbered list counts from 1
+        if (ls.open.length) counts[ls.depth] = 0;
+        const mark = ls.list === 'ol' ? `${++counts[ls.depth]}. ` : '• ';
+        const pad = '  '.repeat(ls.depth - 1);
+        out.push(pad + mark + wrap(textRuns(b.runs).replace(/\s+/g, ' ').trim(), 78 - pad.length - mark.length).replace(/\n/g, '\n' + ' '.repeat(pad.length + mark.length)));
+        continue;
+      }
+      if (b.type === 'symbols') { if (b.rows.length) columns(symbolTable(b).rows.map((r) => r.map((c) => textRuns(c).replace(/\s+/g, ' ').trim())), true); }
+      else if (b.type === 'heading') { const h = (num(b) ? num(b) + ' ' : '') + textRuns(b.runs); out.push('', h, (b.level === 1 ? '=' : '-').repeat(Math.min(78, h.length)), ''); }
       else if (b.type === 'para') { const s = textRuns(b.runs).trim(); if (s) out.push(wrap(s), ''); }
       else if (b.type === 'equation') out.push(`    ${b.tex.replace(/\n/g, '\n    ')}    (${b.num})`, '');
       else if (b.type === 'figure') {
         const subs = pictures(b).length > 1 ? ' ' + pictures(b).map((p, i) => `(${panelLetter(i)}) ${textRuns(p.sub)}`).join(' ') : '';
-        out.push(wrap(`[Figure ${b.num}: ${textRuns(b.caption)}${subs}]`), '');
+        out.push(wrap(`[${Journals().captions(j).figure} ${b.num}: ${textRuns(b.caption)}${subs}]`), '');
       } else if (b.type === 'table') {
-        out.push(wrap(`Table ${b.num}. ${textRuns(b.caption)}`), '');
-        const cells = b.rows.map((r) => r.map((c) => textRuns(c).replace(/\s+/g, ' ').trim()));
-        const widths = [];
-        for (const r of cells) r.forEach((c, k) => { widths[k] = Math.max(widths[k] || 0, c.length); });
-        cells.forEach((r, i) => {
-          out.push(r.map((c, k) => c.padEnd(widths[k])).join('  ').trimEnd());
-          if (i === 0 && b.header) out.push(widths.map((w) => '-'.repeat(w)).join('  '));
-        });
-        out.push('');
+        out.push(wrap(`${Journals().captions(j).table} ${Journals().tableNumber(j, b.num)}${Journals().captions(j).sep} ${textRuns(b.caption)}`), '');
+        columns(b.rows.map((r) => r.map((c) => textRuns(c).replace(/\s+/g, ' ').trim())), b.header);
       }
     }
     const bib = m.bibliography;
@@ -614,13 +951,15 @@ header { text-align: center; margin: 2em 0 1.5em; } h1.title { font-size: 1.5em;
 .abstract { margin: 1em 0; } .abstract h2 { font-size: 1em; } .abstract p { text-indent: 0; }
 .keywords { text-indent: 0; font-size: .9em; }
 h2 { font-size: 1.2em; margin: 1.6em 0 .5em; } h3 { font-size: 1.05em; margin: 1.2em 0 .4em; } h4 { font-size: 1em; font-style: italic; }
-p { margin: 0; text-indent: 1.2em; } h2 + p, h3 + p, h4 + p, figure + p, div.eq + p { text-indent: 0; }
+p { margin: 0; text-indent: 1.2em; } h2 + p, h3 + p, h4 + p, figure + p, div.eq + p, ul + p, ol + p, table + p { text-indent: 0; }
+ul, ol { margin: .4em 0 .6em; padding-left: 1.6em; } li ul, li ol { margin: .2em 0; }
 .eq { text-align: center; margin: .8em 0; } .eq-num { float: right; }
 figure { margin: 1.2em 0; text-align: center; } figure img { max-width: 100%; }
 figure .panels { display: flex; gap: 3%; } figure .panel { flex: 1; } figure .panel img { width: 100%; }
 figcaption, .subcap { text-align: left; font-size: .9em; }
 table { border-collapse: collapse; margin: 0 auto; border-top: 1px solid; border-bottom: 1px solid; font-size: .9em; }
-th { border-bottom: 1px solid; } th, td { padding: .2em .5em; text-align: left; }
+th { border-bottom: 1px solid; } th, td { padding: .2em .5em; text-align: left; vertical-align: top; }
+table.symbols { margin: 1em auto; } table.symbols td:first-child { white-space: nowrap; }
 .references .entry { margin-bottom: .5em; font-size: .9em; }
 a { color: inherit; text-decoration: none; }`;
     const page = `<?xml version="1.0" encoding="utf-8"?>
@@ -705,9 +1044,7 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
     const j = m.journal || null;
     const J = j ? Journals() : null;
     const page = wordPage(j);
-    const figWord = j ? j.captions.figure : 'Figure';
-    const tabWord = j ? j.captions.table : 'Table';
-    const capSep = j ? j.captions.sep : '.';
+    const { figure: figWord, table: tabWord, sep: capSep } = Journals().captions(j);
     const hnum = (b) => (m.numbered === false || b.unnumbered ? '' : j ? J.headingNumber(j, b.num, b.level) : b.num);
     // the width text runs in (a column's, in two): for equation tabs and pictures
     const cols = j ? j.columns : 1;
@@ -784,9 +1121,36 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
     const sect = (cols, last) => `<w:sectPr>${last ? '<w:footerReference w:type="default" r:id="rIdFooter"/>' : ''}<w:type w:val="continuous"/><w:pgSz w:w="${page.w}" w:h="${page.h}"/><w:pgMar w:top="${page.top}" w:right="${page.right}" w:bottom="${page.bottom}" w:left="${page.left}" w:header="567" w:footer="567" w:gutter="0"/>${last ? '<w:pgNumType w:start="1"/>' : ''}<w:cols w:num="${cols}" w:space="${twips(j && j.gap ? j.gap : '0.25in')}"/></w:sectPr>`;
     // two columns: the title, authors and abstract span the page, the paper runs in columns
     if (j && j.columns > 1) body.push(`<w:p><w:pPr>${sect(1, false)}</w:pPr></w:p>`);
+    // a table as the paper's are: rules above and below, one under the header
+    const table = (rows, header) => {
+      const cols = Math.max(1, ...rows.map((r) => r.length));
+      const trs = rows.map((r, i) => {
+        const head = i === 0 && header;
+        const last = i === rows.length - 1;
+        const borders = `<w:tcBorders>${i === 0 ? '<w:top w:val="single" w:sz="12" w:color="000000"/>' : ''}${head ? '<w:bottom w:val="single" w:sz="6" w:color="000000"/>' : last ? '<w:bottom w:val="single" w:sz="12" w:color="000000"/>' : ''}</w:tcBorders>`;
+        const cells = Array.from({ length: cols }, (_, k) => `<w:tc><w:tcPr>${borders}</w:tcPr>${para('TableText', runsXml((r[k] || []).map((x) => (head && x.text !== undefined ? { ...x, b: true } : x))))}</w:tc>`);
+        return `<w:tr>${head ? '<w:trPr><w:tblHeader/></w:trPr>' : ''}${cells.join('')}</w:tr>`;
+      });
+      return `<w:tbl><w:tblPr><w:tblW w:w="${cols > 3 ? 5000 : 3500}" w:type="pct"/><w:jc w:val="center"/><w:tblCellMar><w:left w:w="100" w:type="dxa"/><w:right w:w="100" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${'<w:gridCol/>'.repeat(cols)}</w:tblGrid>${trs.join('')}</w:tbl>`;
+    };
+    // Word's lists: each list its own numbering (so a numbered one starts
+    // at 1), a level for each depth
+    const list = lister();
+    const nums = [];
+    const numStack = [];
     let afterBlock = true;
     for (const b of m.blocks) {
-      if (b.type === 'heading') {
+      const ls = list(b);
+      for (let k = 0; k < ls.close.length; k++) numStack.pop();
+      if (b.type === 'item') {
+        for (const o of ls.open) { nums.push(o.list); numStack.push(nums.length); }
+        body.push(para('ListParagraph', runsXml(b.runs), `<w:numPr><w:ilvl w:val="${ls.depth - 1}"/><w:numId w:val="${numStack[ls.depth - 1]}"/></w:numPr>`));
+        afterBlock = true;
+      } else if (b.type === 'symbols') {
+        if (!b.rows.length) continue;
+        body.push(table(symbolTable(b).rows, true), para('FirstParagraph', ''));
+        afterBlock = true;
+      } else if (b.type === 'heading') {
         body.push(para('Heading' + b.level, mark(b.id, (hnum(b) ? run({ text: hnum(b) + '\t' }) : '') + runsXml((j && j.headings.upper && b.level === 1) ? b.runs.map((r) => (r.text !== undefined ? { ...r, text: r.text.toUpperCase() } : r)) : b.runs))));
         afterBlock = true;
       } else if (b.type === 'para') {
@@ -814,32 +1178,27 @@ ${[...new Map(pics.map((p) => [imgPath(p), p])).values()].map((p, i) => `<item i
         afterBlock = true;
       } else if (b.type === 'figure') {
         const pics = pictures(b);
-        const room = ((b.span && cols > 1 ? textPx * cols : textPx) * (b.width ? b.width / 100 : 1)) / pics.length - (pics.length > 1 ? 8 : 0);
-        const art = pics.map((p) => {
+        const room = (b.span && cols > 1 ? textPx * cols : textPx) * (b.width ? b.width / 100 : 1);
+        const picture = (p, share) => {
           const src = p.png || (p.base64 && p.mime !== 'image/svg+xml' ? { base64: p.base64, w: p.w, h: p.h } : null);
           if (!src) return '';
-          const w = Math.min(room, src.w || room);
+          const w = Math.min(room * share, src.w || room);
           const h = src.w ? (src.h || src.w) * (w / src.w) : w * 0.6;
           const ext = p.png ? 'png' : p.mime === 'image/jpeg' ? 'jpeg' : p.mime.split('/')[1];
           return drawing(addImage(src.base64, ext), w, h, p.alt);
-        }).filter(Boolean);
-        if (art.length) body.push(para('Figure', art.join(run({ text: '  ' }))));
+        };
+        // a paragraph of pictures to a row of panels
+        const rows = pics.length > 1 ? panelRows(b).rows : [[{ p: b, share: 1 }]];
+        for (const row of rows) {
+          const art = row.map(({ p, share }) => picture(p, pics.length > 1 ? share - 0.01 : share)).filter(Boolean);
+          if (art.length) body.push(para('Figure', art.join(run({ text: '  ' }))));
+        }
         const subs = pics.length > 1 ? pics.map((p, i) => mark(`${b.id}-${panelLetter(i)}`, run({ text: `(${panelLetter(i)}) `, b: true })) + runsXml(p.sub) + run({ text: ' ' })).join('') : '';
         body.push(para('Caption', mark(b.id, run({ text: `${figWord} ${b.num}${capSep} `, b: true })) + runsXml(b.caption) + (subs ? run({ text: ' ' }) + subs : '')));
         afterBlock = true;
       } else if (b.type === 'table') {
-        const tnum = tabWord === 'TABLE' && j && j.headings.numbering === 'roman' ? J.headingNumber(j, b.num, 1).replace(/\.$/, '') : b.num;
-        body.push(para('TableCaption', mark(b.id, run({ text: `${tabWord} ${tnum}${capSep} `, b: true })) + runsXml(b.caption)));
-        const cols = Math.max(1, ...b.rows.map((r) => r.length));
-        const rows = b.rows.map((r, i) => {
-          const head = i === 0 && b.header;
-          const last = i === b.rows.length - 1;
-          const borders = `<w:tcBorders>${i === 0 ? '<w:top w:val="single" w:sz="12" w:color="000000"/>' : ''}${head ? '<w:bottom w:val="single" w:sz="6" w:color="000000"/>' : last ? '<w:bottom w:val="single" w:sz="12" w:color="000000"/>' : ''}</w:tcBorders>`;
-          const cells = Array.from({ length: cols }, (_, k) => `<w:tc><w:tcPr>${borders}</w:tcPr>${para('TableText', runsXml((r[k] || []).map((x) => (head && x.text !== undefined ? { ...x, b: true } : x))))}</w:tc>`);
-          return `<w:tr>${head ? '<w:trPr><w:tblHeader/></w:trPr>' : ''}${cells.join('')}</w:tr>`;
-        });
-        body.push(`<w:tbl><w:tblPr><w:tblW w:w="${cols > 3 ? 5000 : 3500}" w:type="pct"/><w:jc w:val="center"/><w:tblCellMar><w:left w:w="100" w:type="dxa"/><w:right w:w="100" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${'<w:gridCol/>'.repeat(cols)}</w:tblGrid>${rows.join('')}</w:tbl>`);
-        body.push(para('FirstParagraph', ''));
+        body.push(para('TableCaption', mark(b.id, run({ text: `${tabWord} ${Journals().tableNumber(j, b.num)}${capSep} `, b: true })) + runsXml(b.caption)));
+        body.push(table(b.rows, b.header), para('FirstParagraph', ''));
         afterBlock = true;
       }
     }
@@ -878,6 +1237,7 @@ ${style('EquationCell', 'Equation (numbered)', '<w:spacing w:before="80" w:after
 ${style('Figure', 'Figure', '<w:jc w:val="center"/><w:keepNext/><w:spacing w:before="240" w:line="240" w:lineRule="auto"/>', '')}
 ${style('Caption', 'caption', '<w:spacing w:before="80" w:after="240" w:line="276" w:lineRule="auto"/>', '<w:sz w:val="20"/>', '<w:basedOn w:val="Normal"/><w:qFormat/>')}
 ${style('TableCaption', 'Table Caption', '<w:keepNext/><w:spacing w:before="240" w:after="80" w:line="276" w:lineRule="auto"/>', '<w:sz w:val="20"/>', '<w:basedOn w:val="Caption"/>')}
+${style('ListParagraph', 'List Paragraph', '<w:spacing w:after="40"/>', '', '<w:basedOn w:val="Normal"/><w:qFormat/>')}
 ${style('TableText', 'Table Text', '<w:spacing w:before="20" w:after="20" w:line="240" w:lineRule="auto"/>', '<w:sz w:val="20"/>', '<w:basedOn w:val="Normal"/>')}
 ${style('Bibliography', 'Bibliography', '<w:ind w:left="720" w:hanging="720"/><w:spacing w:after="120" w:line="276" w:lineRule="auto"/>', '<w:sz w:val="22"/>', '<w:basedOn w:val="Normal"/>')}
 ${style('BibliographyNumbered', 'Bibliography (numbered)', '<w:tabs><w:tab w:val="left" w:pos="540"/></w:tabs><w:ind w:left="540" w:hanging="540"/><w:spacing w:after="120" w:line="276" w:lineRule="auto"/>', '<w:sz w:val="22"/>', '<w:basedOn w:val="Normal"/>')}
@@ -889,7 +1249,7 @@ ${style('Footer', 'footer', '<w:jc w:val="center"/>', '<w:sz w:val="20"/>', '<w:
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 <Relationship Id="rIdFooter" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
-${rels.join('\n')}
+${nums.length ? '<Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>\n' : ''}${rels.join('\n')}
 </Relationships>`;
     const types = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -899,8 +1259,16 @@ ${rels.join('\n')}
 <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
 <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
 <Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>
-<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+${nums.length ? '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>\n' : ''}<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
 </Types>`;
+    // bullets (• ◦ ▪) and numbers (1. at every level), a quarter inch a level
+    const levels = (bullet) => [0, 1, 2].map((i) => `<w:lvl w:ilvl="${i}"><w:start w:val="1"/><w:numFmt w:val="${bullet ? 'bullet' : 'decimal'}"/><w:lvlText w:val="${bullet ? '•◦▪'[i] : `%${i + 1}.`}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="${360 * (i + 1)}" w:hanging="360"/></w:pPr></w:lvl>`).join('');
+    const numbering = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="multilevel"/>${levels(true)}</w:abstractNum>
+<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="multilevel"/>${levels(false)}</w:abstractNum>
+${nums.map((t, i) => `<w:num w:numId="${i + 1}"><w:abstractNumId w:val="${t === 'ol' ? 1 : 0}"/>${[0, 1, 2].map((l) => `<w:lvlOverride w:ilvl="${l}"><w:startOverride w:val="1"/></w:lvlOverride>`).join('')}</w:num>`).join('\n')}
+</w:numbering>`;
     const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 <dc:title>${xml(m.title || '')}</dc:title><dc:creator>${xml(m.authors.map((a) => a.name).join('; '))}</dc:creator><cp:keywords>${xml((m.keywords || []).join(', '))}</cp:keywords>
@@ -916,10 +1284,11 @@ ${rels.join('\n')}
       { path: 'word/document.xml', content: doc },
       { path: 'word/styles.xml', content: styles },
       { path: 'word/footer1.xml', content: footer },
+      ...(nums.length ? [{ path: 'word/numbering.xml', content: numbering }] : []),
       { path: 'word/_rels/document.xml.rels', content: docRels },
       ...media
     ];
   }
 
-  return { latex, pandoc, markdown, text, epub, html, docx, crossId, runsText, htmlToRuns, texEsc };
+  return { latex, pandoc, markdown, talk, text, epub, html, docx, crossId, runsText, htmlToRuns, texEsc, panelRows };
 });

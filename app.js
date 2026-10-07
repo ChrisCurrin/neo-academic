@@ -383,7 +383,8 @@ function popMenu(x, y, items, { title = '', from = null } = {}) {
     }
     document.body.appendChild(menu);
     // opened from the keyboard (no pointer), it hangs from the thing it's for
-    if ((!x && !y) && from) {
+    const keyboard = !x && !y && !!from;
+    if (keyboard) {
       const r = from.getBoundingClientRect();
       x = r.left + 12;
       y = r.bottom;
@@ -406,7 +407,8 @@ function popMenu(x, y, items, { title = '', from = null } = {}) {
       // the Chapters pane it kept open closes if the pointer has left it
       const nav = $('#nav-pane');
       if (nav && nav.dataset.pinned !== '1' && !nav.matches(':hover')) nav.classList.remove('open');
-      if (value === null && back && back.isConnected && back.focus) back.focus({ preventScroll: true });
+      // back where the keys were: after a choice too, when the keys opened it
+      if ((value === null || keyboard) && back && back.isConnected && back.focus) back.focus({ preventScroll: true });
       resolve(value);
     };
     const cancel = () => done(null);
@@ -2253,7 +2255,7 @@ async function openBook(bookId) {
   const isNew = book.chapterOrder.length === 0;
   // a new script opens on its title page (it has no outline to open to)
   const newScript = isScript() && isUntitled(book.title) && !bookWordCount();
-  if (isNew && library.writingStyle === 'plotter' && !isScript() && !isPaper()) {
+  if (isNew && library.writingStyle === 'plotter' && isPlainBook()) {
     switchTab('outline');
   } else {
     switchTab('manuscript');
@@ -2268,7 +2270,7 @@ async function openBook(bookId) {
   }
 
   // the Enter hint shows once per library, ever
-  if (!library.hintShown && !isScript() && !isPaper()) {
+  if (!library.hintShown && isPlainBook()) {
     library.hintShown = true;
     writeLibrary(library);
     setTimeout(() => toast(t('Enter twice = section break · three times = new chapter · {key} shows everything else', { key: KHELP }), 7000), 800);
@@ -3109,9 +3111,12 @@ function guardMarkerDelete(e, body, chId) {
 
 // The engine wraps text in style-carrying spans during merges and splits
 // ("<span style='text-indent...'>"). They corrupt later edits — unwrap them,
-// keeping only NEO's own marks.
+// keeping only NEO's own marks: placeholders, and a paper's citations,
+// cross-references, maths, symbols and figure panels' captions.
+const KEPT_SPANS = ['ph-mark', 'cite', 'xref', 'math', 'sym', 'subcap'];
+const JUNK_SPAN = 'span' + KEPT_SPANS.map((c) => `:not(.${c})`).join('');
 function stripJunkSpans(el) {
-  for (const s of [...el.querySelectorAll('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')]) {
+  for (const s of [...el.querySelectorAll(JUNK_SPAN)]) {
     while (s.firstChild) s.before(s.firstChild);
     s.remove();
   }
@@ -3168,7 +3173,7 @@ function handleEnter(e, body, chId) {
   if (!isStory(chId) && !block.classList.contains('poetry')) {
     e.preventDefault();
     enterRun = 0;
-    if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) {
+    if (block.querySelector(JUNK_SPAN)) {
       const caret = captureCaret();
       stripJunkSpans(block);
       restoreCaret(caret);
@@ -3255,7 +3260,7 @@ function handleEnter(e, body, chId) {
     // normal Enter — native split so ⌘Z keeps working; junk spans (which
     // make the engine clone whole paragraphs) are stripped first if present
     e.preventDefault();
-    if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) {
+    if (block.querySelector(JUNK_SPAN)) {
       // Unwrapping moves text nodes, so preserve the caret's text position.
       const caret = captureCaret();
       stripJunkSpans(block);
@@ -3367,7 +3372,7 @@ function handlePoetry(e, body, chId) {
 
   if (block.classList.contains('poetry')) {
     // the engine's own split keeps the class on the new line, and ⌘Z sees it
-    if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) stripJunkSpans(block);
+    if (block.querySelector(JUNK_SPAN)) stripJunkSpans(block);
     document.execCommand('insertParagraph');
     const cur = caretBlock(body);
     if (cur) {
@@ -3422,7 +3427,7 @@ function handleFlush(e, body, chId) {
   if (!block) return false;
   e.preventDefault();
   if (block.classList.contains('scene-break')) return true;
-  if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) stripJunkSpans(block);
+  if (block.querySelector(JUNK_SPAN)) stripJunkSpans(block);
   if (block.classList.contains('flush')) {
     // the engine's own split keeps the class on the new line, and ⌘Z sees it
     document.execCommand('insertParagraph');
@@ -4218,7 +4223,7 @@ function frenchTypography() {
 document.addEventListener('keydown', (e) => {
   const el = e.target;
   if (e.defaultPrevented || !el || !el.isContentEditable || el.closest('.chapter-body')) return;
-  if (el.closest('.math, .eq')) return; // a paper's TeX is typed as it is
+  if (el.closest('.math, .eq') || (isPaper() && mathCaretIn())) return; // a paper's TeX is typed as it is
   smartKeys(e, el);
 }, true);
 
@@ -5177,6 +5182,8 @@ function spToFdx(lines, title = {}) {
 const isScript = (meta = book) => !!meta && meta.format === 'screenplay';
 // a paper: book.json says "format": "paper" (paper/paper.js)
 const isPaper = (meta = book) => !!meta && meta.format === 'paper';
+// a book of chapters: neither a script nor a paper
+const isPlainBook = (meta = book) => !!meta && !isScript(meta) && !isPaper(meta);
 const SP_CLASSES = SP_TYPES.filter((x) => x !== 'action').map((x) => 'sp-' + x);
 const SP_NAMES = {
   heading: tk('Scene Heading'), action: tk('Action'), character: tk('Character'), paren: tk('Parenthetical'),
@@ -11422,14 +11429,27 @@ function shortcutSections() {
       [['#', '##', '###'], tk('At the start of a line, then a space: a section, subsection or subsubsection heading'), tk('Or ⌥⌘1, ⌥⌘2, ⌥⌘3; ⌥⌘0 makes it body text again.')],
       ['@', tk('Cite a reference, or refer to a section, figure, table or equation'), tk('Type a name, a year or a word of the title. @fig, @tab, @eq and @sec narrow it. Paste a DOI or arXiv ID after the @ to add the reference.')],
       [K('⌘⇧K', 'Ctrl+Shift+K'), tk('Insert a citation')],
-      [['$…$'], tk('Maths in the line, in TeX'), tk('Undo right after keeps the dollar signs. Click the maths to change it.')],
+      [['$…$'], tk('Maths in the line, in TeX'), tk('Undo right after keeps the dollar signs. Arrow into the maths, or click it, to change it.')],
       [['$$'], tk('On a line of its own, then Enter: a numbered equation')],
+      [['\\mu'], tk('Then a space: μ, or any of LaTeX’s symbols by its name'), tk('The paper’s own symbols too: \\Vm and a space. Define them on the References tab, or select maths and press ⇧F10. /symbols makes a table of them.')],
+      [['-', '1.'], tk('At the start of a line, then a space: a bulleted or numbered list'), tk('Tab nests an item; ⇧Tab, or Backspace at its start, brings it out. Enter on an empty item ends the list.')],
       [K('⌘⇧M', 'Ctrl+Shift+M'), tk('Insert an equation')],
+      ['/', tk('On a line of its own: a figure, table, equation, citation, cross-reference or heading'), tk('A word narrows it: /fig, /tab, /eq. LaTeX’s names work too: /includegraphics, /section, /ref.')],
       [tk('Drop or paste a picture'), tk('A numbered figure, with its caption under it')],
       [tk('Paste from a spreadsheet'), tk('A numbered table'), tk('Tab moves between cells (and adds a row at the end); right-click for rows and columns.')],
+      [['←', '→', '↑', '↓'], tk('Into maths, an equation, a figure’s caption or a table’s cells, and out again'), tk('Esc goes back to the writing.')],
+      [K('⇧F10', 'Shift+F10'), tk('The menu for where the caret is'), tk('A table’s rows and columns, a figure’s layout, a citation’s pages, a cross-reference.')],
+      [K('⌥↑ ⌥↓', 'Alt+↑ Alt+↓'), tk('In the pane: move a section up or down')],
       [KPH, tk('Insert a placeholder note')],
       [KDA, tk('Move selected text to Darlings')]
     ] };
+    // editing is its own mode: asked for, never while writing
+    sections.splice(1, 0, { title: tk('Editing a paper'), rows: [
+      [K('⌘⇧;', 'Ctrl+Shift+;'), tk('The editing pass: filler, the passive, comparisons with no basis, long sentences, acronyms, one spelling throughout, units, ranges, figures in order'), tk('Right-click a marked stretch, or ⇧F10 in it, for why and the fix.')],
+      [K('⌘\'', 'Ctrl+\''), tk('The next thing the pass marked'), tk('With ⇧, the one before.')],
+      [tk('View → First and Last Sentences'), tk('Each paragraph’s context and conclusion, the rest dimmed')],
+      [tk('File → Anonymous for Review'), tk('Previews and exports without the authors, for double-blind review')]
+    ] });
     return sections;
   }
   return bookShortcutSections();

@@ -210,7 +210,11 @@ h3 { font-size: 1.02em; margin: 1em 0 .35em; ${head.center ? 'text-align: left; 
 h4 { font-size: 1em; font-style: italic; margin: .8em 0 .3em; ${head.center ? 'text-align: left;' : ''} }
 h2 .num, h3 .num, h4 .num { margin-right: .5em; }
 p { margin: 0; text-indent: ${j.justify ? '1.2em' : '0'}; ${j.justify ? 'text-align: justify; hyphens: auto;' : 'margin-bottom: .6em;'} }
-h2 + p, h3 + p, h4 + p, figure + p, .eq + p, p.flush { text-indent: 0; }
+h2 + p, h3 + p, h4 + p, figure + p, .eq + p, ul + p, ol + p, table + p, p.flush { text-indent: 0; }
+ul, ol { margin: .4em 0 .6em; padding-left: 1.6em; }
+li ul, li ol { margin: .2em 0; }
+table.symbols { margin: .8em auto; break-inside: avoid; }
+table.symbols td:first-child { white-space: nowrap; }
 a { color: inherit; text-decoration: none; }
 .math svg { vertical-align: middle; }
 .eq { display: flex; align-items: center; justify-content: center; position: relative; margin: .7em 0; break-inside: avoid; }
@@ -240,5 +244,30 @@ th, td { padding: .2em .6em; text-align: left; vertical-align: top; }
 .references .csl-right-inline { flex: 1; }`;
   }
 
-  return { JOURNALS, DEFAULT, get, headingNumber, css };
+  // The words for a paper's figures and tables, in a journal's captions (or
+  // none's: Figure 1.), and in its sentences: Fig. 2, Table 1, Section 3,
+  // Equation (4), where a caption set in capitals (FIG., TABLE) is still
+  // Fig. and Table in the text. A cross-reference saved in the chapter says
+  // these, the same on every device, whatever language NEO itself speaks.
+  const PLAIN_CAPTIONS = { figure: 'Figure', table: 'Table', sep: '.' };
+  const journalOf = (j) => (typeof j === 'string' ? get(j) : j);
+  function captions(j) {
+    j = journalOf(j);
+    return j ? j.captions : PLAIN_CAPTIONS;
+  }
+  // a table's number as its caption sets it: TABLE IV in IEEE's way
+  function tableNumber(j, num) {
+    j = journalOf(j);
+    return j && j.captions.table === 'TABLE' && j.headings.numbering === 'roman' ? headingNumber(j, num, 1).replace(/\.$/, '') : String(num);
+  }
+  function refWord(j, kind) {
+    const c = captions(j);
+    const calm = (w) => (w === w.toUpperCase() ? w[0] + w.slice(1).toLowerCase() : w);
+    return { fig: calm(c.figure), tbl: calm(c.table), sec: 'Section', eq: 'Equation' }[kind] || '';
+  }
+  function refLabel(j, kind, num) {
+    return kind === 'eq' ? `${refWord(j, 'eq')} (${num})` : `${refWord(j, kind)} ${num}`;
+  }
+
+  return { JOURNALS, DEFAULT, get, headingNumber, css, captions, tableNumber, refWord, refLabel };
 });

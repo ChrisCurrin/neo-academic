@@ -336,7 +336,7 @@ test('maths, clicked, turns into its TeX in the line, drawn live beside it', asy
   assert.equal(await js(`document.querySelector('.chapter-body .math').contains(getSelection().anchorNode)`), true, 'the caret is in its TeX');
   for (let i = 0; i < 3; i++) await key('Backspace'); // 'E = I' → 'E '
   await type('\\approx I');
-  assert.equal(await js(`document.querySelector('.chapter-body .math').textContent`), 'E \\approx I');
+  assert.equal(await js(`texOf(document.querySelector('.chapter-body .math'))`), 'E \\approx I');
   assert.equal(await js(`!!document.querySelector('.chapter-body .math').shadowRoot.querySelector('.pv svg')`), true, 'drawn as it is typed');
   const { html: mid } = await saved();
   assert.match(mid, /<span class="math" contenteditable="false">E \\approx I<\/span>/, 'saved as maths while it is being written');
@@ -358,6 +358,427 @@ test('maths, clicked, turns into its TeX in the line, drawn live beside it', asy
   await snap('equation-inline-edit');
   await key('Escape');
   await tick(200);
+});
+
+test('maths is opened, written and left from the keyboard', async () => {
+  const editing = () => js(`(() => { const n = document.querySelector('.chapter-body .editing'); return n ? texOf(n) : null; })()`);
+  const line = () => js(`document.querySelector('#kb').innerHTML`);
+  // the caret at a place in a paragraph's nth text
+  const caretAt = (sel, nth, offset) => js(`(() => {
+    const p = document.querySelector(${JSON.stringify(sel)});
+    document.querySelector('.chapter-body').focus();
+    const t = [...p.childNodes].filter((n) => n.nodeType === 3)[${nth}];
+    const r = document.createRange();
+    r.setStart(t, ${offset === -1 ? 't.length' : offset});
+    getSelection().removeAllRanges();
+    getSelection().addRange(r);
+  })()`);
+  await caretAtEnd();
+  await key('Enter');
+  await js(`document.querySelector('.chapter-body').lastElementChild.id = 'kb'`);
+  await type('Gain $x+y$ rises');
+  // → beside the maths opens it at its start; Home and End keep to its TeX
+  await caretAt('#kb', 0, -1);
+  await key('Right');
+  assert.equal(await editing(), 'x+y', '→ opens it');
+  await type('2');
+  await key('End');
+  await type('z');
+  await key('Home');
+  await type('a');
+  assert.equal(await editing(), 'a2x+yz');
+  // ⌘A takes only the TeX, and typing over it leaves maths, not words
+  await key('a', ['meta']);
+  await type('k');
+  assert.equal(await editing(), 'k');
+  await key('Right');
+  assert.equal(await editing(), null, '→ at its end steps out');
+  await type('!');
+  assert.equal(await line(), 'Gain <span class="math" contenteditable="false">k</span>! rises');
+  // Backspace after maths opens it rather than take it whole; emptied, it still takes typing
+  await key('Backspace'); // the !
+  await key('Backspace');
+  assert.equal(await editing(), 'k');
+  await key('Backspace');
+  await type('w');
+  assert.equal(await editing(), 'w');
+  await key('Left');
+  await key('Left');
+  assert.equal(await editing(), null, '← at its start steps out');
+  // ⌘⇧M at the end of a line: maths that takes what's typed
+  await caretAt('#kb', 1, -1);
+  await js(`paperInsertEquation()`);
+  await type('\\beta');
+  await key('Enter');
+  assert.equal(await line(), 'Gain <span class="math" contenteditable="false">w</span> rises<span class="math" contenteditable="false">\\beta</span>');
+  // an equation: ↑ and ↓ from the lines around it, ⇧Enter for another line of TeX
+  await js(`(() => {
+    const r = document.createRange();
+    r.selectNodeContents(document.querySelector('#kb'));
+    r.collapse(false);
+    getSelection().removeAllRanges();
+    getSelection().addRange(r);
+  })()`);
+  await key('Enter');
+  await type('$$a^2$$\nThen');
+  await key('Up');
+  assert.equal(await editing(), 'a^2', '↑ from the line under an equation opens it');
+  await type('+b^2');
+  await key('Enter', ['shift']);
+  await type('c');
+  assert.equal(await editing(), 'a^2+b^2\nc');
+  await key('Down');
+  assert.equal(await editing(), null, '↓ from its last line steps out');
+  await type('X');
+  assert.equal(await js(`document.querySelector('#kb + p.eq + p').textContent`), 'XThen');
+  await caretAt('#kb', 1, -1);
+  await key('Down');
+  assert.equal(await editing(), 'a^2+b^2\nc', '↓ from the line over it opens it');
+  await key('Escape');
+  const { html } = await saved();
+  assert.doesNotMatch(html, /​|spellcheck|editing/, 'nothing of the editing is saved');
+  assert.match(html, /<p class="eq" contenteditable="false" data-id="eq-[^"]+">a\^2\+b\^2\nc<\/p>/);
+  assert.match(html, /<p id="kb">Gain <span class="math" contenteditable="false">w<\/span> rises<span class="math" contenteditable="false">\\beta<\/span><\/p>/);
+  // a line that only starts with $$ stays a line
+  await js(`document.querySelector('#kb').textContent = '$$x$$ is the gain'`);
+  await caretAt('#kb', 0, -1);
+  await key('Enter');
+  assert.equal(await js(`document.querySelector('#kb').className`), '');
+  // as it was, for the tests after
+  await js(`(() => {
+    const kb = document.querySelector('#kb');
+    while (kb.nextElementSibling) kb.nextElementSibling.remove();
+    kb.remove();
+    syncChapter(document.querySelector('.chapter-body'), document.querySelector('.chapter').dataset.id);
+  })()`);
+});
+
+test('figures, tables, citations and sections from the keyboard', async () => {
+  const mod = process.platform === 'darwin' ? 'meta' : 'control';
+  // where the caret is: in a caption, which cell, which paragraph
+  const where = () => js(`(() => {
+    const n = getSelection().anchorNode;
+    const el = n && (n.nodeType === 3 ? n.parentElement : n);
+    return {
+      cap: !!(el && el.closest('figcaption')),
+      cell: el && el.closest('th, td') ? el.closest('th, td').textContent : null,
+      fig: el && el.closest('figure') ? el.closest('figure').className : null,
+      text: el && el.closest('p') ? el.closest('p').textContent : null
+    };
+  })()`);
+  const caretIn = (expr, end) => js(`(() => {
+    const p = ${expr};
+    document.querySelector('.chapter-body').focus();
+    const r = document.createRange();
+    r.selectNodeContents(p);
+    r.collapse(${!end});
+    getSelection().removeAllRanges();
+    getSelection().addRange(r);
+  })()`);
+  const fig = `document.querySelector('.chapter-body figure.fig')`;
+  const tbl = `document.querySelector('.chapter-body figure.tbl')`;
+  // ↓ from the line over a figure: into its caption; Esc: on to the line after it
+  await caretIn(`${fig}.previousElementSibling`, true);
+  await key('Down');
+  assert.deepEqual(await where(), { cap: true, cell: null, fig: 'fig', text: null });
+  await key('Escape');
+  assert.equal((await where()).text, await js(`${fig}.nextElementSibling.textContent`));
+  // Backspace at the start of the line under it steps into the caption; the figure stays
+  await key('Backspace');
+  assert.equal((await where()).cap, true);
+  assert.equal(await js(`document.querySelectorAll('.chapter-body figure.fig').length`), 1);
+  await key('Escape');
+  // a table: ↓ through its caption, its header, down its column
+  await caretIn(`${tbl}.previousElementSibling`, true);
+  await key('Down');
+  assert.equal((await where()).fig, 'tbl');
+  assert.equal((await where()).cap, true);
+  await key('Down');
+  assert.equal((await where()).cell, 'Layer');
+  await key('Down');
+  assert.equal((await where()).cell, 'L2/3');
+  // ⇧F10: its rows and columns, and back in the cell after
+  await key('F10', ['shift']);
+  assert.equal(await js(`document.querySelector('.pop-menu .pm-title').textContent`), 'Table');
+  const pick = (label) => js(`[...document.querySelectorAll('.pop-menu button')].find((b) => b.textContent === ${JSON.stringify(label)}).focus()`);
+  await pick('Insert Row Below');
+  await type('\n'); // a button takes Enter as a character
+  await tick(100);
+  assert.equal(await js(`${tbl}.querySelectorAll('tr').length`), 4);
+  assert.equal((await where()).cell, 'L2/3', 'the caret is back in its cell');
+  await key('Down');
+  await key('F10', ['shift']);
+  await pick('Delete Row');
+  await type('\n');
+  await tick(100);
+  assert.equal(await js(`${tbl}.querySelectorAll('tr').length`), 3);
+  // ↑ from the line under it: its last cell; Esc: back to that line
+  await caretIn(`${tbl}.nextElementSibling`, false);
+  await key('Up');
+  assert.equal((await where()).cell, '7.9');
+  await key('Escape');
+  assert.equal((await where()).fig, null);
+  // ⇧F10 beside a citation: its pages, typed; Enter is back on the page
+  const cite = `document.querySelector('.chapter-body .cite')`;
+  const was = await js(`${cite}.dataset.cite`);
+  await js(`(() => { document.querySelector('.chapter-body').focus(); caretAfter(${cite}); })()`);
+  await key('F10', ['shift']);
+  assert.equal(await js(`document.activeElement.className`), 'cp-loc');
+  await key('a', [mod]);
+  await type('12');
+  await key('Enter');
+  assert.equal(await js(`!!document.querySelector('.cite-pop')`), false);
+  assert.equal(JSON.parse(await js(`${cite}.dataset.cite`))[0].locator, '12');
+  assert.equal(await js(`document.activeElement.classList.contains('chapter-body')`), true, 'the caret is back on the page');
+  await js(`(async () => { const c = ${cite}; c.dataset.cite = ${JSON.stringify(was)}; syncChapter(c.closest('.chapter-body'), c.closest('.chapter').dataset.id); await paperCiteNow(); })()`);
+  // ⌥↑ ⌥↓ in the pane move a section, and the row keeps the keys
+  const heads = () => js(`[...document.querySelectorAll('.chapter-body p.h1')].map((h) => h.textContent)`);
+  await js(`document.getElementById('nav-pane').classList.add('open'); renderNav()`);
+  await tick(200);
+  await js(`document.querySelectorAll('#nav-list .paper-sec.ps-h1 .n-row')[1].focus()`);
+  await key('Up', ['alt']);
+  await tick(200);
+  assert.deepEqual(await heads(), ['Methods', 'Introduction']);
+  assert.equal(await js(`document.activeElement.querySelector('.n-label').textContent`), 'Methods');
+  await key('Down', ['alt']);
+  await tick(200);
+  assert.deepEqual(await heads(), ['Introduction', 'Methods']);
+  await js(`document.getElementById('nav-pane').classList.remove('open')`);
+  // a selection that takes a whole table with it: its words go to Darlings
+  await caretAtEnd();
+  await key('Enter');
+  await type('Before');
+  await js(`document.querySelector('.chapter-body').lastElementChild.id = 'kb'`);
+  await js(`paperInsertTable([['a', 'b'], ['c', 'd']])`);
+  await tick(200);
+  await js(`(() => {
+    const kb = document.querySelector('#kb');
+    const r = document.createRange();
+    r.setStart(kb.firstChild, 3);
+    r.setEnd(kb.nextElementSibling.nextElementSibling, 0);
+    document.querySelector('.chapter-body').focus();
+    getSelection().removeAllRanges();
+    getSelection().addRange(r);
+  })()`);
+  const kept = await js(`darlings.length`);
+  await key('Backspace');
+  await tick(300);
+  assert.equal(await js(`document.querySelectorAll('.chapter-body figure.tbl').length`), 1);
+  assert.equal(await js(`darlings.length`), kept + 1);
+  assert.match(await js(`darlings[darlings.length - 1].text`), /a\tb\nc\td/);
+  await js(`(() => {
+    const kb = document.querySelector('#kb');
+    while (kb.nextElementSibling) kb.nextElementSibling.remove();
+    kb.remove();
+    syncChapter(document.querySelector('.chapter-body'), document.querySelector('.chapter').dataset.id);
+  })()`);
+});
+
+test('/ on a line of its own: a figure, a table, a heading, by a word or a LaTeX name', async () => {
+  const rows = () => js(`[...document.querySelectorAll('.paper-picker .pp-main')].map((r) => r.textContent)`);
+  await caretAtEnd();
+  await key('Enter');
+  await js(`document.querySelector('.chapter-body').lastElementChild.id = 'sl'`);
+  // a / in a sentence is a /
+  await type('and/or');
+  assert.equal(await js(`!!document.querySelector('.paper-picker')`), false);
+  await key('Enter');
+  // nothing by that name: the / stays a /
+  await type('/usr');
+  assert.equal(await js(`!!document.querySelector('.paper-picker')`), false);
+  assert.equal(await js(`document.querySelector('.chapter-body').lastElementChild.textContent`), '/usr');
+  await key('Enter');
+  await type('/');
+  assert.ok((await rows()).includes('Figure…'), 'everything, before a word');
+  await type('ref');
+  assert.equal((await rows())[0], 'Cross-Reference…', 'LaTeX’s \\ref');
+  await key('Escape');
+  for (let i = 0; i < 4; i++) await key('Backspace');
+  // /includegraphics: a picture picked, as a figure
+  const figs = await js(`document.querySelectorAll('.chapter-body figure.fig').length`);
+  await js(`window.pickFile = async () => {
+    const c = new OffscreenCanvas(60, 40);
+    c.getContext('2d').fillRect(0, 0, 60, 40);
+    return new File([await c.convertToBlob({ type: 'image/png' })], 'slash.png', { type: 'image/png' });
+  }; true`);
+  await type('/includeg');
+  assert.deepEqual(await rows(), ['Figure…']);
+  await key('Enter');
+  await tick(600);
+  assert.equal(await js(`document.querySelectorAll('.chapter-body figure.fig').length`), figs + 1);
+  assert.equal(await js(`document.activeElement.matches('figcaption')`), true, 'the caret in its caption');
+  // /tab: a table
+  await key('Escape');
+  const tables = await js(`document.querySelectorAll('.chapter-body figure.tbl').length`);
+  await type('/tab');
+  await key('Enter');
+  await tick(200);
+  assert.equal(await js(`document.querySelectorAll('.chapter-body figure.tbl').length`), tables + 1);
+  // /subsection: the line becomes one
+  await key('Escape');
+  await type('/subs');
+  await key('Enter');
+  await tick(100);
+  await type('Rates');
+  assert.match(await js(`document.querySelector('.chapter-body').lastElementChild.outerHTML`), /^<p class="h2"[^>]*>Rates<\/p>$/);
+  // as it was, for the tests after
+  await js(`(() => {
+    const sl = document.querySelector('#sl');
+    while (sl.nextElementSibling) sl.nextElementSibling.remove();
+    sl.remove();
+    syncChapter(document.querySelector('.chapter-body'), document.querySelector('.chapter').dataset.id);
+    paperRenumber();
+  })()`);
+});
+
+test('lists, \\mu and a space, and the paper’s own symbols in a table with their values and sources', async () => {
+  await caretAtEnd();
+  await key('Enter');
+  await js(`document.querySelector('.chapter-body').lastElementChild.id = 'ls'`);
+  const items = () => js(`(() => { const out = []; for (let el = document.querySelector('#ls'); el; el = el.nextElementSibling) out.push([el.className, el.dataset.list || '', el.dataset.level || '', el.dataset.num || '', el.textContent]); return out; })()`);
+  // - and a space: a bulleted list; Tab nests; Enter on an empty item comes out, then ends it
+  await type('- Excitation\nInhibition');
+  await key('Tab');
+  await type('\nFast\n');
+  await type('\n'); // an empty item a level in: a level out
+  await type('\n'); // and then out of the list
+  await type('1. Record\nModel');
+  assert.deepEqual(await items(), [
+    ['li', 'ul', '', '', 'Excitation'], ['li', 'ul', '2', '', 'Inhibition'], ['li', 'ul', '2', '', 'Fast'],
+    ['li', 'ol', '', '1', 'Record'], ['li', 'ol', '', '2', 'Model']
+  ]);
+  // Backspace at an item's start: a paragraph again
+  await key('Enter');
+  await key('Backspace');
+  await type('With \\mu and \\leq, a $V_m$');
+  assert.match(await js(`document.querySelector('.chapter-body').lastElementChild.innerHTML`), /^With μ and ≤, a <span class="math"/);
+  // the maths defined as a symbol: ⇧F10 beside it
+  await key('F10', ['shift']);
+  const pick = async (label) => {
+    await js(`[...document.querySelectorAll('.pop-menu button')].find((b) => b.textContent === ${JSON.stringify(label)}).focus()`);
+    await type('\n');
+  };
+  await pick('Define as a Symbol…');
+  await tick(200);
+  assert.equal(await js(`document.querySelectorAll('.paper-sym input')[1].value`), 'Vm', 'a name offered from its TeX');
+  await js(`(() => {
+    const f = document.querySelectorAll('.paper-sym input');
+    f[2].value = 'membrane potential'; f[3].value = '−65'; f[4].value = 'mV';
+    document.querySelector('.paper-sym select').value = 'parameter';
+    document.querySelector('.ps-sources input').focus();
+  })()`);
+  await type('smith');
+  await key('Enter');
+  assert.equal(await js(`document.querySelectorAll('.paper-sym .ps-chip').length`), 1);
+  await js(`document.querySelector('.paper-sym .m-ok').click()`);
+  await tick(400);
+  assert.match(await js(`document.querySelector('.chapter-body').lastElementChild.innerHTML`), /<span class="sym" contenteditable="false" data-sym="Vm">V_m<\/span>/);
+  // \Vm and a space: the symbol again
+  await caretAtEnd();
+  await type(' or \\Vm ');
+  assert.equal(await js(`document.querySelectorAll('.chapter-body .sym[data-sym="Vm"]').length`), 2);
+  // /symbols: the table, its source cited in the paper's style
+  await key('Enter');
+  await type('/symbols');
+  await key('Enter');
+  await tick(800);
+  const table = () => js(`[...document.querySelector('.chapter-body p.symtab').shadowRoot.querySelectorAll('tr')].map((r) => [...r.children].map((c) => c.textContent.trim()))`);
+  const rows = await table();
+  assert.deepEqual(rows[0], ['Symbol', 'Meaning', 'Value', 'Unit', 'Source']);
+  assert.deepEqual(rows[1].slice(1), ['membrane potential', '−65', 'mV', '(Smith et al., 2020)']);
+  await js(`document.querySelector('.chapter-body p.symtab').scrollIntoView({ block: 'center' })`);
+  await snap('lists-and-symbols');
+  // its definition changed: every use follows, and the table
+  await js(`paperSaveSymbols(paper.symbols.map((x) => ({ ...x, tex: 'V_\\\\mathrm{m}' })))`);
+  await tick(400);
+  assert.deepEqual(await js(`[...document.querySelectorAll('.chapter-body .sym')].map((n) => n.textContent)`), ['V_\\mathrm{m}', 'V_\\mathrm{m}']);
+  const { dir, html } = await saved();
+  // (the engine copies the test's id="ls" to each new line)
+  assert.match(html, /<p(?: id="ls")? class="li" data-list="ul">Excitation<\/p><p(?: id="ls")? class="li" data-list="ul" data-level="2">Inhibition<\/p>/);
+  assert.match(html, /<p(?: id="ls")? class="li" data-list="ol">Record<\/p>/, 'numbers are drawn, never saved');
+  assert.match(html, /<p class="symtab" contenteditable="false" data-id="symtab-\w+"><\/p>/, 'the table is drawn, never saved');
+  const syms = JSON.parse(fs.readFileSync(path.join(dir, 'symbols.json'), 'utf8'));
+  assert.deepEqual(syms, [{ id: 'Vm', tex: 'V_\\mathrm{m}', meaning: 'membrane potential', unit: 'mV', value: '−65', kind: 'parameter', table: true, cite: [{ id: 'smith2020neural' }] }]);
+  // and in LaTeX: its own command, μ that compiles, the lists, the table
+  const tex = await js(`(async () => NeoPaperExport.latex(await paperModel()).find((f) => f.path === 'paper.tex').content)()`);
+  assert.match(tex, /\\DeclareRobustCommand\{\\Vm\}/);
+  assert.match(tex, /\\Vm\{\}/);
+  assert.match(tex, /\\ensuremath\{\\mu\}/);
+  assert.match(tex, /\\begin\{itemize\}[\s\S]*\\begin\{itemize\}[\s\S]*\\end\{itemize\}[\s\S]*\\end\{itemize\}/);
+  assert.match(tex, /\\begin\{enumerate\}/);
+  assert.match(tex, /membrane potential/);
+});
+
+test('editing, asked for: the pass and its fixes, first and last sentences, anonymous for review, a talk, references that lack something', async () => {
+  await caretAtEnd();
+  await key('Enter');
+  await js(`document.querySelector('.chapter-body').lastElementChild.id = 'ed'`);
+  await type('We built a rig in order to record cells. The cells were recorded by hand. Our method is faster. It worked. It worked well. It ends here.');
+  // nothing is marked until the pass is asked for
+  assert.equal(await js(`CSS.highlights.has('neo-edit')`), false);
+  await js(`paperEditing(true)`);
+  await tick(200);
+  const flags = () => js(`editingFlags.map(({ range, flag }) => flag.rule + ':' + range.toString())`);
+  const before = await flags();
+  assert.ok(before.includes('filler:in order to'), before.join(' | '));
+  assert.ok(before.some((f) => f.startsWith('passive:were recorded')), before.join(' | '));
+  assert.ok(before.some((f) => f.startsWith('compare:')), before.join(' | '));
+  await js(`document.querySelector('#ed').scrollIntoView({ block: 'center' })`);
+  await snap('editing-pass');
+  // ⌘' selects the next; ⇧F10 in it: why, and the fix
+  await js(`(() => { const p = document.querySelector('#ed'); const r = document.createRange(); r.setStart(p.firstChild, 0); r.collapse(true); getSelection().removeAllRanges(); getSelection().addRange(r); })()`);
+  await js(`paperEditingNext(1)`);
+  assert.equal(await js(`getSelection().toString()`), 'in order to');
+  await js(`(() => { const s = getSelection(); s.collapseToStart(); s.modify('move', 'forward', 'character'); })()`);
+  await key('F10', ['shift']);
+  assert.match(await js(`document.querySelector('.pop-menu .pm-title').textContent`), /Filler/);
+  await js(`[...document.querySelectorAll('.pop-menu button')].find((b) => /^Change to/.test(b.textContent)).focus()`);
+  await type('\n');
+  await tick(200);
+  assert.match(await js(`document.querySelector('#ed').textContent`), /^We built a rig to record cells\./);
+  await js(`paperEditing(false)`);
+  assert.equal(await js(`CSS.highlights.has('neo-edit')`), false);
+  // first and last sentences: the middle of the paragraph dimmed, nothing in the file
+  await js(`paperSkim(true)`);
+  const dim = await js(`[...CSS.highlights.get('neo-skim')].map((r) => r.toString())`);
+  assert.ok(dim.some((r) => r.startsWith('The cells were recorded') && r.endsWith('It worked well.')), JSON.stringify(dim));
+  await snap('first-and-last-sentences');
+  await js(`paperSkim(false)`);
+  const { html } = await saved();
+  assert.doesNotMatch(html, /neo-|highlight/);
+  // anonymous for review: the model (and so every way out) without the authors or what names them
+  await js(`(() => {
+    const body = document.querySelector('.chapter-body');
+    const h = document.createElement('p'); h.className = 'h1'; h.dataset.id = 'sec-ack'; h.textContent = 'Acknowledgements';
+    const p = document.createElement('p'); p.id = 'ack'; p.textContent = 'We thank the Babbage lab.';
+    body.append(h, p);
+    syncChapter(body, body.closest('.chapter').dataset.id);
+  })()`);
+  await js(`paperAnonymous(true)`);
+  const anon = await js(`(async () => { const m = await paperModel(); return { authors: m.authors.map((a) => a.name), ack: m.blocks.some((b) => /Babbage/.test(JSON.stringify(b.runs || ''))) }; })()`);
+  assert.deepEqual(anon, { authors: ['Anonymous'], ack: false });
+  assert.equal(await js(`document.getElementById('tp-authors').classList.contains('anon')`), true);
+  await js(`paperAnonymous(false)`);
+  assert.deepEqual(await js(`(async () => (await paperModel()).authors.map((a) => a.name))()`), ['Ada Lovelace', 'Charles Babbage']);
+  // a talk: its outline from the abstract's moves and the figures
+  const talk = await js(`(async () => NeoPaperExport.talk(await paperModel({ png: true })).map((f) => f.path + (f.path === 'talk.md' ? '\\n' + f.content : '')))()`);
+  const md = talk.find((f) => f.startsWith('talk.md'));
+  assert.ok(md && /## /.test(md), talk.join('\n'));
+  assert.ok(talk.some((f) => f.startsWith('figures/')), 'its figures');
+  // a reference with no year shows it on the References tab
+  await js(`(async () => { await paperSaveRefs([...paper.refs, { id: 'noyear', type: 'article-journal', title: 'Undated', author: [{ family: 'Nobody' }] }]); switchTab('references'); })()`);
+  await tick(300);
+  assert.match(await js(`[...document.querySelectorAll('#references-view .rl-gaps')].map((g) => g.textContent).join('|')`), /no year/);
+  await js(`(async () => { await paperSaveRefs(paper.refs.filter((r) => r.id !== 'noyear')); switchTab('manuscript'); })()`);
+  await tick(200);
+  // as it was, for the tests after
+  await js(`(() => {
+    const ed = document.querySelector('#ed');
+    while (ed.nextElementSibling) ed.nextElementSibling.remove();
+    ed.remove();
+    syncChapter(document.querySelector('.chapter-body'), document.querySelector('.chapter').dataset.id);
+    paperRenumber();
+  })()`);
 });
 
 test('the authors dialog and the pane of sections', async () => {
@@ -485,6 +906,53 @@ test('a panel can be referred to on its own: Figure 1b', async () => {
   await type('.');
 });
 
+test('panels set out from the keyboard: so many to a row, one wider, moved, a reference following its picture', async () => {
+  const fig = `document.querySelector('.chapter-body figure.fig')`;
+  await js(`(async () => {
+    const c = new OffscreenCanvas(200, 120);
+    const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, 200, 120); g.fillStyle = '#36c'; g.fillRect(40, 30, 120, 60);
+    await addPanel(${fig}, new File([await c.convertToBlob({ type: 'image/png' })], 'c.png', { type: 'image/png' }));
+  })()`);
+  await tick(600);
+  // the menu for the panel the caret is in, from its sub-caption
+  const menuFor = async (letter, ...labels) => {
+    await js(`(() => {
+      const sub = ${fig}.querySelectorAll(':scope > .panel .subcap')[${letter.charCodeAt(0) - 97}];
+      sub.focus();
+      const r = document.createRange();
+      r.selectNodeContents(sub);
+      r.collapse(false);
+      getSelection().removeAllRanges();
+      getSelection().addRange(r);
+    })()`);
+    await key('F10', ['shift']);
+    for (const label of labels) {
+      await js(`[...document.querySelectorAll('.pop-menu button')].find((b) => b.textContent === ${JSON.stringify(label)}).focus()`);
+      await type('\n');
+    }
+    await tick(200);
+  };
+  await menuFor('a', 'Panel Layout…', '2 to a Row');
+  assert.equal(await js(`${fig}.dataset.cols`), '2');
+  await menuFor('a', 'Panel Layout…', 'Panel (a) Twice as Wide');
+  assert.equal(await js(`${fig}.querySelector('.panel').dataset.colspan`), '2');
+  // (a) across the row; (b) and (c) side by side under it
+  const boxes = await js(`[...${fig}.querySelectorAll(':scope > .panel')].map((p) => { const r = p.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), b: Math.round(r.bottom) }; })`);
+  assert.ok(boxes[1].y >= boxes[0].b && boxes[2].y === boxes[1].y, JSON.stringify(boxes));
+  assert.ok(Math.abs(boxes[0].w - (boxes[1].w * 2 + (boxes[2].x - boxes[1].x - boxes[1].w))) <= 2, 'twice as wide, and the gap between: ' + JSON.stringify(boxes));
+  await snap('panels-in-rows');
+  // (b) moved first: the reference to it follows it to (a), and back
+  const ref = `[...document.querySelectorAll('.chapter-body .xref')].find((x) => /-[ab]$/.test(x.dataset.ref))`;
+  assert.equal(await js(`${ref}.textContent`), 'Figure 1b');
+  await menuFor('b', 'Panel Layout…', 'Move Panel (b) Earlier');
+  assert.equal(await js(`${fig}.querySelector('.panel .subcap').textContent`), 'Layer 5');
+  assert.equal(await js(`${ref}.textContent`), 'Figure 1a');
+  await menuFor('a', 'Panel Layout…', 'Move Panel (a) Later');
+  assert.equal(await js(`${ref}.textContent`), 'Figure 1b');
+  const { html } = await saved();
+  assert.match(html, /<figure class="fig" contenteditable="false" data-id="fig-\w+" data-place="H" data-cols="2"><div class="panel" data-src="figure-\w+\.png" data-colspan="2">/);
+});
+
 test('Draft for Feedback: the level asked for, on the first page', async () => {
   const before = new Set(fs.readdirSync(OUT));
   await js(`void paperFeedback()`); // it waits on the dialogs, so don't wait on it
@@ -573,7 +1041,7 @@ test('every way out', async () => {
   const html = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.html'))), 'utf8');
   assert.match(html, /<h1 class="title">Inhibition in cortical circuits<\/h1>/);
   assert.match(html, /\(Doe, 2019; Smith et al\., 2020\)/);
-  assert.match(html, /<figure id="fig-\w+" class="multi"><div class="panels"><div class="panel" id="fig-\w+-a"><img src="data:image\/png;base64,/);
+  assert.match(html, /<figure id="fig-\w+" class="multi"><div class="panels"[^>]*><div class="panel" id="fig-\w+-a"[^>]*><img src="data:image\/png;base64,/);
   assert.match(html, /<div class="eq" id="eq-\w+"><span class="eq-body"><svg/);
   assert.match(html, /Smith, J\., Doe, J\., (&amp;|&#38;) Lee, A\. \(2020\)/);
   const pdf = fs.readFileSync(path.join(OUT, files.find((f) => f.endsWith('.pdf'))));

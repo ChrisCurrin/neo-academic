@@ -152,20 +152,44 @@ test('figure layout: placement, both columns, wrapped text and panels, as LaTeX 
   assert.match(tex, /\\begin\{figure\}\[H\]\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-a\.png\}/);
   assert.match(tex, /\\begin\{figure\*\}\[tp\][\s\S]*?\\end\{figure\*\}/, 'a figure across both columns takes no [H]');
   assert.match(tex, /\\begin\{wrapfigure\}\{r\}\{0\.33\\linewidth\}\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-c\.png\}/);
-  assert.match(tex, /\\begin\{subfigure\}\[t\]\{0\.48\\linewidth\}\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-d\.png\}\n\\caption\{Before\}\n\\label\{fig:p4-a\}\n\\end\{subfigure\}\\hfill\n\\begin\{subfigure\}/);
-  assert.match(tex, /\\caption\{After\}\n\\label\{fig:p4-b\}\n\\end\{subfigure\}\n\\caption\{Both\}/);
+  assert.match(tex, /\\begin\{subfigure\}\[t\]\{0\.485\\linewidth\}\n\\centering\n\\includegraphics\[width=\\linewidth\]\{figures\/figure-d\.png\}\n\\caption\{Before\}\n\\label\{fig:p4-a\}\n\\end\{subfigure\}\\hspace\{0\.030\\linewidth\}\n\\begin\{subfigure\}/);
+  assert.match(tex, /\\caption\{After\}\n\\label\{fig:p4-b\}\n\\end\{subfigure\}%\n\\caption\{Both\}/);
   assert.match(tex, /\\begin\{table\*\}\[t\][\s\S]*?\\end\{table\*\}/);
   assert.deepEqual(files.filter((f) => f.path.startsWith('figures/')).map((f) => f.path),
     ['figures/figure-a.png', 'figures/figure-b.png', 'figures/figure-c.png', 'figures/figure-d.png', 'figures/figure-e.png']);
   const md = X.pandoc(m).find((f) => f.path === 'paper.md').content;
   assert.match(md, /\{#fig:p1 fig-pos="H"\}/);
-  assert.match(md, /<div id="fig:p4">\n!\[Before\]\(figures\/figure-d\.png\)\{#fig:p4-a width=49%\}\n!\[After\]\(figures\/figure-e\.png\)\{#fig:p4-b width=49%\}\n\nBoth\n<\/div>/);
+  assert.match(md, /<div id="fig:p4">\n!\[Before\]\(figures\/figure-d\.png\)\{#fig:p4-a width=48%\}\n!\[After\]\(figures\/figure-e\.png\)\{#fig:p4-b width=48%\}\n\nBoth\n<\/div>/);
   const html = X.html(m);
   assert.match(html, /<figure id="fig-p3" class="wrap-right" style="--w:33%">/);
-  assert.match(html, /<figure id="fig-p4" class="multi" style="--w:100%"><div class="panels"><div class="panel" id="fig-p4-a"><img[^>]+><div class="subcap"><b>\(a\)<\/b> Before<\/div>/);
+  assert.match(html, /<figure id="fig-p4" class="multi" style="--w:100%"><div class="panels" style="[^"]*"><div class="panel" id="fig-p4-a" style="flex:0 0 48\.40%"><img[^>]+><div class="subcap"><b>\(a\)<\/b> Before<\/div>/);
   assert.match(html, /<figure class="table span" id="tab-t1">/);
   const doc = X.docx(m).find((f) => f.path === 'word/document.xml').content;
   assert.match(doc, /Figure 4\. <\/w:t><\/w:r><w:bookmarkEnd w:id="\d+"\/><w:r><w:t xml:space="preserve">Both<\/w:t><\/w:r><w:r><w:t xml:space="preserve"> <\/w:t><\/w:r><w:bookmarkStart w:id="\d+" w:name="_fig_p4_a"\/><w:r><w:rPr><w:b\/><\/w:rPr><w:t xml:space="preserve">\(a\) <\/w:t>/, 'panel (a) can be linked to');
+});
+
+test('panels in rows: so many to a row, a panel two columns wide, the same in every format', () => {
+  const m = model();
+  const pic = (name, more) => ({ name, mime: 'image/png', base64: 'AAAA', w: 100, h: 50, ...more });
+  // (a) across the first row, (b) and (c) under it; two columns to a row
+  m.blocks = [{ type: 'figure', id: 'fig-g', num: '1', cols: 2, caption: [T('Grid')], ...pic('figure-a.png'),
+    panels: [pic('figure-a.png', { colspan: 2, sub: [T('Wide')] }), pic('figure-b.png', { sub: [T('Left')] }), pic('figure-c.png', { sub: [T('Right')] })] }];
+  const { rows, units } = X.panelRows(m.blocks[0]);
+  assert.equal(units, 2);
+  assert.deepEqual(rows.map((r) => r.map((x) => x.i)), [[0], [1, 2]]);
+  assert.equal(rows[0][0].share, 1, 'a panel as wide as the row is the whole figure');
+  assert.ok(Math.abs(rows[1][0].share - 0.485) < 1e-9);
+  // three to a row when unset: all in one row; a span past the row starts the next
+  assert.deepEqual(X.panelRows({ panels: [pic('a'), pic('b'), pic('c')] }).rows.map((r) => r.length), [3]);
+  assert.deepEqual(X.panelRows({ cols: 2, panels: [pic('a'), pic('b', { colspan: 2 }), pic('c')] }).rows.map((r) => r.map((x) => x.i)), [[0], [1], [2]]);
+  const tex = X.latex(m).find((f) => f.path === 'paper.tex').content;
+  assert.match(tex, /\\begin\{subfigure\}\[t\]\{1\.000\\linewidth\}[\s\S]*?\\label\{fig:g-a\}\n\\end\{subfigure\}%\n\n\\medskip\n\\begin\{subfigure\}\[t\]\{0\.485\\linewidth\}/, 'a row, then the next');
+  const md = X.pandoc(m).find((f) => f.path === 'paper.md').content;
+  assert.match(md, /\{#fig:g-a width=100%\}\n\n!\[Left\]\(figures\/figure-b\.png\)\{#fig:g-b width=48%\}\n!\[Right\]/, 'a paragraph to a row');
+  const html = X.html(m);
+  assert.match(html, /<div class="panel" id="fig-g-a" style="flex:0 0 99\.90%">[\s\S]*<div class="panel" id="fig-g-b" style="flex:0 0 48\.40%">/);
+  const doc = X.docx(m).find((f) => f.path === 'word/document.xml').content;
+  assert.equal((doc.match(/<w:pStyle w:val="Figure"\/>/g) || []).length, 2, 'a paragraph of pictures to a row');
 });
 
 // every XML part well-formed, by xmllint (macOS and most Linux have it)
@@ -251,4 +275,213 @@ test('back matter (Acknowledgements, Data availability…) is unnumbered in ever
   assert.match(X.html(m), /<h2 id="sec-back1">Acknowledgements<\/h2>/);
   assert.match(X.docx(m).find((f) => f.path === 'word/document.xml').content, /w:name="_sec_back1"\/><w:r><w:t xml:space="preserve">Acknowledgements<\/w:t>/);
   assert.match(X.text(m), /\nAcknowledgements\n=+\n/);
+});
+
+// lists, a paper's own symbols, Unicode symbols in the text and the table of symbols
+const symbolModel = () => {
+  const m = model();
+  m.symbols = [{ id: 'Vm', tex: 'V_\\mathrm{m}' }, { id: 'tauE', tex: '\\tau_\\mathrm{E}' }];
+  const smith = { cite: [{ id: 'smith2020' }], narrative: false, html: '(Smith, 2020)' };
+  m.blocks = [
+    { type: 'heading', level: 1, num: '1', id: 'sec-ab12', runs: [T('Methods')] },
+    { type: 'para', runs: [T('The potential '), { sym: 'Vm', math: 'V_\\mathrm{m}', svg: '<svg class="vm"/>', mml: '<math><msub><mi>V</mi><mi mathvariant="normal">m</mi></msub></math>' }, T(' rose by 5 μV ≤ 10° in 3 ms.')] },
+    { type: 'item', list: 'ul', level: 1, runs: [T('first')] },
+    { type: 'item', list: 'ul', level: 2, runs: [T('nested')] },
+    { type: 'item', list: 'ul', level: 1, runs: [T('second')] },
+    { type: 'item', list: 'ol', level: 1, runs: [T('one')] },
+    { type: 'item', list: 'ol', level: 1, runs: [T('two')] },
+    { type: 'para', runs: [T('After.')] },
+    { type: 'symbols', kind: '', rows: [
+      { id: 'Vm', tex: 'V_\\mathrm{m}', meaning: 'membrane potential', unit: 'mV', value: '−65', kind: 'variable', svg: '<svg class="vm"/>', cite: smith },
+      { id: 'tauE', tex: '\\tau_\\mathrm{E}', meaning: 'excitatory time constant', unit: 'ms', value: '', kind: 'parameter', cite: null }
+    ] },
+    { type: 'item', list: 'ol', level: 1, runs: [T('again')] }
+  ];
+  return m;
+};
+
+test('lists and symbols in LaTeX: \\Vm defined once, lists nested, μ set, the table of symbols', () => {
+  const tex = X.latex(symbolModel()).find((f) => f.path === 'paper.tex').content;
+  assert.match(tex, /\\DeclareRobustCommand\{\\Vm\}\{\\ensuremath\{V_\\mathrm\{m\}\}\}\n\\DeclareRobustCommand\{\\tauE\}\{\\ensuremath\{\\tau_\\mathrm\{E\}\}\}\n[\s\S]*\\begin\{document\}/);
+  assert.match(tex, /The potential \\Vm\{\} rose by 5 \\ensuremath\{\\mu\}V \\ensuremath\{\\leq\} 10\\textdegree\{\} in 3 ms\./);
+  assert.match(tex, /\\begin\{itemize\}\n {2}\\item first\n {2}\\begin\{itemize\}\n {4}\\item nested\n {2}\\end\{itemize\}\n {2}\\item second\n\\end\{itemize\}\n\\begin\{enumerate\}\n {2}\\item one\n {2}\\item two\n\\end\{enumerate\}\nAfter\./);
+  assert.match(tex, /\\usepackage\{tabularx\}/);
+  assert.match(tex, /\\begin\{tabularx\}\{\\linewidth\}\{@\{\}l>\{\\raggedright\\arraybackslash\}Xll>\{\\raggedright\\arraybackslash\}X@\{\}\}\n\\toprule\nSymbol & Meaning & Value & Unit & Source \\\\\n\\midrule\n\\Vm\{\} & membrane potential & \\ensuremath\{-\}65 & mV & \\citep\{smith2020\} \\\\\n\\tauE\{\} & excitatory time constant & {2}& ms & {2}\\\\\n\\bottomrule\n\\end\{tabularx\}/);
+  assert.match(tex, /\\begin\{enumerate\}\n {2}\\item again\n\\end\{enumerate\}\n\n\\bibliographystyle/, 'a list at the end is closed');
+  // no value, unit or source: no column for it
+  const m = symbolModel();
+  m.blocks[8].rows = m.blocks[8].rows.map((r) => ({ ...r, value: '', unit: '', cite: null }));
+  assert.match(X.latex(m).find((f) => f.path === 'paper.tex').content, /\{@\{\}l>\{\\raggedright\\arraybackslash\}X@\{\}\}\n\\toprule\nSymbol & Meaning \\\\/);
+});
+
+test('lists and symbols in Pandoc Markdown, HTML and plain text', () => {
+  const md = X.pandoc(symbolModel()).find((f) => f.path === 'paper.md').content;
+  assert.match(md, /The potential \$V_\\mathrm\{m\}\$ rose by 5 μV ≤ 10° in 3 ms\./);
+  assert.match(md, /\n\n- first\n {4}- nested\n- second\n\n1\. one\n1\. two\n\nAfter\.\n\n/);
+  assert.match(md, /\| Symbol \| Meaning \| Value \| Unit \| Source \|\n\| --- \| --- \| --- \| --- \| --- \|\n\| \$V_\\mathrm\{m\}\$ \| membrane potential \| −65 \| mV \| \[@smith2020\] \|\n\| \$\\tau_\\mathrm\{E\}\$ \| excitatory time constant \| {2}\| ms \| {2}\|/);
+  const html = X.html(symbolModel());
+  assert.match(html, /The potential <span class="math"><svg class="vm"\/><\/span> rose/);
+  assert.match(html, /<ul><li>first\n<ul><li>nested\n<\/li><\/ul><\/li><li>second\n<\/li><\/ul><ol><li>one\n<\/li><li>two\n<\/li><\/ol>\n<p>After\.<\/p>/, 'the nested list inside its item');
+  assert.match(html, /<table class="symbols"><thead><tr><th>Symbol<\/th><th>Meaning<\/th><th>Value<\/th><th>Unit<\/th><th>Source<\/th><\/tr><\/thead><tbody><tr><td><span class="math"><svg class="vm"\/><\/span><\/td><td>membrane potential<\/td><td>−65<\/td><td>mV<\/td><td><span class="cite"><a href="#ref-smith2020">\(Smith, 2020\)<\/a><\/span><\/td><\/tr>/);
+  assert.match(html, /<ol><li>again\n<\/li><\/ol>/);
+  const s = X.text(symbolModel());
+  assert.match(s, /\n• first\n {2}• nested\n• second\n\n1\. one\n2\. two\n\nAfter\.\n/);
+  assert.match(s, /Symbol {13}Meaning {19}Value {2}Unit {2}Source\n-{17} {2}-{24} {2}-{5} {2}-{4} {2}-{13}\n\$V_\\mathrm\{m\}\$ {5}membrane potential {8}−65 {4}mV {4}\(Smith, 2020\)\n/);
+  assert.match(s, /\n1\. again\n/, 'a new list counts from 1');
+});
+
+test('lists and symbols in Word: real lists, each numbered one from 1, the table of symbols, well-formed', () => {
+  const files = X.docx(symbolModel());
+  const doc = files.find((f) => f.path === 'word/document.xml').content;
+  const item = (lvl, num, text) => new RegExp(`<w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="${lvl}"/><w:numId w:val="${num}"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">${text}</w:t>`);
+  assert.match(doc, item(0, 1, 'first'));
+  assert.match(doc, item(1, 2, 'nested'));
+  assert.match(doc, item(0, 1, 'second'));
+  assert.match(doc, item(0, 3, 'one'));
+  assert.match(doc, item(0, 3, 'two'));
+  assert.match(doc, item(0, 4, 'again'));
+  const numbering = files.find((f) => f.path === 'word/numbering.xml').content;
+  assert.match(numbering, /<w:abstractNum w:abstractNumId="0">.*<w:numFmt w:val="bullet"\/>/);
+  assert.match(numbering, /<w:abstractNum w:abstractNumId="1">.*<w:numFmt w:val="decimal"\/><w:lvlText w:val="%1\."\/>/);
+  assert.match(numbering, /<w:num w:numId="4"><w:abstractNumId w:val="1"\/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"\/>/);
+  assert.match(files.find((f) => f.path === 'word/_rels/document.xml.rels').content, /relationships\/numbering" Target="numbering\.xml"/);
+  assert.match(files.find((f) => f.path === '[Content_Types].xml').content, /PartName="\/word\/numbering\.xml" ContentType="application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.numbering\+xml"/);
+  assert.match(doc, /<m:oMath><m:sSub>/, 'the symbol in the text as a Word equation');
+  assert.match(doc, /<w:t xml:space="preserve">Symbol<\/w:t>.*<w:t xml:space="preserve">Source<\/w:t>.*<w:t xml:space="preserve">membrane potential<\/w:t>.*<w:t xml:space="preserve">−65<\/w:t>.*\(Smith, 2020\)/);
+  wellFormed(files);
+  assert.ok(!X.docx(model()).some((f) => f.path === 'word/numbering.xml'), 'no lists, no numbering part');
+  const ep = X.epub(symbolModel(), { uuid: 'urn:uuid:test', modified: '2026-01-01T00:00:00Z' });
+  assert.match(ep.find((f) => f.path === 'OEBPS/paper.xhtml').content, /<ul><li>first\n<ul><li>nested/);
+  wellFormed(ep);
+});
+
+// the LaTeX compiles, where there's a TeX to compile it with
+const tectonic = (() => { try { execFileSync('which', ['tectonic'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+test('lists and symbols: the LaTeX compiles', { skip: !tectonic && 'tectonic is not installed' }, () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'neo-symbols-'));
+  try {
+    const m = symbolModel();
+    m.blocks.push({ type: 'para', runs: [T(Object.values(require('../paper/symbols.js').TEX_CHARS).join(' ') + ' µ −')] });
+    for (const f of X.latex(m)) {
+      fs.mkdirSync(path.dirname(path.join(dir, f.path)), { recursive: true });
+      fs.writeFileSync(path.join(dir, f.path), f.base64 ? Buffer.from(f.content, 'base64') : f.content);
+    }
+    execFileSync('tectonic', ['-X', 'compile', 'paper.tex'], { cwd: dir, stdio: 'ignore' });
+    assert.ok(fs.existsSync(path.join(dir, 'paper.pdf')), 'paper.tex compiles');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// a talk: the abstract's moves as the story, a slide to a figure titled with its question
+const talkModel = () => {
+  const m = model();
+  const pic = (name, more) => ({ name, mime: 'image/png', base64: 'AAAA', w: 400, h: 200, ...more });
+  m.subtitle = 'A study';
+  m.moves = [
+    { move: 'status', text: 'Cortex balances excitation and inhibition.' },
+    { move: 'problem', text: 'Nobody knows how it holds under load.' },
+    { move: 'problem', text: 'Models assume it is fixed.' },
+    { move: 'solution', text: 'Tracking both at once would tell.' },
+    { move: 'did', text: 'We recorded 200 neurons in mouse V1.' },
+    { move: 'found', text: 'Inhibition tracks excitation within 5 ms.' },
+    { move: 'impact', text: 'Balance is dynamic, not set.' }
+  ];
+  m.blocks = [
+    { type: 'heading', level: 1, num: '1', id: 'sec-a1', runs: [T('Introduction')] },
+    { type: 'para', runs: [T('Words.')] },
+    { type: 'heading', level: 1, num: '2', id: 'sec-a2', runs: [T('Materials and methods')] },
+    { type: 'heading', level: 2, num: '2.1', id: 'sec-a3', runs: [T('Recordings')] },
+    { type: 'heading', level: 2, num: '2.2', id: 'sec-a4', runs: [T('A model of '), { math: 'V_m' }] },
+    { type: 'heading', level: 1, num: '3', id: 'sec-a5', runs: [T('Results')] },
+    { type: 'heading', level: 2, num: '3.1', id: 'sec-a6', runs: [T('Not a method')] },
+    { type: 'figure', id: 'fig-t1', num: '1', ...pic('figure-a.png'),
+      caption: [T('Rates rise with load, as in Fig. 2 of '), { cite: [{ id: 'smith2020' }], narrative: true, html: 'Smith (2020)' }, T('. Inhibition follows within 5 ms. Grey: '), { math: '\\pm 1\\sigma' }, T('.')],
+      panels: [pic('figure-a.png', { sub: [T('Before')] }), pic('figure-b.png', { sub: [T('After')] }), pic('figure-c.png', { sub: [T('Ratio')] })] },
+    { type: 'figure', id: 'fig-t2', num: '2', ...pic('figure-d.png'), caption: [T('Does inhibition track excitation? Yes, at every load.')] }
+  ];
+  return m;
+};
+const slideTitles = (md) => [...md.matchAll(/^## (.*)$/gm)].map((x) => x[1]);
+
+test('talk: front matter, the moves in order, a slide to a figure, notes, columns for panels, the figures and a README', () => {
+  const files = X.talk(talkModel(), { date: '2026-10-07' });
+  const md = files.find((f) => f.path === 'talk.md').content;
+  assert.match(md, /^---\ntitle: "Balance & control in 100% of cortex"\nsubtitle: "A study"\nauthor:\n {2}- "Ada Lovelace"\n {2}- "Charles Babbage"\ninstitute: "University of London; University of Cambridge"\ndate: "2026-10-07"\n---\n\n## Why it matters/);
+  assert.deepEqual(slideTitles(md), ['Why it matters', 'What we did', 'Figure 1: Rates rise with load, as in Fig. 2 of Smith (2020)', 'Does inhibition track excitation?', 'What we found', 'What it means', 'Thank you']);
+  assert.equal(md.split('\n\n---\n\n## ').length, 7, 'a rule before every slide but the first');
+  assert.match(md, /## Why it matters\n\nCortex balances excitation and inhibition\.\n\n- Nobody knows how it holds under load\.\n- Models assume it is fixed\.\n- Tracking both at once would tell\.\n\n::: notes\nNext: What we did\n:::/);
+  assert.match(md, /## What we did\n\nWe recorded 200 neurons in mouse V1\.\n\n- Recordings\n- A model of \$V_m\$\n\n/, 'the Methods sections, not the Results');
+  assert.doesNotMatch(md, /Not a method/);
+  assert.match(md, /::: notes\nAsk the question this figure answers, then show the answer: Inhibition follows within 5 ms\.\n\nGrey: \$\\pm 1\\sigma\$\.\n\nNext: Does inhibition track excitation\?\n:::/);
+  // the panels in two columns, read across; each panel's words above it
+  assert.match(md, /:::: columns\n::: \{\.column width="48%"\}\n\*\*\(a\)\*\* Before\n\n!\[\]\(figures\/figure-a\.png\)\{height=30%\}\n\n\*\*\(c\)\*\* Ratio\n\n!\[\]\(figures\/figure-c\.png\)\{height=30%\}\n:::\n::: \{\.column width="48%"\}\n\*\*\(b\)\*\* After\n\n!\[\]\(figures\/figure-b\.png\)\{height=30%\}\n:::\n::::/);
+  // a caption that asks its question is the title as it is
+  assert.match(md, /## Does inhibition track excitation\?\n\n!\[\]\(figures\/figure-d\.png\)\{height=70%\}\n\n::: notes\nYes, at every load\.\n\nNext: What we found\n:::/);
+  assert.match(md, /## What we found\n\n- Inhibition tracks excitation within 5 ms\./);
+  assert.match(md, /## What it means\n\n- Balance is dynamic, not set\./);
+  assert.match(md, /## Thank you\n\n\*Balance & control in 100% of cortex\*\n\nada\\@example\.org\n$/);
+  assert.doesNotMatch(md, /\[@/, 'citations as set: a talk has no reference list');
+  // Marp: the title as a slide, notes as comments, panels in rows
+  const marp = files.find((f) => f.path === 'talk-marp.md').content;
+  assert.match(marp, /^---\nmarp: true\npaginate: true\ntitle: "Balance & control in 100% of cortex"\nauthor: "Ada Lovelace, Charles Babbage"\n---\n\n# Balance & control in 100% of cortex\n\nA study\n\nAda Lovelace, Charles Babbage\n\nUniversity of London; University of Cambridge\n\n2026-10-07\n\n---\n\n## Why it matters/);
+  assert.deepEqual(slideTitles(marp), slideTitles(md));
+  assert.match(marp, /!\[w:320\]\(figures\/figure-a\.png\) !\[w:320\]\(figures\/figure-b\.png\)\n\n\*\*\(a\)\*\* Before · \*\*\(b\)\*\* After\n\n!\[w:320\]\(figures\/figure-c\.png\)/);
+  assert.match(marp, /<!--\nAsk the question this figure answers, then show the answer: Inhibition follows within 5 ms\./);
+  assert.doesNotMatch(marp, /:::/);
+  assert.deepEqual(files.filter((f) => f.path.startsWith('figures/')).map((f) => f.path), ['figures/figure-a.png', 'figures/figure-b.png', 'figures/figure-c.png', 'figures/figure-d.png']);
+  assert.ok(files.filter((f) => f.path.startsWith('figures/')).every((f) => f.base64));
+  assert.match(files.find((f) => f.path === 'README.txt').content, /pandoc talk\.md -o talk\.pptx[\s\S]*marp-cli talk-marp\.md/);
+});
+
+test('talk: a caption of one sentence, or none, still asks for its result', () => {
+  const m = talkModel();
+  m.blocks = [
+    { type: 'figure', id: 'fig-u1', num: '1', name: 'figure-u1.png', mime: 'image/png', base64: 'AAAA', caption: [T('Spikes per second.')] },
+    { type: 'figure', id: 'fig-u2', num: '2', name: 'figure-u2.png', mime: 'image/png', caption: [] }
+  ];
+  const md = X.talk(m, { date: 'today' }).find((f) => f.path === 'talk.md').content;
+  assert.match(md, /## Figure 1: Spikes per second\n\n!\[\]\(figures\/figure-u1\.png\)\{height=70%\}\n\n::: notes\nAsk the question this figure answers, then show the answer: its one main result\./);
+  assert.match(md, /## Figure 2\n\n::: notes\n/, 'no picture yet: no broken link');
+});
+
+test('talk without moves: the abstract opens, the paper\'s sections say what comes', () => {
+  const m = talkModel();
+  delete m.moves;
+  const md = X.talk(m, { date: 'today' }).find((f) => f.path === 'talk.md').content;
+  assert.deepEqual(slideTitles(md), ['In brief', 'Outline', 'What we did', 'Figure 1: Rates rise with load, as in Fig. 2 of Smith (2020)', 'Does inhibition track excitation?', 'Thank you']);
+  assert.match(md, /## In brief\n\nWe ask \$x_1\$\.\n/);
+  assert.match(md, /## Outline\n\n- Introduction\n- Materials and methods\n- Results\n/);
+  assert.match(md, /## What we did\n\n- Recordings\n- A model of \$V_m\$\n/);
+  // nothing to say about a part: no slide for it
+  const bare = X.talk({ ...model(), abstract: [], blocks: [], moves: [{ move: 'found', text: 'It works.' }] }, { date: 'today' }).find((f) => f.path === 'talk.md').content;
+  assert.deepEqual(slideTitles(bare), ['What we found', 'Thank you']);
+});
+
+// Pandoc makes the slides, where it's installed
+const pandocBin = (() => { try { execFileSync('which', ['pandoc'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+test('talk: Pandoc makes PowerPoint and Beamer slides of it', { skip: !pandocBin && 'pandoc is not installed' }, () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'neo-talk-'));
+  try {
+    // a real picture: a 1 × 1 PNG
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const m = talkModel();
+    for (const b of m.blocks.filter((x) => x.type === 'figure')) for (const p of [b, ...(b.panels || [])]) p.base64 = png;
+    for (const f of X.talk(m, { date: '2026-10-07' })) {
+      fs.mkdirSync(path.dirname(path.join(dir, f.path)), { recursive: true });
+      fs.writeFileSync(path.join(dir, f.path), f.base64 ? Buffer.from(f.content, 'base64') : f.content);
+    }
+    execFileSync('pandoc', ['talk.md', '-o', 'talk.pptx'], { cwd: dir, stdio: 'ignore' });
+    assert.ok(fs.statSync(path.join(dir, 'talk.pptx')).size > 0, 'talk.pptx');
+    const beamer = execFileSync('pandoc', ['talk.md', '-t', 'beamer'], { cwd: dir }).toString();
+    assert.equal((beamer.match(/\\begin\{frame\}/g) || []).length, 7, 'a frame a slide, and none for the rules between them');
+    assert.match(beamer, /\\begin\{columns\}/);
+    assert.match(beamer, /\\note\{/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

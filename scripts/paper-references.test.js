@@ -139,3 +139,35 @@ test('a CSL JSON id that is a number, or not a usable key, becomes a key', () =>
   assert.deepEqual(items.map((x) => x.id), ['1', 'ng2002two']);
   assert.ok(R.KEY.test('smith2020') && !R.KEY.test('a&b') && !R.KEY.test('x y'));
 });
+
+test('a linked file read again as it was updates nothing; only a real change counts', () => {
+  const lib = [{ id: 'old', type: 'book', title: 'Brains', author: [{ family: 'Doe', given: 'J' }], issued: { 'date-parts': [[2001]] } }];
+  // the same reference, its fields in another order, as a reference manager might write it
+  const again = { issued: { 'date-parts': [[2001]] }, author: [{ given: 'J', family: 'Doe' }], title: 'Brains', type: 'book', id: 'old' };
+  const same = R.mergeReferences(lib, [again], { keepKeys: true });
+  assert.deepEqual(same.updated, []);
+  assert.deepEqual(same.added, []);
+  assert.deepEqual(same.keys, ['old'], 'the key of what was matched is still given');
+  assert.deepEqual(same.items, lib);
+  const changed = R.mergeReferences(lib, [{ ...again, title: 'Brains, Revised' }], { keepKeys: true });
+  assert.deepEqual(changed.updated, ['old']);
+  assert.equal(changed.items[0].title, 'Brains, Revised');
+  const byWork = R.mergeReferences(lib, [{ type: 'book', title: 'Brains', issued: { 'date-parts': [[2001]] } }]);
+  assert.deepEqual([byWork.updated, byWork.keys], [[], ['old']], 'nothing new in it, matched by title and year');
+  const fresh = R.mergeReferences(lib, [{ type: 'book', title: 'New', author: [{ family: 'Lee' }], issued: { 'date-parts': [[2001]] } }]);
+  assert.deepEqual([fresh.added, fresh.keys], [['lee2001new'], ['lee2001new']]);
+});
+
+test('saving keeps what another device added since, and not what was deleted here', () => {
+  const ref = (id) => ({ id, type: 'book', title: 'Title ' + id, issued: { 'date-parts': [[2000]] } });
+  const saved = [ref('a'), ref('b'), ref('c')];
+  const mine = [ref('a'), ref('c'), ref('d')]; // b deleted here, d added here
+  const disk = [ref('a'), ref('b'), ref('c'), ref('e')]; // e added over there
+  assert.deepEqual(R.keepTheirs(saved, mine, disk).map((r) => r.id), ['a', 'c', 'd', 'e']);
+  assert.equal(R.keepTheirs(saved, mine, saved), mine, 'nothing new there: the list as it was');
+  assert.equal(R.keepTheirs(saved, mine, null), mine, 'a file that did not read as a list changes nothing');
+  assert.deepEqual(R.keepTheirs([], [], [ref(7), null]).map((r) => r.id), ['7']);
+  // the same work under another key there joins the one here, keeping this key
+  const there = { ...ref('x'), title: 'Title a' };
+  assert.deepEqual(R.keepTheirs(saved, mine, [...disk, there]).map((r) => r.id), ['a', 'c', 'd', 'e']);
+});

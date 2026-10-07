@@ -28,10 +28,14 @@
 
 'use strict';
 
-const PAPER_SEL = '.cite, .xref, .math, .eq, .fig, .tbl, .h1, .h2, .h3';
+const PAPER_SEL = '.cite, .xref, .math, .sym, .eq, .symtab, .fig, .tbl, .h1, .h2, .h3, .li';
+// the pieces in a line that the caret steps over whole
+const ATOMS = '.cite, .xref, .math, .sym';
 const paper = {
   refs: [],            // the paper's references (CSL JSON), as on disk
   refsSaved: '',       // what references.json held when last read or written
+  symbols: [],         // the paper's own notation (symbols.json): see Symbols
+  symbolsSaved: '[]',  // what symbols.json held when last read or written
   proc: null,          // the citeproc processor for the current style
   procStyle: null,     // …and which style it was built for
   styleXml: {},        // style XML by id ('custom' is the paper's style.csl)
@@ -49,7 +53,16 @@ const paperMeta = () => {
   return book.paper;
 };
 const paperId = (prefix) => prefix + '-' + Math.random().toString(36).slice(2, 10);
+// An id for something that came without one (a chapter written elsewhere),
+// from what it says and where it stands: every device that opens the paper
+// gives it the same one, so none of them saves a chapter the others didn't
+function paperIdFor(prefix, text, at) {
+  let h = 2166136261;
+  for (const c of prefix + '\u0000' + text + '\u0000' + at) h = Math.imul(h ^ c.codePointAt(0), 16777619);
+  return prefix + '-' + (h >>> 0).toString(36);
+}
 const paperBodies = () => [...document.querySelectorAll('#chapters .chapter-body')];
+const paperHeadings = () => [...document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3')];
 
 /* ------------------------------------------------------------------ */
 /*  The scripts a paper needs, fetched the first time one opens       */
@@ -96,7 +109,7 @@ const mathReady = () => !!(window.MathJax && window.MathJax.tex2svg);
 async function paperAsset(name) {
   if (window.neo.paperAsset) return window.neo.paperAsset(name);
   const res = await fetch('paper/csl/' + name);
-  if (!res.ok) throw new Error('Couldn’t read ' + name);
+  if (!res.ok) throw new Error(t('Couldn’t read {file}', { file: name }));
   return res.text();
 }
 
@@ -112,8 +125,16 @@ async function paperOpen() {
   paper.refs = await window.neo.readJSON(book.id, 'references', []);
   if (!Array.isArray(paper.refs)) paper.refs = [];
   paper.refsSaved = JSON.stringify(paper.refs);
+  paper.symbols = await window.neo.readJSON(book.id, 'symbols', []);
+  if (!Array.isArray(paper.symbols)) paper.symbols = [];
+  paper.symbolsSaved = JSON.stringify(paper.symbols);
   paper.proc = null;
   paper.procStyle = null;
+  editingOn = false;
+  skimOn = false;
+  editingLeft.clear();
+  CSS.highlights.delete('neo-edit');
+  CSS.highlights.delete('neo-skim');
   paper.citeText = new Map();
   paper.linkedStamp = null;
   paper.linkedPath = null;
@@ -183,19 +204,23 @@ function paperRendered() {
   for (const body of paperBodies()) {
     body.classList.add('paper-body', 'no-cap');
     // a heading's number, a figure's picture: put on at once, saved never
-    for (const p of body.querySelectorAll('p.h1, p.h2, p.h3, p.eq')) if (!p.dataset.id) p.dataset.id = paperId(p.classList.contains('eq') ? 'eq' : 'sec');
+    body.querySelectorAll('p.h1, p.h2, p.h3, p.eq').forEach((p, i) => {
+      if (!p.dataset.id) p.dataset.id = paperIdFor(p.classList.contains('eq') ? 'eq' : 'sec', p.textContent, i);
+    });
   }
   for (const body of paperBodies()) body.addEventListener('input', paperHintsSoon);
   paperHydrate();
   paperRenumber();
-  paperCiteSoon(0);
+  // each symbol as its definition now says (another device may have changed one)
+  paperSymbolsShown();
 }
 
 // What the page keeps only on screen (from captureBody)
 function paperStrip(html) {
   return html.replace(/ (?:data-num|data-missing|data-state|data-hint)="[^"]*"/g, '').replace(/ src="blob:[^"]*"/g, '')
-    // maths being written is saved as maths
-    .replace(/ class="(math|eq) editing" contenteditable="true"( spellcheck="false")?/g, ' class="$1" contenteditable="false"');
+    // maths being written is saved as maths, without the place its caret holds
+    .replace(/<(span|p) class="(math|eq)(?: editing)?"([^>]*)>([^<]*)/g, (_, tag, kind, attrs, tex) =>
+      `<${tag} class="${kind}"${attrs.replace(' contenteditable="true"', ' contenteditable="false"').replace(' spellcheck="false"', '')}>${tex.replace(/\u200B/g, '')}`);
 }
 
 // Everything a paper adds to the page gets its drawing, wherever it came
@@ -218,7 +243,8 @@ paperWatch.observe($('#chapters'), { childList: true, subtree: true });
 
 function paperHydrate(root = $('#chapters')) {
   if (!book || !isPaper()) return;
-  for (const n of root.querySelectorAll('.math, .eq')) drawMath(n);
+  for (const n of root.querySelectorAll('.math, .eq, .sym')) drawMath(n);
+  for (const n of root.querySelectorAll('p.symtab')) drawSymbolTable(n);
   for (const f of root.querySelectorAll('figure.fig')) loadFigure(f);
   for (const c of root.querySelectorAll('.fig figcaption, .tbl figcaption, .tbl th, .tbl td')) {
     if (c.getAttribute('contenteditable') !== 'true') c.setAttribute('contenteditable', 'true');
@@ -290,10 +316,15 @@ function paperTitlePage(on) {
   abs.addEventListener('keydown', (e) => {
     const editing = mathCaretIn();
     if (editing) { mathEditKey(e, editing); return; }
+    if (paperStepIn(e, abs)) return;
+    if (paperSymbolKey(e, abs)) return;
     paperMathKey(e, abs);
   });
-  abs.addEventListener('click', (e) => { const n = e.target.closest('.math'); if (n) editMath(n); });
-  for (const n of abs.querySelectorAll('.math')) drawMath(n);
+  abs.addEventListener('click', (e) => {
+    const n = e.target.closest('.math, .sym');
+    if (n && n.matches('.sym')) symbolMenu(e, n); else if (n) editMath(n);
+  });
+  for (const n of abs.querySelectorAll('.math, .sym')) drawMath(n);
 
   const kw = document.createElement('div');
   kw.id = 'tp-keywords';
@@ -402,7 +433,8 @@ function paperClean(html) {
     if (n.nodeType === 3) return escHtml(n.data);
     if (n.nodeType !== 1) return '';
     const tag = n.tagName.toLowerCase();
-    if (n.classList.contains('math')) return `<span class="math" contenteditable="false">${escHtml(n.textContent)}</span>`;
+    if (n.classList.contains('math')) return `<span class="math" contenteditable="false">${escHtml(texOf(n))}</span>`;
+    if (n.classList.contains('sym') && /^[A-Za-z]+$/.test(n.dataset.sym || '')) return `<span class="sym" contenteditable="false" data-sym="${n.dataset.sym}">${escHtml(n.textContent)}</span>`;
     if (['i', 'em'].includes(tag)) return `<i>${out(n)}</i>`;
     if (['b', 'strong'].includes(tag)) return `<b>${out(n)}</b>`;
     if (['sub', 'sup'].includes(tag)) return `<${tag}>${out(n)}</${tag}>`;
@@ -428,6 +460,9 @@ function paperShowAuthors() {
   const affils = paperAffiliations(authors);
   el.innerHTML = '';
   el.classList.toggle('empty', !authors.length);
+  // anonymous for review: still here, said to be left out of what's sent
+  el.classList.toggle('anon', !!paperMeta().anonymous);
+  if (paperMeta().anonymous) el.dataset.anon = t('Anonymous for review: left out of previews and exports'); else delete el.dataset.anon;
   if (!authors.length) {
     el.textContent = t('Add authors');
   } else {
@@ -648,6 +683,8 @@ function paperRenumberSoon() {
 function paperRenumber() {
   if (!book || !isPaper()) return;
   const numbered = paperMeta().numbered !== false;
+  // in the journal's words, never the interface's: they're saved in the chapter
+  const label = (kind, num) => NeoJournals.refLabel(paperJournal(), kind, num);
   const counts = [0, 0, 0];
   const n = { fig: 0, tbl: 0, eq: 0 };
   const targets = new Map();
@@ -665,7 +702,7 @@ function paperRenumber() {
       for (let k = level + 1; k < 3; k++) counts[k] = 0;
       const num = counts.slice(0, level + 1).map((c) => c || 1).join('.');
       if (numbered) set(el, num); else if (el.dataset.num) delete el.dataset.num;
-      targets.set(el.dataset.id, { kind: 'sec', num, label: numbered ? t('Section {n}', { n: num }) : '“' + el.textContent.trim() + '”', el });
+      targets.set(el.dataset.id, { kind: 'sec', num, label: numbered ? label('sec', num) : '“' + el.textContent.trim() + '”', el });
       continue;
     }
     const kind = el.classList.contains('fig') ? 'fig' : el.classList.contains('tbl') ? 'tbl' : 'eq';
@@ -673,17 +710,17 @@ function paperRenumber() {
     set(el, num);
     const cap = el.querySelector('figcaption');
     if (cap) set(cap, num);
-    const label = kind === 'fig' ? t('Figure {n}', { n: num }) : kind === 'tbl' ? t('Table {n}', { n: num }) : t('Equation ({n})', { n: num });
-    targets.set(el.dataset.id, { kind, num, label, el });
+    targets.set(el.dataset.id, { kind, num, label: label(kind, num), el });
     // each panel can be referred to on its own: Figure 2b
     if (kind === 'fig') {
       el.querySelectorAll(':scope > .panel').forEach((panel, i) => {
         const pn = num + String.fromCharCode(97 + i);
-        targets.set(el.dataset.id + '-' + String.fromCharCode(97 + i), { kind: 'fig', num: pn, label: t('Figure {n}', { n: pn }), el: panel });
+        targets.set(el.dataset.id + '-' + String.fromCharCode(97 + i), { kind: 'fig', num: pn, label: label('fig', pn), el: panel });
       });
     }
   }
   paper.targets = targets;
+  paperListNumbers();
   paperHints();
   for (const x of document.querySelectorAll('#chapters .xref')) {
     const tgt = targets.get(x.dataset.ref);
@@ -704,7 +741,7 @@ const SECTION_NAMES = [
   ['results', /result|finding|experiment|evaluation/i], ['conclusions', /discuss|conclu|summary|outlook|implication/i]
 ];
 function paperHints() {
-  const heads = [...document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3')];
+  const heads = paperHeadings();
   const keep = new Set();
   heads.forEach((h) => {
     let first = null;
@@ -764,7 +801,7 @@ function paperTargets() {
   paperRenumber();
   return [...(paper.targets || new Map()).entries()].map(([id, x]) => {
     const cap = x.el.querySelector && x.el.querySelector(':scope > figcaption, :scope > .subcap');
-    const text = x.kind === 'sec' ? x.el.textContent.trim() : x.kind === 'eq' ? x.el.textContent.trim() : (cap ? cap.textContent.trim() : '');
+    const text = x.kind === 'sec' ? x.el.textContent.trim() : x.kind === 'eq' ? texOf(x.el).trim() : (cap ? cap.textContent.trim() : '');
     return { id, kind: x.kind, label: x.kind === 'sec' ? t('Section {n}', { n: x.num }) : x.label, text };
   });
 }
@@ -779,17 +816,24 @@ function paperKey(e, body, chId) {
   const editingMath = mathCaretIn();
   if (editingMath) return mathEditKey(e, editingMath);
   if (pickerKey(e)) return true;
+  if (paperMenuKey(e)) return true;
+  paperSelectionTakes(e, body);
+  if (paperSymbolKey(e, body)) return true;
+  if (paperListKey(e, body, chId)) return true;
+  if (paperStepIn(e, body)) return true;
   const inIsland = e.target !== body && e.target.closest && e.target.closest('figure');
   if (inIsland) return figureKey(e, body, chId);
   const cmd = e.metaKey || e.ctrlKey;
-  // ⌥⌘1–3, ⌥⌘0 (the menu has them too; this works where a menu can't reach)
-  if (cmd && e.altKey && !e.shiftKey && /^Digit[0-3]$/.test(e.code || '')) {
+  // ⌥⌘1–3, ⌥⌘0 (the menu has them too; this works where a menu can't reach).
+  // Not AltGr, which arrives as Ctrl+Alt and types }, ² and ³ on many layouts
+  if (cmd && e.altKey && !e.shiftKey && !altGraph(e) && /^Digit[0-3]$/.test(e.code || '')) {
     e.preventDefault();
     paperSetHeading(['', 'h1', 'h2', 'h3'][+e.code.slice(5)], body);
     return true;
   }
   // @ and $ typed with ⌥ (a German or Swedish Mac) or AltGr (Windows) are typing
   if (typedChar(e) && e.key === '@') return pickerOpenOnAt(e, body);
+  if (typedChar(e) && e.key === '/' && pickerOpenOnSlash(e, body)) return true;
   if (paperMathKey(e, body)) return true;
   if (cmd || e.altKey) return false;
   if (e.key === 'Enter' && !e.shiftKey) return paperEnter(e, body, chId);
@@ -809,8 +853,9 @@ function paperEnter(e, body, chId) {
   enterRun = 0;
   if (!sel.isCollapsed) document.execCommand('delete');
   const text = block.textContent.trim();
-  const display = /^\$\$([\s\S]*?)(?:\$\$)?$/.exec(text);
-  if (display && !headingOf(block)) {
+  // the line is $$, its TeX, and $$ (or nothing) after: nothing else
+  const display = /^\$\$((?:(?!\$\$)[\s\S])*)(?:\$\$)?$/.exec(text);
+  if (display && !headingOf(block) && !block.querySelector(ATOMS)) {
     snapshotStructure('equation');
     const eq = makeDisplayEq(display[1].trim());
     block.replaceWith(eq);
@@ -839,7 +884,7 @@ function paperEnter(e, body, chId) {
       return true;
     }
   }
-  if (block.querySelector('span:not(.ph-mark):not(.cite):not(.xref):not(.math)')) {
+  if (block.querySelector(JUNK_SPAN)) {
     const caret = captureCaret();
     stripJunkSpans(block);
     restoreCaret(caret);
@@ -856,6 +901,94 @@ function paperEnter(e, body, chId) {
   syncChapter(body, chId);
   revealCaret();
   return true;
+}
+
+// Lists: each item a paragraph, <p class="li" data-list="ul|ol">, nested
+// by data-level (2, 3; none is 1), the way headings are paragraphs too.
+// "- " or "* " at the start of a line starts a bulleted list, "1. " a
+// numbered one; Enter makes the next item, and on an empty item ends the
+// list; Tab and ⇧Tab nest and un-nest; Backspace at an item's start
+// un-nests it, then makes it a paragraph again. Numbers are drawn, never saved.
+const listLevel = (p) => +(p.dataset.level || 1);
+function setListItem(p, list, level) {
+  if (!list || level < 1) {
+    p.classList.remove('li');
+    if (!p.getAttribute('class')) p.removeAttribute('class');
+    delete p.dataset.list;
+    delete p.dataset.level;
+    delete p.dataset.num;
+    return;
+  }
+  p.classList.add('li');
+  p.dataset.list = list;
+  if (level > 1) p.dataset.level = String(level); else delete p.dataset.level;
+}
+function paperListKey(e, body, chId) {
+  const block = caretBlock(body);
+  if (!block || !block.matches('p') || block.closest('figure')) return false;
+  const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  const pre = document.createRange();
+  pre.selectNodeContents(block);
+  pre.setEnd(r.startContainer, r.startOffset);
+  const before = pre.toString();
+  const change = (fn) => {
+    e.preventDefault();
+    snapshotStructure('list');
+    const caret = captureCaret();
+    fn();
+    restoreCaret(caret);
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    paperRenumber();
+    return true;
+  };
+  // "- ", "* " or "1. " at the start of a paragraph: a list
+  if (e.key === ' ' && plain && !e.shiftKey && !block.classList.contains('li') && !headingOf(block) && !block.matches('.eq, .symtab')) {
+    const list = /^[-*•]$/.test(before) ? 'ul' : /^\d{1,3}[.)]$/.test(before) ? 'ol' : '';
+    if (!list) return false;
+    e.preventDefault();
+    selectChars(block, 0, before.length);
+    document.execCommand('delete');
+    return change(() => setListItem(block, list, 1));
+  }
+  if (!block.classList.contains('li')) return false;
+  const level = listLevel(block);
+  const list = block.dataset.list;
+  const empty = !block.textContent.trim() && !block.querySelector(ATOMS);
+  // Tab: a level in (no deeper than one past the item above); ⇧Tab: a level out
+  if (e.key === 'Tab' && plain) {
+    if (e.shiftKey) return change(() => setListItem(block, level > 1 ? list : '', level - 1));
+    const prev = block.previousElementSibling;
+    const most = prev && prev.classList.contains('li') ? Math.min(3, listLevel(prev) + 1) : 1;
+    if (level >= most) { e.preventDefault(); return true; }
+    return change(() => setListItem(block, list, level + 1));
+  }
+  // Enter on an empty item, or Backspace at an item's start: a level out, then out of the list
+  if ((e.key === 'Enter' && plain && !e.shiftKey && empty) || (e.key === 'Backspace' && plain && !e.shiftKey && !before.length)) {
+    return change(() => setListItem(block, level > 1 ? list : '', level - 1));
+  }
+  return false;
+}
+// the numbers of numbered items, counted through each list and its levels
+function paperListNumbers() {
+  for (const body of paperBodies()) {
+    let counts = [0, 0, 0];
+    let lists = ['', '', ''];
+    for (const el of body.children) {
+      if (!el.matches('p.li')) { counts = [0, 0, 0]; lists = ['', '', '']; continue; }
+      const k = Math.min(3, listLevel(el)) - 1;
+      for (let d = k + 1; d < 3; d++) { counts[d] = 0; lists[d] = ''; }
+      // a list of the other kind at this level starts again
+      if (lists[k] !== el.dataset.list) { counts[k] = 0; lists[k] = el.dataset.list; }
+      counts[k]++;
+      const num = el.dataset.list === 'ol' ? String(counts[k]) : '';
+      if ((el.dataset.num || '') !== num) { if (num) el.dataset.num = num; else delete el.dataset.num; }
+    }
+  }
 }
 
 // "# " at the start of a line makes a section heading; ## and ### the levels below
@@ -881,7 +1014,8 @@ function paperHashHeading(e, body) {
 // italic. Not money: "$5 and $10" stays as typed, and so does a $ after a
 // space. ⌘Z right after brings back the dollar signs.
 const MATH_INLINE = /(^|[^\\$\p{L}\p{N}])\$([^\s$](?:[^$]*?[^\s$\\])?)$/u;
-const typedChar = (e) => !e.metaKey && (!e.ctrlKey || (e.getModifierState && e.getModifierState('AltGraph')));
+const altGraph = (e) => !!(e.getModifierState && e.getModifierState('AltGraph'));
+const typedChar = (e) => !e.metaKey && (!e.ctrlKey || altGraph(e));
 function paperMathKey(e, field) {
   if (e.key !== '$' || !typedChar(e) || (library && library.markdownOff)) return false;
   const sel = window.getSelection();
@@ -1026,7 +1160,7 @@ function drawMath(node) {
 function mathPreview(node) {
   const pv = node.shadowRoot && node.shadowRoot.querySelector('.pv');
   if (!pv) return;
-  const tex = node.textContent.trim();
+  const tex = texOf(node).trim();
   pv.innerHTML = '';
   pv.classList.remove('bad');
   if (!tex) return;
@@ -1042,7 +1176,9 @@ function autoGrow(ta) {
 // the drawing follows the TeX as it's typed
 document.addEventListener('input', () => {
   const n = mathCaretIn();
-  if (n) mathPreview(n);
+  if (!n) return;
+  mathHold(n);
+  mathPreview(n);
 }, true);
 // the maths being written, when the caret is in it
 function mathCaretIn() {
@@ -1068,18 +1204,50 @@ const eqNumberWatch = new MutationObserver((records) => {
 });
 eqNumberWatch.observe($('#chapters'), { attributes: true, attributeFilter: ['data-num'], subtree: true });
 
-// Maths is edited where it stands: a click turns it into its TeX, right
-// there in the line (an equation shows its TeX over a live drawing of it),
-// and Enter, Esc, or arrowing out of it turns it back. While it's written
-// the light DOM is the TeX itself, shown through a slot; paperStrip keeps
-// the editing state out of the saved chapter.
+// Maths is edited where it stands: a click, or arrowing into it, turns it
+// into its TeX, right there in the line (an equation shows its TeX over a
+// live drawing of it), and Enter, Esc, or arrowing out of it turns it back.
+// While it's written the light DOM is the TeX itself, shown through a slot;
+// paperStrip keeps the editing state out of the saved chapter.
 let mathEditing = null; // { node, was }
+// The TeX stands behind a zero-width space while it's written. Empty TeX
+// has no text for the caret to stand in (what's typed there goes nowhere),
+// and TeX selected whole is the span to the engine, which types over the
+// span and leaves plain words in the line. The space is never saved.
+const MATH_HOLD = '\u200B';
+function texOf(node) { return node.textContent.replace(/\u200B/g, ''); }
+// a place-holder at the start of the TeX's text, and its text in one piece
+function mathHold(node) {
+  const text = node.firstChild;
+  if (node.childNodes.length !== 1 || text.nodeType !== 3) {
+    node.textContent = MATH_HOLD + texOf(node);
+    placeCaret(node.firstChild, node.firstChild.length);
+  } else if (!text.data.startsWith(MATH_HOLD)) text.insertData(0, MATH_HOLD);
+}
+// the caret at a place in the TeX, counted without place-holders
+function texCaret(node, at, to = at) {
+  const text = node.firstChild;
+  const offset = (n) => {
+    let i = 0;
+    for (let k = 0; i < text.length; i++) {
+      if (text.data[i] === MATH_HOLD) continue;
+      if (k++ === n) break;
+    }
+    return i;
+  };
+  const r = document.createRange();
+  r.setStart(text, offset(at));
+  r.setEnd(text, offset(to));
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
 function editMath(node, { caret = 'end' } = {}) {
   if (mathEditing && mathEditing.node === node) return;
   finishMath(true);
   const body = node.closest('.chapter-body');
   if (body) snapshotStructure('maths'); // ⌘Z after: the maths as it was
-  mathEditing = { node, was: node.textContent };
+  mathEditing = { node, was: texOf(node) };
   node.classList.add('editing');
   node.contentEditable = 'true';
   node.spellcheck = false;
@@ -1087,107 +1255,323 @@ function editMath(node, { caret = 'end' } = {}) {
   node.focus({ preventScroll: true });
   // the caret in the TeX's own text: at an element boundary the engine
   // would settle it outside the span
-  node.normalize();
-  if (!node.firstChild) node.appendChild(document.createTextNode(''));
-  const text = node.firstChild;
-  const r = document.createRange();
-  if (caret === 'all') { r.setStart(text, 0); r.setEnd(text, text.length); }
-  else r.setStart(text, caret === 'start' ? 0 : text.length);
-  if (caret !== 'all') r.collapse(true);
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(r);
+  node.textContent = MATH_HOLD + texOf(node);
+  const len = texOf(node).length;
+  texCaret(node, caret === 'end' ? len : 0, caret === 'start' ? 0 : len);
 }
 // keep: the TeX as typed; otherwise as it was. Emptied, the maths goes.
-function finishMath(keep, { step = 0 } = {}) {
+// step: the side it was left by (−1 before it, else after it). place:
+// false when the caret has already gone somewhere else, and stays there.
+function finishMath(keep, { step = 0, place = true } = {}) {
   if (!mathEditing) return;
   const { node, was } = mathEditing;
   mathEditing = null;
   if (!node.isConnected) return;
+  const s = window.getSelection();
+  const gone = !place && s.rangeCount ? s.getRangeAt(0).cloneRange() : null;
   const display = node.classList.contains('eq');
-  let tex = keep ? node.textContent : was;
+  let tex = keep ? texOf(node) : was;
   if (!display) tex = tex.replace(/\s*\n\s*/g, ' ');
   tex = tex.trim();
   node.classList.remove('editing');
   node.contentEditable = 'false';
+  node.removeAttribute('spellcheck');
   const body = node.closest('.chapter-body');
   const field = body || node.closest('#tp-abstract');
+  // where the caret lands: beside the maths, on the side it was left by;
+  // an equation's neighbours are the paragraphs around it
+  let r = document.createRange();
+  let into = null;
   if (!tex) {
-    const next = node.nextSibling;
-    const parent = node.parentNode;
+    r.setStartBefore(node);
     node.remove();
-    if (field) {
-      field.focus({ preventScroll: true });
-      const r = document.createRange();
-      if (next && next.isConnected) r.setStartBefore(next); else r.selectNodeContents(parent);
-      r.collapse(!!(next && next.isConnected));
-      const s = window.getSelection();
-      s.removeAllRanges();
-      s.addRange(r);
-    }
   } else {
     if (node.textContent !== tex) node.textContent = tex;
     drawMath(node);
-    if (field) {
-      field.focus({ preventScroll: true });
-      const r = document.createRange();
-      if (display && step >= 0) {
-        const after = node.nextElementSibling;
-        if (after && after.matches('p:not(.eq)')) r.setStart(after, 0); else r.setStartAfter(node);
-      } else if (step < 0) r.setStartBefore(node);
-      else r.setStartAfter(node);
-      r.collapse(true);
-      const s = window.getSelection();
-      s.removeAllRanges();
-      s.addRange(r);
-    }
+    const beside = step < 0 ? node.previousElementSibling : node.nextElementSibling;
+    if (display && place && step && beside && beside.matches('figure, p.eq')) {
+      // arrowed onto a figure or another equation: on into it, below
+      into = beside;
+      r = null;
+    } else if (display && place) {
+      let p = beside;
+      if (!p || !p.matches('p:not(.eq)')) {
+        p = document.createElement('p');
+        p.innerHTML = '<br>';
+        if (step < 0) node.before(p); else node.after(p);
+      }
+      r = step < 0 ? caretAtEnd(p) : caretAtStart(p);
+    } else if (step < 0) r.setStartBefore(node);
+    else r.setStartAfter(node);
   }
   if (body) {
     syncChapter(body, body.closest('.chapter').dataset.id);
     if (tex !== was) breakRun++; else undoStack.pop(); // nothing changed, nothing to take back
     body.contentEditable = 'false';
     body.contentEditable = 'true';
-    body.focus({ preventScroll: true });
-  } else if (field) field.dispatchEvent(new Event('input'));
+  }
+  // a click or a move that took the caret elsewhere keeps it there
+  if (gone && !node.contains(gone.startContainer)) r = field && field.contains(gone.startContainer) ? gone : null;
+  if (field && r) {
+    field.focus({ preventScroll: true });
+    s.removeAllRanges();
+    s.addRange(settleCaret(r));
+  }
+  if (!body && field) field.dispatchEvent(new Event('input'));
+  if (into && into.matches('figure')) enterFigure(into, step);
+  else if (into) { field.focus({ preventScroll: true }); editMath(into, { caret: step < 0 ? 'end' : 'start' }); }
   paperRenumberSoon();
+}
+// A caret between two elements, moved into the text beside it: the engine
+// keeps a caret in text where it puts it
+function settleCaret(r) {
+  const c = r.startContainer;
+  const o = r.startOffset;
+  if (c.nodeType === 1) {
+    const after = c.childNodes[o];
+    const before = c.childNodes[o - 1];
+    if (after && after.nodeType === 3) r.setStart(after, 0);
+    else if (before && before.nodeType === 3) r.setStart(before, before.length);
+  }
+  r.collapse(true);
+  return r;
+}
+function caretAtStart(p) {
+  const r = document.createRange();
+  r.setStart(p, 0);
+  return r;
+}
+function caretAtEnd(p) {
+  const r = document.createRange();
+  const last = p.lastChild;
+  if (!last || (last.nodeName === 'BR' && p.childNodes.length === 1)) r.setStart(p, 0);
+  else if (last.nodeType === 3) r.setStart(last, last.length);
+  else r.setStart(p, p.childNodes.length - (last.nodeName === 'BR' ? 1 : 0));
+  return r;
+}
+// Is the caret on the first (dir < 0) or last (dir > 0) line of what's in el?
+function caretOnEdgeLine(el, r, dir) {
+  const all = document.createRange();
+  all.selectNodeContents(el);
+  const lines = [...all.getClientRects()].filter((x) => x.height);
+  const c = [...r.getClientRects()].find((x) => x.height);
+  if (!lines.length || !c) {
+    // no box to measure (an empty line): is there anything on that side?
+    const side = document.createRange();
+    side.selectNodeContents(el);
+    if (dir < 0) side.setEnd(r.startContainer, r.startOffset); else side.setStart(r.startContainer, r.startOffset);
+    return !side.toString().replace(/\u200B/g, '').length;
+  }
+  return dir < 0 ? c.top - Math.min(...lines.map((x) => x.top)) < c.height / 2
+    : Math.max(...lines.map((x) => x.bottom)) - c.bottom < c.height / 2;
 }
 // keys while maths is being written
 function mathEditKey(e, node) {
   const display = node.classList.contains('eq');
+  const cmd = e.metaKey || e.ctrlKey;
   if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finishMath(false); return true; }
   if (e.key === 'Enter' && !(display && e.shiftKey)) { e.preventDefault(); finishMath(true); return true; }
-  if (e.key === 'Enter') { e.preventDefault(); document.execCommand('insertText', false, '\n'); return true; }
-  if (e.key === 'Tab') { e.preventDefault(); finishMath(true); return true; }
+  if (e.key === 'Enter') {
+    // a line of the equation's TeX: into its text by hand, as the engine
+    // would split the equation in two at a typed line end
+    e.preventDefault();
+    const r = window.getSelection().getRangeAt(0);
+    if (r.startContainer !== node.firstChild || r.endContainer !== node.firstChild) return true;
+    r.deleteContents();
+    const at = r.startOffset;
+    // a line end last in the text draws no line: a place-holder gives it one
+    node.firstChild.insertData(at, at === node.firstChild.length ? '\n' + MATH_HOLD : '\n');
+    placeCaret(node.firstChild, at + 1);
+    mathPreview(node);
+    return true;
+  }
+  if (e.key === 'Tab') { e.preventDefault(); finishMath(true, { step: e.shiftKey ? -1 : 1 }); return true; }
+  const tex = texOf(node);
+  // ⌘A: all of the TeX, not all of the paper
+  if (cmd && !e.altKey && !e.shiftKey && (e.code === 'KeyA' || e.key.toLowerCase() === 'a')) {
+    e.preventDefault();
+    texCaret(node, 0, tex.length);
+    return true;
+  }
   const sel = window.getSelection();
-  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  if (!sel.rangeCount) return false;
+  if (!sel.isCollapsed) return !cmd;
   const r = sel.getRangeAt(0);
   const pre = document.createRange();
   pre.selectNodeContents(node);
   pre.setEnd(r.startContainer, r.startOffset);
-  const at = pre.toString().length;
-  const len = node.textContent.length;
-  // arrowing past either end steps out of the maths
-  if ((e.key === 'ArrowLeft' || (display && e.key === 'ArrowUp' && !node.textContent.slice(0, at).includes('\n'))) && at === 0) { e.preventDefault(); finishMath(true, { step: -1 }); return true; }
-  if ((e.key === 'ArrowRight' || (display && e.key === 'ArrowDown' && !node.textContent.slice(at).includes('\n'))) && at === len) { e.preventDefault(); finishMath(true, { step: 1 }); return true; }
-  if (e.key === 'Backspace' && !len) { e.preventDefault(); finishMath(true); return true; }
+  const at = pre.toString().replace(/\u200B/g, '').length;
+  const len = tex.length;
+  const plain = !cmd && !e.altKey && !e.shiftKey;
+  // Home and End (⌘← ⌘→ on a Mac) keep to the TeX's line
+  const home = (plain && e.key === 'Home') || (IS_MAC && e.metaKey && !e.altKey && !e.shiftKey && e.key === 'ArrowLeft');
+  const end = (plain && e.key === 'End') || (IS_MAC && e.metaKey && !e.altKey && !e.shiftKey && e.key === 'ArrowRight');
+  if (home || end) {
+    e.preventDefault();
+    let i = home ? tex.lastIndexOf('\n', at - 1) + 1 : tex.indexOf('\n', at);
+    if (i < 0) i = len;
+    texCaret(node, i);
+    return true;
+  }
+  if (!plain) return !cmd;
+  // arrowing past either end steps out of the maths, and so does deleting
+  // past it: the words beside it are the page's, not the TeX's
+  if ((e.key === 'ArrowLeft' || e.key === 'Backspace') && at === 0) {
+    e.preventDefault();
+    finishMath(true, { step: -1 });
+    return true;
+  }
+  if ((e.key === 'ArrowRight' || e.key === 'Delete') && at === len) {
+    e.preventDefault();
+    finishMath(true, { step: 1 });
+    return true;
+  }
+  if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    const dir = e.key === 'ArrowUp' ? -1 : 1;
+    if (display) {
+      if (!caretOnEdgeLine(node, r, dir)) return true;
+      e.preventDefault();
+      finishMath(true, { step: dir });
+      return true;
+    }
+    // in the line, a line up or down is the sentence's: out, then on
+    e.preventDefault();
+    finishMath(true, { step: dir });
+    window.getSelection().modify('move', dir < 0 ? 'backward' : 'forward', 'line');
+    return true;
+  }
   // anything else is typing TeX: none of the page's typography (curly
   // quotes, -- to a dash, *emphasis*) applies to it
-  return !(e.metaKey || e.ctrlKey);
+  return true;
+}
+// Arrowing into maths opens it, the way arrowing past its ends closes it:
+// ← or → beside maths in the line, and ← → ↑ ↓ from the lines around an
+// equation. A figure or table beside the line is stepped into the same
+// way, at its caption or its cells. Backspace after maths and Delete
+// before it open it too, and next to a figure they step into its caption:
+// no key takes a whole piece of the paper at once.
+function paperStepIn(e, field) {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return false;
+  const back = e.key === 'ArrowLeft' || e.key === 'Backspace';
+  const fwd = e.key === 'ArrowRight' || e.key === 'Delete';
+  const up = e.key === 'ArrowUp';
+  const down = e.key === 'ArrowDown';
+  if (!back && !fwd && !up && !down) return false;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  if (!field.contains(r.startContainer)) return false;
+  if (back || fwd) {
+    const n = nodeBeside(r, back ? -1 : 1);
+    if (n && n.matches('.math')) {
+      e.preventDefault();
+      editMath(n, { caret: back ? 'end' : 'start' });
+      return true;
+    }
+  }
+  const start = r.startContainer.nodeType === 3 ? r.startContainer.parentElement : r.startContainer;
+  const block = start && start.closest('p');
+  if (!block || !field.contains(block) || block.matches('.eq') || block.closest('figure')) return false;
+  const dir = back || up ? -1 : 1;
+  const next = dir < 0 ? block.previousElementSibling : block.nextElementSibling;
+  if (!next || !next.matches('p.eq, figure')) return false;
+  if (!(up || down ? caretOnEdgeLine(block, r, dir) : atBlockEdge(block, r, dir))) return false;
+  e.preventDefault();
+  // Backspace on an empty line under an equation or a figure: the line goes, into it
+  if ((e.key === 'Backspace' || e.key === 'Delete') && !block.textContent.replace(/\u200B/g, '').trim() && !block.querySelector(ATOMS)) {
+    block.remove();
+    const body = next.closest('.chapter-body');
+    if (body) syncChapter(body, body.closest('.chapter').dataset.id);
+  }
+  if (next.matches('figure')) enterFigure(next, dir);
+  else editMath(next, { caret: dir < 0 ? 'end' : 'start' });
+  return true;
+}
+
+// A figure's or table's own places to write: its captions and cells, in order
+const figPlaces = (fig) => [...fig.querySelectorAll('figcaption, .subcap, th, td')];
+function caretInto(el, end) {
+  el.focus({ preventScroll: true });
+  const r = end ? caretAtEnd(el) : caretAtStart(el);
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(settleCaret(r));
+  revealCaret();
+}
+// into a figure on the way down or forward (dir > 0) at its first place,
+// on the way up or back at its last
+function enterFigure(fig, dir) {
+  const places = figPlaces(fig);
+  const at = dir > 0 ? places[0] : places[places.length - 1];
+  if (at) caretInto(at, dir < 0);
+}
+// out of a figure, to what's before (dir < 0) or after it: a paragraph's
+// end or start, an equation, another figure, or a new line to write on
+// (always a line, with write: Enter and Esc go on with the writing)
+function leaveFigure(fig, dir, { write = false } = {}) {
+  const body = fig.closest('.chapter-body');
+  let to = dir < 0 ? fig.previousElementSibling : fig.nextElementSibling;
+  if (to && to.matches('figure') && !write) { enterFigure(to, dir); return; }
+  body.focus({ preventScroll: true });
+  if (to && to.matches('p.eq') && !write) { editMath(to, { caret: dir < 0 ? 'end' : 'start' }); return; }
+  if (!to || !to.matches('p:not(.eq)')) {
+    to = document.createElement('p');
+    to.innerHTML = '<br>';
+    if (dir < 0) fig.before(to); else fig.after(to);
+    syncChapter(body, body.closest('.chapter').dataset.id);
+  }
+  caretInto(to, dir < 0);
+}
+// on to the figure's next place to write (or the one before), else out of it
+function stepFigure(fig, place, dir) {
+  const places = figPlaces(fig);
+  const to = places[places.indexOf(place) + dir];
+  if (to) caretInto(to, dir < 0); else leaveFigure(fig, dir);
+}
+// the element right beside a caret, if it stands next to one
+function nodeBeside(r, dir) {
+  const c = r.startContainer;
+  const o = r.startOffset;
+  let n;
+  if (c.nodeType === 3) {
+    if (dir < 0 ? o > 0 : o < c.length) return null;
+    n = dir < 0 ? c.previousSibling : c.nextSibling;
+  } else n = dir < 0 ? c.childNodes[o - 1] : c.childNodes[o];
+  while (n && n.nodeType === 3 && !n.data.length) n = dir < 0 ? n.previousSibling : n.nextSibling;
+  return n && n.nodeType === 1 && n.nodeName !== 'BR' ? n : null;
+}
+// nothing in the paragraph before (dir < 0) or after (dir > 0) the caret
+function atBlockEdge(block, r, dir) {
+  const side = document.createRange();
+  side.selectNodeContents(block);
+  if (dir < 0) side.setEnd(r.startContainer, r.startOffset); else side.setStart(r.startContainer, r.startOffset);
+  return !side.toString().replace(/\u200B/g, '').length && !side.cloneContents().querySelector(ATOMS);
 }
 // a click anywhere else, or the window losing the caret, finishes it
 document.addEventListener('mousedown', (e) => {
-  if (mathEditing && !mathEditing.node.contains(e.target)) finishMath(true);
+  if (mathEditing && !mathEditing.node.contains(e.target)) finishMath(true, { place: false });
 }, true);
 document.addEventListener('selectionchange', () => {
   if (!mathEditing) return;
   const sel = window.getSelection();
-  const n = sel && sel.anchorNode;
-  if (n && !mathEditing.node.contains(n)) finishMath(true);
+  // a selection reaching out of the TeX is the page's again
+  const out = (n) => n && !mathEditing.node.contains(n);
+  if (sel && (out(sel.anchorNode) || out(sel.focusNode))) finishMath(true, { place: false });
 });
 
 // ⌘⇧M: maths where the caret is — a display equation on an empty line,
 // inline maths in the middle of a sentence
 function paperInsertEquation() {
+  // in the abstract: maths in the line (it has no numbered equations)
+  const sel = window.getSelection();
+  const at = sel.rangeCount && sel.anchorNode;
+  const abs = at && (at.nodeType === 3 ? at.parentElement : at).closest('#tp-abstract');
+  if (abs) {
+    const node = placeAtom(sel.getRangeAt(0), `<span class="math" contenteditable="false">${escHtml(sel.isCollapsed ? '' : sel.toString())}</span>`, 'maths');
+    drawMath(node);
+    editMath(node);
+    return;
+  }
   const body = paperCaretBody();
   if (!body) return;
   const block = caretBlock(body);
@@ -1207,7 +1591,6 @@ function paperInsertEquation() {
     editMath(eq);
     return;
   }
-  const sel = window.getSelection();
   const selected = sel.isCollapsed ? '' : sel.toString();
   const node = placeAtom(sel.getRangeAt(0), `<span class="math" contenteditable="false">${escHtml(selected)}</span>`, 'maths');
   editMath(node);
@@ -1304,12 +1687,25 @@ async function paperLocales() {
 // Every citation set in a processor's style, and its reference list,
 // without touching the page (for a preview in another journal's style)
 function paperRenderCites(proc) {
-  const nodes = [...document.querySelectorAll('#chapters .cite')];
-  const out = proc.render(nodes.map((n, i) => ({ id: i, items: citeData(n), narrative: n.hasAttribute('data-narrative') })));
+  // in reading order: the page's citations, and a table of symbols' sources where it stands
+  const nodes = [];
+  const clusters = [];
+  for (const n of document.querySelectorAll('#chapters .cite, #chapters p.symtab')) {
+    if (n.matches('.cite')) {
+      nodes.push(n);
+      clusters.push({ key: n, items: citeData(n), narrative: n.hasAttribute('data-narrative') });
+    } else {
+      for (const sym of symtabRows(n)) {
+        const items = (sym.cite || []).filter((x) => x && NeoReferences.KEY.test(x.id));
+        if (items.length) clusters.push({ key: symtabKey(n, sym.id), items, narrative: false });
+      }
+    }
+  }
+  const out = proc.render(clusters.map((c, i) => ({ id: i, items: c.items, narrative: c.narrative })));
   const text = new Map();
-  nodes.forEach((n, i) => {
+  clusters.forEach((c, i) => {
     const html = out.text.get(i);
-    text.set(n, html ? paperSafe(html) : '(' + citeData(n).map((x) => '?' + escHtml(x.id)).join('; ') + ')');
+    text.set(c.key, html ? paperSafe(html) : '(' + c.items.map((x) => '?' + escHtml(x.id)).join('; ') + ')');
   });
   return { nodes, text, missing: out.missing, order: out.order, bibliography: proc.bibliography() };
 }
@@ -1343,7 +1739,7 @@ function paperCiteSoon(ms = 150) {
 // Every citation in reading order, set in the paper's style; then the list
 let paperCiting = Promise.resolve();
 function paperCiteNow() {
-  paperCiting = paperCiting.then(async () => {
+  const step = paperCiting.then(async () => {
     if (!book || !isPaper()) return;
     const proc = await paperProcessor();
     if (!proc || !book || !isPaper()) return;
@@ -1359,7 +1755,10 @@ function paperCiteNow() {
     out.nodes.forEach((n) => {
       const missing = citeData(n).filter((x) => out.missing.includes(x.id)).map((x) => x.id);
       const shown = out.text.get(n);
-      if (n.innerHTML !== shown) { n.innerHTML = shown; touched.add(n.closest('.chapter-body')); }
+      // a reference not here (perhaps references.json hasn't synced yet)
+      // leaves the citation's words as they were saved, only marked
+      const keep = missing.length && n.textContent.trim();
+      if (!keep && n.innerHTML !== shown) { n.innerHTML = shown; touched.add(n.closest('.chapter-body')); }
       if (missing.length) {
         n.setAttribute('data-missing', '');
         n.dataset.state = t('Not in this paper’s references: {keys}', { keys: missing.join(', ') });
@@ -1370,13 +1769,18 @@ function paperCiteNow() {
     });
     // a citation set afresh is part of what the chapter says: saved with it
     for (const body of touched) if (body) syncChapter(body, body.closest('.chapter').dataset.id);
+    // the tables of symbols, their sources set with the rest (drawn, never saved)
+    for (const b of document.querySelectorAll('#chapters p.symtab')) drawSymbolTable(b);
     paper.bibliography = out.bibliography;
     paper.cited = out.order;
     paperShowRefs();
     if (currentTab === 'references') paperLibraryRender();
     if (touched.size) paperPreviewSoon();
   });
-  return paperCiting;
+  // one that fails (a style or locale that didn't read) is the caller's to
+  // hear about; the ones after it still run
+  paperCiting = step.catch((err) => window.neo.logError('citations: ' + (err && err.stack || err)));
+  return step;
 }
 
 // The reference list after the last page: made, never typed
@@ -1450,7 +1854,57 @@ function paperSafe(html, { links = false } = {}) {
 
 /* ---- the @ picker: references to cite, and what can be referred to ---- */
 
-const picker = { el: null, body: null, at: null, rows: [], idx: 0, mode: 'all', busy: false, zotero: { q: '', items: [], timer: null, down: 0 } };
+const picker = { el: null, body: null, at: null, mark: '@', rows: [], idx: 0, mode: 'all', busy: false, zotero: { q: '', items: [], timer: null, down: 0 } };
+
+// / on a line of its own: what can go there, found by a word, or by its
+// LaTeX name (/includegraphics, /section, /ref). A / anywhere else is a /.
+const INSERT_COMMANDS = [
+  { id: 'figure', label: tk('Figure…'), what: tk('A picture from a file, numbered, with its caption'), words: ['figure', 'image', 'picture', 'includegraphics', 'graphic', 'photo'] },
+  { id: 'table', label: tk('Table'), what: tk('Rows and columns to fill in, numbered, with its caption'), words: ['table', 'tabular'] },
+  { id: 'equation', label: tk('Equation'), what: tk('A numbered equation, in TeX'), words: ['equation', 'eq', 'maths', 'math', 'displaymath', 'align'] },
+  { id: 'cite', label: tk('Citation…'), what: tk('One of the paper’s references'), words: ['cite', 'citation', 'citep', 'citet', 'reference'] },
+  { id: 'xref', label: tk('Cross-Reference…'), what: tk('A section, figure, table or equation, by its number'), words: ['ref', 'cross-reference', 'xref', 'cref', 'autoref', 'eqref'] },
+  { id: 'ul', label: tk('Bulleted List'), what: tk('Or type - and a space at the start of a line'), words: ['list', 'bullets', 'itemize', 'ul'] },
+  { id: 'ol', label: tk('Numbered List'), what: tk('Or type 1. and a space at the start of a line'), words: ['numbered', 'enumerate', 'ol'] },
+  { id: 'symbol', label: tk('Symbol…'), what: tk('A symbol of the paper’s own, defined once: then \\name and a space'), words: ['symbol', 'newcommand', 'notation', 'parameter', 'variable'] },
+  { id: 'symbols', label: tk('Table of Symbols'), what: tk('The symbols marked for it, with their meanings, values and sources'), words: ['symbols', 'nomenclature', 'printnomenclature', 'glossary', 'parameters'] },
+  { id: 'h1', label: tk('Section Heading'), words: ['section', 'heading', 'h1'] },
+  { id: 'h2', label: tk('Subsection Heading'), words: ['subsection', 'h2'] },
+  { id: 'h3', label: tk('Subsubsection Heading'), words: ['subsubsection', 'h3'] }
+];
+function insertCommands(q) {
+  q = q.trim().toLowerCase().replace(/^\\/, '');
+  // a whole name first (/ref is a cross-reference, not a reference), then by its own word
+  const rank = (c) => (c.words.includes(q) ? 0 : c.words[0].startsWith(q) ? 1 : 2);
+  return INSERT_COMMANDS.filter((c) => c.words.some((w) => w.startsWith(q))).sort((a, b) => rank(a) - rank(b));
+}
+async function runInsertCommand(id, body) {
+  if (id === 'figure') await paperInsertFigure();
+  else if (id === 'table') paperInsertTable();
+  else if (id === 'equation') paperInsertEquation();
+  else if (id === 'cite' || id === 'xref') paperPickAtCaret(id);
+  else if (id === 'symbol') await paperNewSymbolHere();
+  else if (id === 'symbols') paperInsertSymbolTable();
+  else if (id === 'ul' || id === 'ol') {
+    const block = caretBlock(body);
+    if (!block) return;
+    snapshotStructure('list');
+    setListItem(block, id, 1);
+    syncChapter(body, body.closest('.chapter').dataset.id);
+    paperRenumber();
+  } else paperSetHeading(id, body);
+}
+function pickerOpenOnSlash(e, body) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const block = caretBlock(body);
+  if (!block || !block.matches('p') || block.matches('.eq') || headingOf(block) || block.closest('figure')) return false;
+  if (block.textContent.trim() || block.querySelector(ATOMS)) return false;
+  e.preventDefault();
+  document.execCommand('insertText', false, '/');
+  pickerOpen(body, 'insert', '/');
+  return true;
+}
 
 // Zotero's library, searched as the @ is typed (paper:zotero in main.js):
 // a moment after the typing pauses, and not again for a minute if Zotero
@@ -1489,12 +1943,13 @@ function pickerOpenOnAt(e, body) {
   return true;
 }
 
-function pickerOpen(body, mode) {
+function pickerOpen(body, mode, mark = '@') {
   pickerClose();
   const sel = window.getSelection();
   const r = sel.getRangeAt(0);
-  if (r.startContainer.nodeType !== 3 || r.startOffset < 1 || r.startContainer.data[r.startOffset - 1] !== '@') return;
+  if (r.startContainer.nodeType !== 3 || r.startOffset < 1 || r.startContainer.data[r.startOffset - 1] !== mark) return;
   picker.body = body;
+  picker.mark = mark;
   picker.at = { node: r.startContainer, offset: r.startOffset - 1 };
   picker.mode = mode;
   picker.idx = 0;
@@ -1515,13 +1970,13 @@ function pickerClose() {
   document.removeEventListener('selectionchange', pickerFollow);
   picker.body = null;
 }
-// what has been typed after the @, or null once the caret has left it
+// what has been typed after the @ (or /), or null once the caret has left it
 function pickerQuery() {
   const { node, offset } = picker.at;
   const sel = window.getSelection();
   if (!node.isConnected || !sel.rangeCount || !sel.isCollapsed) return null;
   const r = sel.getRangeAt(0);
-  if (r.startContainer !== node || r.startOffset <= offset || node.data[offset] !== '@') return null;
+  if (r.startContainer !== node || r.startOffset <= offset || node.data[offset] !== picker.mark) return null;
   const q = node.data.slice(offset + 1, r.startOffset);
   return /\n/.test(q) || q.length > 120 ? null : q;
 }
@@ -1532,6 +1987,15 @@ function pickerUpdate() {
   if (!picker.el) return;
   const q = pickerQuery();
   if (q === null) { pickerClose(); return; }
+  if (picker.mode === 'insert') {
+    // nothing by that name: the / was a /
+    const found = /\s/.test(q) ? [] : insertCommands(q);
+    if (!found.length) { pickerClose(); return; }
+    picker.rows = found.map((command) => ({ kind: 'command', command }));
+    picker.idx = Math.min(picker.idx, picker.rows.length - 1);
+    pickerDraw(q);
+    return;
+  }
   const rows = [];
   const ident = NeoReferences.findIdentifier(q);
   if (ident && picker.mode !== 'xref') rows.push({ kind: 'lookup', ident });
@@ -1581,6 +2045,9 @@ function pickerDraw(q) {
     if (row.kind === 'ref') {
       main.textContent = NeoReferences.shortLabel(row.item);
       sub.textContent = row.item.title || row.item.id;
+    } else if (row.kind === 'command') {
+      main.textContent = t(row.command.label);
+      sub.textContent = row.command.what ? t(row.command.what) : '';
     } else if (row.kind === 'label') {
       main.textContent = row.target.label;
       sub.textContent = row.target.text;
@@ -1655,12 +2122,29 @@ async function pickerChoose() {
     toast(t('Added to the references: {ref}', { ref: NeoReferences.shortLabel(item) }));
     return;
   }
+  if (row.kind === 'command') {
+    // the /word goes, and what it names goes in its place
+    const q = pickerQuery();
+    const { node, offset } = picker.at;
+    const body = picker.body;
+    pickerClose();
+    if (q === null) return;
+    const r = document.createRange();
+    r.setStart(node, offset);
+    r.setEnd(node, offset + 1 + q.length);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+    document.execCommand('delete');
+    await runInsertCommand(row.command.id, body);
+    return;
+  }
   if (row.kind === 'ref') pickerInsert(citeHtml([{ id: row.item.id }]), row.item.id);
   else if (row.kind === 'zotero') {
     // into the paper's references (with Zotero's citation key when it has one), then cited
-    const { items, added, updated } = NeoReferences.mergeReferences(paper.refs, [paperTidyLookup(row.item, row.item.DOI || '')], { keepKeys: !!row.item.id });
+    const { items, keys } = NeoReferences.mergeReferences(paper.refs, [paperTidyLookup(row.item, row.item.DOI || '')], { keepKeys: !!row.item.id });
     await paperSaveRefs(items);
-    const id = added[0] || updated[0];
+    const id = keys[0];
     if (id) pickerInsert(citeHtml([{ id }]), id);
   }
   else if (row.kind === 'label') pickerInsert(`<span class="xref" contenteditable="false" data-ref="${escHtml(row.target.id)}">${escHtml(row.target.label)}</span>`);
@@ -1712,10 +2196,23 @@ function paperPickAtCaret(mode) {
 
 /* ---- a citation, clicked: pages, prefix, who's named, what's in it ---- */
 
-function openCitePop(node) {
+function openCitePop(node, { keys = false } = {}) {
   const body = node.closest('.chapter-body');
   if (!body) return;
   const pop = paperPop(node, 'cite-pop');
+  // Enter or Esc: the panel closes and the caret is back after the citation
+  const back = () => {
+    closePaperPop();
+    if (!node.isConnected) return;
+    body.focus({ preventScroll: true });
+    caretAfter(node);
+  };
+  pop.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    back();
+  });
   const draw = () => {
     const items = citeData(node);
     pop.innerHTML = '';
@@ -1738,9 +2235,9 @@ function openCitePop(node) {
         el.spellcheck = false;
         el.addEventListener('change', () => { apply(el.value.trim()); commit(items); });
         el.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') return; // the panel's
           e.stopPropagation();
-          if (e.key === 'Enter') { e.preventDefault(); el.blur(); closePaperPop(); }
-          if (e.key === 'Escape') { e.preventDefault(); closePaperPop(); }
+          if (e.key === 'Enter') { e.preventDefault(); el.blur(); back(); }
         });
         return el;
       };
@@ -1788,6 +2285,8 @@ function openCitePop(node) {
     paperCiteSoon(0);
   };
   draw();
+  // from the keyboard, the caret goes into the panel, at the first page
+  if (keys) { const first = pop.querySelector('.cp-loc'); if (first) first.focus(); }
 }
 // a citation, cross-reference or maths taken out by the writer: ⌘Z brings it back
 function removeNode(node) {
@@ -1811,9 +2310,9 @@ async function paperLookup(ident) {
   if (!window.neo.paperLookup) throw new Error(t('looking up needs the desktop app'));
   const csl = await window.neo.paperLookup(doi);
   const item = paperTidyLookup(csl, doi);
-  const { items, added, updated } = NeoReferences.mergeReferences(paper.refs, [item]);
+  const { items, keys } = NeoReferences.mergeReferences(paper.refs, [item]);
   await paperSaveRefs(items);
-  return paper.refs.find((r) => r.id === (added[0] || updated[0]));
+  return paper.refs.find((r) => r.id === keys[0]);
 }
 // doi.org's CSL JSON carries more than a reference needs
 function paperTidyLookup(csl, doi) {
@@ -1854,11 +2353,7 @@ async function paperSaveRefs(items) {
   const disk = await window.neo.readJSON(bookId, 'references', []);
   if (!book || book.id !== bookId) return;
   if (Array.isArray(disk) && JSON.stringify(disk) !== paper.refsSaved) {
-    const saved = new Set(JSON.parse(paper.refsSaved || '[]').map((r) => r.id));
-    const mine = new Set(items.map((r) => r.id));
-    // new over there (not just something deleted here)
-    const theirs = disk.filter((r) => r && !mine.has(String(r.id)) && !saved.has(String(r.id)));
-    if (theirs.length) items = NeoReferences.mergeReferences(items, theirs, { keepKeys: true }).items;
+    items = NeoReferences.keepTheirs(JSON.parse(paper.refsSaved || '[]'), items, disk);
   }
   paper.refs = items;
   if (paper.proc) paper.proc.setItems(items);
@@ -1876,10 +2371,665 @@ async function paperSaveRefs(items) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Symbols: the paper's own notation, defined once, used everywhere   */
+/* ------------------------------------------------------------------ */
+
+// symbols.json beside references.json: [{ id, tex, meaning, unit, table,
+// kind, value, cite }], id being its name (\Vm). On the page a symbol is
+// <span class="sym" data-sym="Vm"> holding its TeX, drawn from its
+// definition, so a change to it shows everywhere; one whose definition is
+// gone keeps the TeX it was saved with, drawn as maths and marked.
+const symbolOf = (id) => paper.symbols.find((s) => s.id === id) || null;
+const symHtml = (s) => `<span class="sym" contenteditable="false" data-sym="${escHtml(s.id)}">${escHtml(s.tex)}</span>`;
+// the TeX a symbol on the page stands for, its definition's when it has one
+const symTex = (n) => { const s = symbolOf(n.dataset.sym); return s ? s.tex : texOf(n); };
+const KIND_NAMES = { parameter: tk('Parameter'), variable: tk('Variable') };
+// why a name won't do, in a sentence (NeoSymbols.validKey's reasons)
+const SYMBOL_NAME_WHY = {
+  [NeoSymbols.LETTERS_ONLY]: tk('A symbol’s name is letters only, up to 30 of them, as \\Vm'),
+  [NeoSymbols.TAKEN]: tk('Another symbol already has that name'),
+  [NeoSymbols.LATEX_COMMAND]: tk('LaTeX already has a command of that name; choose another')
+};
+
+// To disk, keeping what another device added since NEO last read it
+let symbolsWriting = 0;
+async function paperSaveSymbols(items) {
+  const bookId = book.id;
+  const disk = await window.neo.readJSON(bookId, 'symbols', []);
+  if (!book || book.id !== bookId) return;
+  if (Array.isArray(disk) && JSON.stringify(disk) !== paper.symbolsSaved) items = NeoSymbols.keepTheirs(JSON.parse(paper.symbolsSaved || '[]'), items, disk);
+  paper.symbols = items;
+  const json = JSON.stringify(items);
+  if (json !== paper.symbolsSaved) {
+    symbolsWriting++;
+    try {
+      await window.neo.writeJSON(bookId, 'symbols', items);
+      paper.symbolsSaved = json;
+    } finally {
+      symbolsWriting--;
+    }
+  }
+  paperSymbolsShown();
+}
+// The page after the definitions change: each symbol's TeX (saved with the
+// chapter, so it reads sensibly on its own), its drawing, the tables
+function paperSymbolsShown() {
+  const touched = new Set();
+  for (const n of document.querySelectorAll('#chapters .sym, #tp-abstract .sym')) {
+    const s = symbolOf(n.dataset.sym);
+    if (s && n.textContent !== s.tex) { n.textContent = s.tex; touched.add(n.closest('.chapter-body, #tp-abstract')); }
+    n.toggleAttribute('data-missing', !s);
+    drawMath(n);
+  }
+  for (const f of touched) {
+    if (!f) continue;
+    if (f.matches('.chapter-body')) syncChapter(f, f.closest('.chapter').dataset.id);
+    else f.dispatchEvent(new Event('input'));
+  }
+  // the tables' sources are citations, set with the rest
+  paperCiteSoon(0);
+  if (currentTab === 'references') paperLibraryRender();
+}
+
+// \mu then a space: μ. \Vm (one of the paper's own) then a space: the
+// symbol. The key that ended the name still goes in; ⌘Z right after
+// brings the TeX back. Never in maths, which is TeX already.
+const SYMBOL_ENDS = [' ', '.', ',', ';', ':', '!', '?', ')', ']', 'Enter'];
+function paperSymbolKey(e, field) {
+  if (!SYMBOL_ENDS.includes(e.key) || !typedChar(e) || (e.key === 'Enter' && e.shiftKey)) return false;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  const node = r.startContainer;
+  if (node.nodeType !== 3 || !field.contains(node) || node.parentElement.closest('.math, .eq, .sym, .cite, .xref')) return false;
+  const hit = NeoSymbols.autocorrect(node.data.slice(0, r.startOffset));
+  if (!hit) return false;
+  const own = symbolOf(hit.name);
+  const ch = own ? null : NeoSymbols.charFor(hit.name);
+  if (!own && !ch) return false;
+  const range = document.createRange();
+  range.setStart(node, hit.from);
+  range.setEnd(node, r.startOffset);
+  if (own) {
+    const host = node.parentElement.closest('figcaption, .subcap, th, td');
+    const sym = placeAtom(range, symHtml(own), 'symbol');
+    drawMath(sym);
+    // in a caption or a cell the caret goes back there, where its own words are
+    if (host) { host.focus({ preventScroll: true }); caretAfter(sym); }
+    if (!field.matches('.chapter-body')) field.dispatchEvent(new Event('input'));
+  } else {
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('insertText', false, ch);
+  }
+  // Enter goes on to be the paragraph's; the rest are typed here
+  if (e.key === 'Enter') return false;
+  e.preventDefault();
+  document.execCommand('insertText', false, e.key);
+  return true;
+}
+
+// A symbol's definition, new or changed: its name, TeX, meaning, kind,
+// value, unit, sources (citations of the paper's references) and whether
+// the table of symbols lists it. Resolves with the symbol saved, or null.
+function paperEditSymbol(sym = null, { tex = '' } = {}) {
+  return new Promise((resolve) => {
+    const draft = sym ? { ...sym, cite: [...(sym.cite || [])] } : { id: '', tex, meaning: '', unit: '', value: '', kind: '', table: true, cite: [] };
+    const bd = document.createElement('div');
+    bd.className = 'modal-backdrop';
+    bd.innerHTML = `<div class="modal paper-ref paper-sym" role="dialog" aria-modal="true"><h2></h2><div class="ps-preview" aria-hidden="true"></div><div class="pr-grid"></div>
+      <div class="pa-foot"><button class="m-cancel btn-quiet" type="button"></button><button class="m-ok btn-gold" type="button"></button></div></div>`;
+    bd.querySelector('h2').textContent = sym ? t('Symbol') : t('New Symbol');
+    bd.querySelector('.m-cancel').textContent = t('Cancel');
+    bd.querySelector('.m-ok').textContent = t('Save');
+    const grid = bd.querySelector('.pr-grid');
+    const preview = bd.querySelector('.ps-preview');
+    const row = (label, el, wide) => {
+      const l = document.createElement('label');
+      l.className = 'pr-field' + (wide ? ' wide' : '');
+      const s = document.createElement('span');
+      s.textContent = label;
+      l.append(s, el);
+      grid.appendChild(l);
+      return el;
+    };
+    const input = (label, value, wide, ph) => {
+      const el = document.createElement('input');
+      el.spellcheck = false;
+      el.value = value || '';
+      if (ph) el.placeholder = ph;
+      return row(label, el, wide);
+    };
+    const texIn = input(t('Its TeX'), draft.tex, false, 'V_\\mathrm{m}');
+    const idIn = input(t('Its name, typed as \\name'), draft.id, false, 'Vm');
+    const meaning = input(t('What it stands for'), draft.meaning, true, t('membrane potential'));
+    const kind = document.createElement('select');
+    for (const [v, l] of [['', tk('Neither')], ['parameter', KIND_NAMES.parameter], ['variable', KIND_NAMES.variable]]) {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = t(l);
+      kind.appendChild(o);
+    }
+    kind.value = draft.kind || '';
+    row(t('A parameter or a variable'), kind);
+    const value = input(t('Its value, if it has one'), draft.value, false, '−65');
+    const unit = input(t('Unit'), draft.unit, false, 'mV');
+    // sources: the paper's references, by key, the way @ finds them
+    const sources = document.createElement('div');
+    sources.className = 'ps-sources';
+    const chips = document.createElement('span');
+    chips.className = 'ps-chips';
+    const find = document.createElement('input');
+    find.spellcheck = false;
+    find.placeholder = t('Type to find a reference');
+    find.setAttribute('aria-label', t('Add a source'));
+    const found = document.createElement('div');
+    found.className = 'ps-found';
+    found.setAttribute('role', 'listbox');
+    sources.append(chips, find, found);
+    row(t('Where its value comes from'), sources, true);
+    const table = document.createElement('input');
+    table.type = 'checkbox';
+    table.checked = draft.table !== false;
+    const tl = document.createElement('label');
+    tl.className = 'pr-check wide';
+    tl.append(table, document.createTextNode(' ' + t('List it in the table of symbols')));
+    grid.appendChild(tl);
+    const drawChips = () => {
+      chips.innerHTML = '';
+      draft.cite.forEach((x, i) => {
+        const it = paper.refs.find((r) => r.id === x.id);
+        const c = document.createElement('button');
+        c.type = 'button';
+        c.className = 'ps-chip';
+        c.textContent = (it ? NeoReferences.shortLabel(it) : '@' + x.id) + ' ×';
+        c.title = t('Take this source out');
+        c.onclick = () => { draft.cite.splice(i, 1); drawChips(); find.focus(); };
+        chips.appendChild(c);
+      });
+    };
+    let hits = [];
+    let hit = 0;
+    const drawFound = () => {
+      const q = find.value.trim().toLowerCase();
+      hits = q ? paper.refs.map((it) => ({ it, s: NeoReferences.score(it, q) })).filter((x) => x.s > 0 && !draft.cite.some((c) => c.id === x.it.id))
+        .sort((a, b) => b.s - a.s).slice(0, 5).map((x) => x.it) : [];
+      hit = Math.min(hit, Math.max(0, hits.length - 1));
+      found.innerHTML = '';
+      hits.forEach((it, i) => {
+        const o = document.createElement('div');
+        o.className = 'pp-row' + (i === hit ? ' active' : '');
+        o.setAttribute('role', 'option');
+        o.textContent = NeoReferences.shortLabel(it) + (it.title ? ' — ' + it.title : '');
+        o.onmousedown = (e) => { e.preventDefault(); add(it); };
+        found.appendChild(o);
+      });
+    };
+    const add = (it) => { draft.cite.push({ id: it.id }); find.value = ''; drawFound(); drawChips(); find.focus(); };
+    find.addEventListener('input', () => { hit = 0; drawFound(); });
+    find.addEventListener('keydown', (e) => {
+      if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && hits.length) { e.preventDefault(); hit = (hit + (e.key === 'ArrowDown' ? 1 : hits.length - 1)) % hits.length; drawFound(); }
+      else if (e.key === 'Enter' && hits.length) { e.preventDefault(); e.stopPropagation(); add(hits[hit]); }
+      else if (e.key === 'Backspace' && !find.value && draft.cite.length) { draft.cite.pop(); drawChips(); }
+    });
+    drawChips();
+    // the symbol drawn as it's written
+    const draw = () => {
+      preview.innerHTML = '';
+      const tex = texIn.value.trim();
+      if (!tex) return;
+      const svg = mathReady() ? texSvg(tex, false) : null;
+      if (svg) preview.appendChild(svg); else preview.textContent = mathReady() ? t('doesn’t parse yet') : tex;
+    };
+    // a name offered from the TeX (V_\mathrm{m}: Vm), until the writer names it
+    const offer = () => { if (!sym && !idIn.dataset.typed) idIn.value = texIn.value.replace(/\\(mathrm|mathit|mathbf|text|operatorname)\b|\\/g, '').replace(/[^A-Za-z]/g, '').slice(0, 12); };
+    texIn.addEventListener('input', () => { draw(); offer(); });
+    offer();
+    idIn.addEventListener('input', () => { idIn.dataset.typed = '1'; });
+    draw();
+    document.body.appendChild(bd);
+    (sym ? meaning : texIn).focus();
+    const close = (value) => { bd.remove(); resolve(value); };
+    bd.querySelector('.m-cancel').onclick = () => close(null);
+    bd.querySelector('.m-ok').onclick = async () => {
+      const id = idIn.value.trim().replace(/^\\/, '');
+      const why = NeoSymbols.validKey(id, paper.symbols.filter((s) => !sym || s.id !== sym.id).map((s) => s.id));
+      if (why) { toast(t(SYMBOL_NAME_WHY[why] || why)); idIn.focus(); return; }
+      if (!texIn.value.trim()) { toast(t('A symbol needs its TeX')); texIn.focus(); return; }
+      const saved = { id, tex: texIn.value.trim(), meaning: meaning.value.trim(), unit: unit.value.trim(), value: value.value.trim(), kind: kind.value, table: table.checked, cite: draft.cite };
+      for (const k of ['meaning', 'unit', 'value', 'kind']) if (!saved[k]) delete saved[k];
+      if (!saved.cite.length) delete saved.cite;
+      const items = sym ? paper.symbols.map((s) => (s.id === sym.id ? saved : s)) : [...paper.symbols, saved];
+      // a new name follows it into the paper
+      if (sym && id !== sym.id) for (const n of document.querySelectorAll(`#chapters .sym[data-sym="${CSS.escape(sym.id)}"], #tp-abstract .sym[data-sym="${CSS.escape(sym.id)}"]`)) n.dataset.sym = id;
+      close(saved);
+      await paperSaveSymbols(items);
+    };
+    bd.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); close(null); }
+      if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target !== find && e.target.type !== 'checkbox') { e.preventDefault(); bd.querySelector('.m-ok').click(); }
+    });
+  });
+}
+
+// Maths on the page made a symbol: defined from its TeX, and every piece
+// of maths that's the same TeX becomes it too
+async function paperDefineSymbol(node) {
+  const tex = texOf(node).trim();
+  const sym = await paperEditSymbol(null, { tex });
+  if (!sym) return;
+  const body = node.closest('.chapter-body');
+  if (body) snapshotStructure('symbol');
+  let n = 0;
+  for (const m of document.querySelectorAll('#chapters .math, #tp-abstract .math')) {
+    if (texOf(m).trim() !== sym.tex) continue;
+    const holder = document.createElement('span');
+    holder.innerHTML = symHtml(sym);
+    m.replaceWith(holder.firstChild);
+    n++;
+  }
+  for (const b of paperBodies()) syncChapter(b, b.closest('.chapter').dataset.id);
+  const abs = $('#tp-abstract');
+  if (abs && abs.querySelector('.sym')) abs.dispatchEvent(new Event('input'));
+  paperHydrate();
+  if (body) { resetNativeUndo(); breakRun++; }
+  toast(n === 1 ? t('\\{name} defined — type \\{name} and a space to use it again', { name: sym.id })
+    : t('\\{name} defined, and used in the {n} places with that maths — type \\{name} and a space for it', { name: sym.id, n }));
+}
+
+// A symbol on the page, clicked (or ⇧F10 beside it)
+async function symbolMenu(e, node) {
+  const sym = symbolOf(node.dataset.sym);
+  const choice = await popMenu(e.clientX, e.clientY, [
+    { label: sym ? t('Edit \\{name}…', { name: sym.id }) : t('Define \\{name} Again…', { name: node.dataset.sym }), value: 'edit' },
+    { label: t('Back to Plain Maths'), value: 'plain' },
+    { label: t('Remove'), value: 'remove', danger: true }
+  ], { title: sym && sym.meaning ? sym.meaning : '\\' + node.dataset.sym, from: e.from });
+  if (choice === 'edit') {
+    if (sym) await paperEditSymbol(sym);
+    else {
+      const made = await paperEditSymbol(null, { tex: texOf(node) });
+      if (made) node.dataset.sym = made.id;
+      paperSymbolsShown();
+    }
+  } else if (choice === 'plain') {
+    const body = node.closest('.chapter-body');
+    if (body) snapshotStructure('symbol');
+    const holder = document.createElement('span');
+    holder.innerHTML = `<span class="math" contenteditable="false">${escHtml(symTex(node))}</span>`;
+    const m = holder.firstChild;
+    node.replaceWith(m);
+    drawMath(m);
+    if (body) { syncChapter(body, body.closest('.chapter').dataset.id); resetNativeUndo(); breakRun++; }
+  } else if (choice === 'remove') removeNode(node);
+}
+// Maths, clicked from the keyboard (⇧F10) or right-clicked: change it, or make it a symbol
+async function mathMenu(e, node) {
+  const choice = await popMenu(e.clientX, e.clientY, [
+    { label: t('Edit the Maths'), value: 'edit' },
+    { label: t('Define as a Symbol…'), value: 'define' }
+  ], { title: t('Maths'), from: e.from });
+  if (choice === 'edit') editMath(node);
+  else if (choice === 'define') await paperDefineSymbol(node);
+}
+
+/* ---- the table of symbols: where /symbols puts it ---- */
+
+// <p class="symtab" data-kind="parameter"> holds nothing of its own: the
+// table is drawn into its shadow root from symbols.json (those listed, of
+// its kind, in the nomenclature's order), so nothing in the chapter changes
+// when a definition does
+function symtabRows(block) {
+  const kind = block.dataset.kind || '';
+  return NeoSymbols.sortSymbols(paper.symbols.filter((s) => s.table !== false && (!kind || s.kind === kind)));
+}
+const SYMTAB_CSS = `:host{display:block}
+table{border-collapse:collapse;margin:.4em auto;font-size:.92em;border-top:1.2px solid currentColor;border-bottom:1.2px solid currentColor}
+th{font-weight:600;text-align:left;border-bottom:.8px solid currentColor}
+th,td{padding:.25em .7em;vertical-align:baseline}
+td.s{white-space:nowrap}
+.none{text-align:center;opacity:.55;font-style:italic;padding:.6em;border:1px dashed currentColor;border-radius:4px}
+mjx-container{display:inline-block}svg{overflow:visible;vertical-align:middle}`;
+function drawSymbolTable(block) {
+  const root = block.shadowRoot || block.attachShadow({ mode: 'open' });
+  const rows = symtabRows(block);
+  const kind = block.dataset.kind || '';
+  root.innerHTML = `<style>${SYMTAB_CSS}</style>`;
+  if (!rows.length) {
+    const none = document.createElement('div');
+    none.className = 'none';
+    none.textContent = kind === 'parameter' ? t('Table of parameters: none yet. Mark a symbol as a parameter on the References tab.')
+      : kind === 'variable' ? t('Table of variables: none yet. Mark a symbol as a variable on the References tab.')
+      : t('Table of symbols: none yet. Define one from some maths, or on the References tab.');
+    root.appendChild(none);
+    return;
+  }
+  const has = (k) => rows.some((s) => k === 'cite' ? s.cite && s.cite.length : s[k]);
+  const cols = ['tex', 'meaning', ...['value', 'unit', 'cite'].filter(has)];
+  const head = { tex: 'Symbol', meaning: 'Meaning', value: 'Value', unit: 'Unit', cite: 'Source' };
+  const tbl = document.createElement('table');
+  tbl.innerHTML = `<thead><tr>${cols.map((c) => `<th>${escHtml(head[c])}</th>`).join('')}</tr></thead><tbody></tbody>`;
+  for (const s of rows) {
+    const tr = document.createElement('tr');
+    for (const c of cols) {
+      const td = document.createElement('td');
+      if (c === 'tex') {
+        td.className = 's';
+        const svg = mathReady() ? texSvg(s.tex, false) : null;
+        if (svg) td.appendChild(svg); else td.textContent = s.tex;
+      } else if (c === 'cite') td.innerHTML = (paper.citeText && paper.citeText.get(symtabKey(block, s.id))) || '';
+      else td.textContent = s[c] || '';
+      tr.appendChild(td);
+    }
+    tbl.tBodies[0].appendChild(tr);
+  }
+  root.appendChild(tbl);
+}
+// a table's sources, among the paper's citations in reading order
+const symtabKey = (block, id) => 'symtab:' + (block.dataset.id || '') + ':' + id;
+function makeSymbolTable(kind = '') {
+  const p = document.createElement('p');
+  p.className = 'symtab';
+  p.contentEditable = 'false';
+  p.dataset.id = paperId('symtab');
+  if (kind) p.dataset.kind = kind;
+  return p;
+}
+// /symbols: the table where the caret's line is
+function paperInsertSymbolTable() {
+  const body = paperCaretBody();
+  if (!body) return;
+  snapshotStructure('table of symbols');
+  const tbl = makeSymbolTable();
+  placeBlock(tbl, body);
+  syncChapter(body, body.closest('.chapter').dataset.id);
+  resetNativeUndo();
+  breakRun++;
+  drawSymbolTable(tbl);
+  paperCiteSoon(0);
+  if (!paper.symbols.length) toast(t('Symbols you define show here: select some maths and press ⇧F10, or type /symbol'));
+}
+// which symbols it lists, or out of the paper (its symbols stay defined)
+async function symtabMenu(e, block) {
+  const kind = block.dataset.kind || '';
+  const choice = await popMenu(e.clientX, e.clientY, [
+    { label: t('Every Symbol Marked for the Table'), value: 'k:', checked: !kind },
+    { label: t('Only the Parameters'), value: 'k:parameter', checked: kind === 'parameter' },
+    { label: t('Only the Variables'), value: 'k:variable', checked: kind === 'variable' },
+    '-',
+    { label: t('Edit the Symbols…'), value: 'edit' },
+    { label: t('Remove the Table'), value: 'remove', danger: true }
+  ], { title: t('Table of Symbols'), from: e.from || block });
+  if (!choice) return;
+  if (choice === 'edit') { libraryView = 'symbols'; switchTab('references'); return; }
+  figureChange(block, choice === 'remove' ? 'table of symbols' : 'symbols', () => {
+    if (choice === 'remove') block.remove();
+    else if (choice === 'k:') delete block.dataset.kind;
+    else block.dataset.kind = choice.slice(2);
+  });
+  if (block.isConnected) drawSymbolTable(block);
+  paperCiteSoon(0);
+}
+// /symbol: a new one, defined and put where the caret is
+async function paperNewSymbolHere() {
+  const sel = window.getSelection();
+  const at = sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+  const sym = await paperEditSymbol();
+  if (!sym || !at || !at.startContainer.isConnected) return;
+  const body = at.startContainer.nodeType === 3 ? at.startContainer.parentElement.closest('.chapter-body') : at.startContainer.closest && at.startContainer.closest('.chapter-body');
+  if (!body) return;
+  body.focus({ preventScroll: true });
+  drawMath(placeAtom(at, symHtml(sym), 'symbol'));
+}
+
+/* ------------------------------------------------------------------ */
+/*  The editing pass and the paragraph check: asked for, never while   */
+/*  writing (docs/writing-principles.md, sections 5 and 6)             */
+/* ------------------------------------------------------------------ */
+
+// A paragraph's text as the rules read it: a citation, cross-reference,
+// maths or symbol is one character (U+FFFC), and each stretch of text
+// remembers its node, so what's found becomes a Range on the page
+function paperParaText(el) {
+  const segs = [];
+  let text = '';
+  const walk = (node) => {
+    for (const n of node.childNodes) {
+      if (n.nodeType === 3) { if (n.data) { segs.push({ node: n, at: text.length, len: n.data.length }); text += n.data; } }
+      else if (n.nodeType === 1 && n.matches(ATOMS)) { segs.push({ atom: n, at: text.length, len: 1 }); text += '\uFFFC'; }
+      else if (n.nodeType === 1 && !n.matches('.ph-mark')) walk(n);
+    }
+  };
+  walk(el);
+  return { el, text, segs };
+}
+function paraRange(pt, start, end) {
+  const find = (i, isEnd) => pt.segs.find((s) => (isEnd ? s.at < i && i <= s.at + s.len : s.at <= i && i < s.at + s.len));
+  const a = find(start, false);
+  const b = find(end, true);
+  if (!a || !b) return null;
+  try {
+    const r = new Range();
+    if (a.node) r.setStart(a.node, start - a.at); else r.setStartBefore(a.atom);
+    if (b.node) r.setEnd(b.node, end - b.at); else r.setEndAfter(b.atom);
+    return r;
+  } catch { return null; }
+}
+// what the rules read, in the order a reader does: the abstract, then the
+// paper's paragraphs, list items and captions (not headings or equations)
+const paperProse = () => [...document.querySelectorAll('#tp-abstract > p, #chapters .chapter-body > p:not(.h1):not(.h2):not(.h3):not(.eq):not(.symtab), #chapters figcaption, #chapters .subcap')];
+
+/* ---- First and Last Sentences ---- */
+
+// Each paragraph's first sentence gives its context and its last
+// concludes and points on: with the rest dimmed, a gap in that rhythm
+// shows at a glance. Drawn with the Highlight API: nothing in the file changes.
+let skimOn = false;
+function paperSkim(on = !skimOn) {
+  skimOn = on;
+  paperSkimDraw();
+  paperReportState();
+  if (on) toast(t('First and last sentences: the rest of each paragraph dimmed, to read its rhythm'));
+}
+function paperSkimDraw() {
+  if (!skimOn || !book || !isPaper()) { CSS.highlights.delete('neo-skim'); return; }
+  const hl = new Highlight();
+  for (const p of document.querySelectorAll('#chapters .chapter-body > p:not(.h1):not(.h2):not(.h3):not(.eq):not(.symtab):not(.li)')) {
+    const pt = paperParaText(p);
+    const s = NeoEditing.sentences(pt.text);
+    if (s.length < 3) continue;
+    const r = paraRange(pt, s[1].start, s[s.length - 2].end);
+    if (r) hl.add(r);
+  }
+  CSS.highlights.set('neo-skim', hl);
+}
+
+/* ---- the editing pass ---- */
+
+// Edit → Editing Pass: the language rules (filler, passive, a comparison
+// with no basis, long sentences) and what consistency asks (acronyms, one
+// spelling throughout, units, ranges, figures referred to in order),
+// marked like the spellcheck pass. ⌘' steps through them; a right-click
+// (or ⇧F10) says why and offers the fix where there is one.
+let editingOn = false;
+let editingFlags = []; // [{ range, flag }] in reading order
+const editingLeft = new Set(); // what the writer chose to leave, for this session
+const flagKey = (flag, text) => flag.rule + '\u0000' + text;
+function paperEditing(on = !editingOn) {
+  editingOn = on;
+  if (on) {
+    paperEditingScan();
+    const by = new Map();
+    for (const { flag } of editingFlags) by.set(flag.rule, (by.get(flag.rule) || 0) + 1);
+    const parts = [...by].map(([rule, n]) => `${n} ${t(rule === 'order' ? ORDER_RULE : NeoEditing.RULES[rule] || rule).toLowerCase()}`);
+    toast(editingFlags.length
+      ? t('Editing pass: {n} to look at ({what}). {key} goes to the next; right-click one for why.', { n: editingFlags.length, what: parts.join(', '), key: IS_MAC ? '⌘\'' : 'Ctrl+\'' })
+      : t('Editing pass: nothing to look at'), 8000);
+  } else {
+    editingFlags = [];
+    CSS.highlights.delete('neo-edit');
+    toast(t('Editing pass off'));
+  }
+  paperReportState();
+}
+function paperEditingScan() {
+  if (!editingOn || !book || !isPaper()) return;
+  const paras = paperProse().map(paperParaText);
+  const found = [];
+  for (const flag of NeoEditing.check(paras.map((p) => p.text), { lang: writingLanguage() })) {
+    const range = paraRange(paras[flag.p], flag.start, flag.end);
+    if (range) found.push({ range, flag });
+  }
+  found.push(...figureOrderFlags());
+  editingFlags = found
+    .filter(({ range, flag }) => !editingLeft.has(flagKey(flag, range.toString())))
+    .sort((a, b) => a.range.compareBoundaryPoints(Range.START_TO_START, b.range));
+  const hl = new Highlight();
+  for (const { range } of editingFlags) hl.add(range);
+  CSS.highlights.set('neo-edit', hl);
+}
+let editingTimer = null;
+document.addEventListener('input', (e) => {
+  const at = e.target && e.target.closest && e.target.closest('#chapters, #tp-abstract');
+  if (!at || (!editingOn && !skimOn)) return;
+  clearTimeout(editingTimer);
+  editingTimer = setTimeout(() => { paperEditingScan(); paperSkimDraw(); }, 700);
+}, true);
+// Every figure and table referred to in the text, first in the order
+// they're numbered (journals ask for it, and readers expect it)
+const ORDER_RULE = tk('Figures in order');
+function figureOrderFlags() {
+  const out = [];
+  const xrefs = [...document.querySelectorAll('#chapters .xref')];
+  for (const kind of ['fig', 'tbl']) {
+    let lastFirst = null;
+    let lastLabel = '';
+    for (const el of document.querySelectorAll(`#chapters figure.${kind}`)) {
+      const id = el.dataset.id;
+      const label = (paper.targets && paper.targets.get(id) || {}).label || '';
+      const first = xrefs.find((x) => x.dataset.ref === id || (x.dataset.ref || '').startsWith(id + '-'));
+      const vars = { what: label, other: lastLabel };
+      if (!first) {
+        const r = new Range();
+        r.selectNodeContents(el.querySelector(':scope > figcaption'));
+        out.push({ range: r, flag: { rule: 'order', key: tk('{what} isn’t referred to in the text: say where it comes in.'), vars, fix: null } });
+      } else if (lastFirst && first.compareDocumentPosition(lastFirst) & Node.DOCUMENT_POSITION_FOLLOWING) {
+        const r = new Range();
+        r.selectNode(first);
+        out.push({ range: r, flag: { rule: 'order', key: tk('{what} is first referred to before {other}: number them in the order the text first mentions them.'), vars, fix: null } });
+      }
+      if (first) { lastFirst = first; lastLabel = label; }
+    }
+  }
+  return out;
+}
+const flagNote = (flag) => t(flag.key || flag.note, flag.vars || {});
+// ⌘' and ⌘⇧': the next one after the caret (or before), selected and in view
+function paperEditingNext(dir = 1) {
+  if (!editingOn) { paperEditing(true); return; }
+  paperEditingScan();
+  if (!editingFlags.length) { toast(t('Editing pass: nothing to look at')); return; }
+  const sel = window.getSelection();
+  const here = sel.rangeCount ? sel.getRangeAt(0) : null;
+  const after = (r) => !here || r.compareBoundaryPoints(Range.START_TO_END, here) > 0;
+  const list = dir > 0 ? editingFlags : [...editingFlags].reverse();
+  const next = list.find(({ range }) => (dir > 0 ? after(range) : !here || range.compareBoundaryPoints(Range.END_TO_START, here) < 0)) || list[0];
+  const host = next.range.startContainer.parentElement && next.range.startContainer.parentElement.closest('[contenteditable="true"]');
+  if (host) host.focus({ preventScroll: true });
+  sel.removeAllRanges();
+  sel.addRange(next.range.cloneRange());
+  (next.range.startContainer.parentElement || next.range.startContainer).scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
+  // said because it was asked for: the writer pressed the key
+  toast(flagNote(next.flag), 6000);
+}
+// the flag under a point, or the caret
+function editingFlagAt(node, offset) {
+  if (!editingOn) return null;
+  return editingFlags.find(({ range }) => { try { return range.isPointInRange(node, offset) && !range.collapsed; } catch { return false; } }) || null;
+}
+async function editingMenu(e, hit) {
+  const { range, flag } = hit;
+  const items = [];
+  const was = range.toString();
+  if (flag.fix !== null && flag.fix !== undefined) items.push({ label: flag.fix ? t('Change to “{text}”', { text: flag.fix }) : t('Delete “{text}”', { text: was.trim() }), value: 'fix' });
+  items.push({ label: t('Leave This One'), value: 'leave' }, { label: t('Next Thing to Look At'), value: 'next' });
+  const choice = await popMenu(e.clientX, e.clientY, items, { title: flagNote(flag), from: e.from });
+  if (choice === 'fix') {
+    const host = range.startContainer.parentElement && range.startContainer.parentElement.closest('[contenteditable="true"]');
+    if (host) host.focus({ preventScroll: true });
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    if (flag.fix) document.execCommand('insertText', false, flag.fix); else document.execCommand('delete');
+    paperEditingScan();
+  } else if (choice === 'leave') {
+    editingLeft.add(flagKey(flag, was));
+    paperEditingScan();
+  } else if (choice === 'next') paperEditingNext(1);
+}
+
+/* ---- anonymous for review ---- */
+
+// File → Anonymous for Review: for a double-blind submission, every
+// preview and export leaves out the authors, their affiliations, and the
+// sections that name them (Acknowledgements, Funding, Author
+// contributions). The paper itself keeps everything.
+function paperAnonymous(on = !paperMeta().anonymous) {
+  const m = paperMeta();
+  if (on) m.anonymous = true; else delete m.anonymous;
+  scheduleMetaSave();
+  paperShowAuthors();
+  paperReportState();
+  toast(on ? t('Anonymous for review: previews and exports leave out the authors, their affiliations, the acknowledgements and the author contributions. The paper keeps them. Look over Data availability for links that name you.')
+    : t('Previews and exports name the authors again'), 9000);
+}
+const NAMES_AUTHORS = /acknowledg|funding|contribution/i;
+function anonymize(model) {
+  model.authors = [{ name: 'Anonymous', affiliations: [] }];
+  model.affiliations = [];
+  const out = [];
+  let skip = 0; // the level of the section being left out
+  for (const b of model.blocks) {
+    if (b.type === 'heading') {
+      if (skip && b.level <= skip) skip = 0;
+      if (!skip && NAMES_AUTHORS.test(NeoPaperExport.runsText(b.runs))) { skip = b.level; continue; }
+    }
+    if (!skip) out.push(b);
+  }
+  model.blocks = out;
+  model.anonymous = true;
+  return model;
+}
+
+/* ---- the abstract's moves, for the talk outline ---- */
+
+// Each sentence of the abstract under the move it makes (the same cues as
+// the abstract guide), moving forward only: a sentence that makes none
+// carries on the one before
+const MOVE_NAMES = ['status', 'problem', 'solution', 'did', 'found', 'impact'];
+function abstractMoves(text) {
+  const sentences = text ? text.split(/(?<=[.!?])\s+(?=[A-Z“"(])/) : [];
+  let at = 0;
+  return sentences.map((s, i) => {
+    if (i > 0) for (let k = Math.max(1, at); k < MOVE_CUES.length; k++) if (MOVE_CUES[k].test(s)) { at = k; break; }
+    return { move: MOVE_NAMES[at], text: s };
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Figures: an image dropped, pasted or picked, with its caption      */
 /* ------------------------------------------------------------------ */
 
 const FIGURE_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/svg+xml': 'svg' };
+const FIGURE_ACCEPT = Object.keys(FIGURE_TYPES).join(',');
+// Insert → Figure… and /figure: a picture picked, as a figure where the caret is
+async function paperInsertFigure() {
+  const body = paperCaretBody();
+  if (!body) return;
+  const at = caretBlock(body);
+  const file = await pickFile(FIGURE_ACCEPT);
+  if (file) await paperAddFigure(file, body, at);
+}
 const FIGURE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' };
 
 function figureUrl(name) {
@@ -1982,7 +3132,8 @@ async function addPanel(fig, file) {
   loadFigure(fig);
 }
 async function removePanel(fig, panel) {
-  const letter = String.fromCharCode(97 + [...fig.querySelectorAll(':scope > .panel')].indexOf(panel));
+  const was = [...fig.querySelectorAll(':scope > .panel')];
+  const letter = String.fromCharCode(97 + was.indexOf(panel));
   const sub = panel.querySelector('.subcap').textContent.trim();
   if (sub) await paperToDarlings(sub, t('Figure {n}{letter}', { n: fig.dataset.num || '', letter }));
   figureChange(fig, 'figure panel', () => {
@@ -1999,8 +3150,71 @@ async function removePanel(fig, panel) {
         cap.textContent = (subLeft + ' ' + cap.textContent).trim();
       }
       last.remove();
+      delete fig.dataset.cols;
     }
+    relinkPanels(fig, was);
   });
+}
+
+// The panels' layout: so many to a row (data-cols on the figure; unset,
+// all in one row) and a panel more than one column wide (data-colspan).
+// Every export sets them the same way (panelRows in paper/export.js).
+const PANEL_COLS = ['1', '2', '3', '4'];
+function setPanelLayout(fig, { cols, panel, colspan } = {}) {
+  figureChange(fig, 'figure panels', () => {
+    if (cols !== undefined) { if (cols) fig.dataset.cols = cols; else delete fig.dataset.cols; }
+    if (panel && colspan !== undefined) { if (colspan > 1) panel.dataset.colspan = String(colspan); else delete panel.dataset.colspan; }
+  });
+}
+// A cross-reference to a panel (Figure 2b) names it by its letter: when
+// panels move or one goes, each reference follows its picture (to the
+// figure itself when its panel is gone). was: the panels as they stood
+function relinkPanels(fig, was) {
+  const now = [...fig.querySelectorAll(':scope > .panel')];
+  const id = fig.dataset.id;
+  for (const x of document.querySelectorAll('#chapters .xref')) {
+    const m = new RegExp('^' + id + '-([a-z])$').exec(x.dataset.ref || '');
+    if (!m) continue;
+    const k = now.indexOf(was[m[1].charCodeAt(0) - 97]);
+    x.dataset.ref = k >= 0 ? id + '-' + String.fromCharCode(97 + k) : id;
+  }
+}
+function movePanel(fig, panel, dir) {
+  const was = [...fig.querySelectorAll(':scope > .panel')];
+  const other = dir < 0 ? panel.previousElementSibling : panel.nextElementSibling;
+  if (!other || !other.matches('.panel')) return;
+  figureChange(fig, 'figure panels', () => {
+    if (dir < 0) other.before(panel); else other.after(panel);
+    relinkPanels(fig, was);
+  });
+}
+// how many to a row, and for one panel: how wide, and where among the others
+async function panelMenu(x, y, fig, panel, from) {
+  const panels = [...fig.querySelectorAll(':scope > .panel')];
+  const cols = fig.dataset.cols || '';
+  const items = [{ label: t('All in One Row'), value: 'cols:', checked: !cols }];
+  for (const n of PANEL_COLS) {
+    if (+n < panels.length) items.push({ label: n === '1' ? t('One Above Another') : t('{n} to a Row', { n }), value: 'cols:' + n, checked: cols === n });
+  }
+  if (panel) {
+    const i = panels.indexOf(panel);
+    const letter = String.fromCharCode(97 + i);
+    const span = +(panel.dataset.colspan || 1);
+    // as wide as a row can hold, when they're in rows
+    const most = cols ? Math.min(3, +cols) : 3;
+    items.push('-',
+      { label: t('Panel ({letter}) as Wide as the Others', { letter }), value: 'span:1', checked: span === 1 },
+      ...(most >= 2 ? [{ label: t('Panel ({letter}) Twice as Wide', { letter }), value: 'span:2', checked: span === 2 }] : []),
+      ...(most >= 3 ? [{ label: t('Panel ({letter}) Three Times as Wide', { letter }), value: 'span:3', checked: span === 3 }] : []),
+      '-',
+      { label: t('Move Panel ({letter}) Earlier', { letter }), value: 'earlier', disabled: i === 0 },
+      { label: t('Move Panel ({letter}) Later', { letter }), value: 'later', disabled: i === panels.length - 1 });
+  }
+  const choice = await popMenu(x, y, items, { title: t('Panels'), from: from || panel || fig });
+  if (!choice) return;
+  if (choice.startsWith('cols:')) setPanelLayout(fig, { cols: choice.slice(5) });
+  else if (choice.startsWith('span:')) setPanelLayout(fig, { panel, colspan: +choice.slice(5) });
+  else movePanel(fig, panel, choice === 'earlier' ? -1 : 1);
 }
 
 /* ---- layout, as LaTeX lays figures out ---- */
@@ -2009,6 +3223,7 @@ async function removePanel(fig, panel) {
 function figureLayoutAttrs(n) {
   const d = n.dataset;
   return (FIGURE_WIDTHS.includes(d.width) && d.width !== '100' ? ` data-width="${d.width}"` : '')
+    + (PANEL_COLS.includes(d.cols) ? ` data-cols="${d.cols}"` : '')
     + (['left', 'right'].includes(d.wrap) ? ` data-wrap="${d.wrap}"` : '')
     + (['h', 't', 'b', 'p', 'H'].includes(d.place) ? ` data-place="${d.place}"` : '')
     + (d.span === 'page' ? ' data-span="page"' : '');
@@ -2049,16 +3264,26 @@ function setFigureLayout(el, { width, wrap, place, span } = {}) {
   });
 }
 async function placementMenu(x, y, el) {
-  const items = PLACEMENTS.map(([v, label, what]) => ({ label: t(label), value: 'p:' + v, checked: (el.dataset.place || '') === v, title: t(what) }));
+  const items = [];
+  // a figure's width and wrap, as its toolbar has them, for the keyboard
+  if (el.matches('figure.fig')) {
+    const w = el.dataset.width || '100';
+    for (const v of FIGURE_WIDTHS) items.push({ label: t('{n}% of the text width', { n: v }), value: 'w:' + v, checked: w === v });
+    items.push('-', { label: t('Text wraps on its right'), value: 'wrap:left', checked: el.dataset.wrap === 'left' },
+      { label: t('Text wraps on its left'), value: 'wrap:right', checked: el.dataset.wrap === 'right' }, '-');
+  }
+  items.push(...PLACEMENTS.map(([v, label, what]) => ({ label: t(label), value: 'p:' + v, checked: (el.dataset.place || '') === v, title: t(what) })));
   items.push('-', { label: t('Across Both Columns'), value: 'span', checked: el.dataset.span === 'page' });
-  const choice = await popMenu(x, y, items, { title: t('Where it may go when printed') });
+  const choice = await popMenu(x, y, items, { title: t('Where it may go when printed'), from: el });
   if (!choice) return;
-  if (choice === 'span') setFigureLayout(el, { span: el.dataset.span !== 'page', wrap: '' });
+  if (choice.startsWith('w:')) setFigureLayout(el, { width: choice.slice(2) });
+  else if (choice.startsWith('wrap:')) { const side = choice.slice(5); setFigureLayout(el, { wrap: el.dataset.wrap === side ? '' : side }); }
+  else if (choice === 'span') setFigureLayout(el, { span: el.dataset.span !== 'page', wrap: '' });
   else setFigureLayout(el, { place: choice.slice(2), wrap: '' });
 }
 
-// the toolbar over a figure, while the pointer is on it
-const figTools = { el: null, fig: null, timer: null };
+// the toolbar over a figure, while the pointer is on it (or the caret in it)
+const figTools = { el: null, fig: null, panel: null, timer: null };
 function figToolsDraw() {
   const fig = figTools.fig;
   if (!fig || !fig.isConnected) { figToolsHide(true); return; }
@@ -2098,9 +3323,15 @@ function figToolsDraw() {
     const r = e.target.getBoundingClientRect();
     placementMenu(r.left, r.bottom + 4, fig);
   });
+  if (fig.matches('figure.fig') && fig.querySelectorAll(':scope > .panel').length > 1) {
+    btn(group('ft-panels'), '▦ ' + t('Panels') + ' ▾', t('How the panels are set out: so many to a row, how wide, in what order'), !!fig.dataset.cols, (e) => {
+      const r = e.target.getBoundingClientRect();
+      panelMenu(r.left, r.bottom + 4, fig, figTools.panel && fig.contains(figTools.panel) ? figTools.panel : null);
+    });
+  }
   if (fig.matches('figure.fig')) {
     btn(group('ft-panel'), '+ ' + t('Panel'), t('Add a picture beside this one, as panel (b), (c)…'), false, async () => {
-      const file = await pickFile('image/png,image/jpeg,image/gif,image/webp,image/svg+xml');
+      const file = await pickFile(FIGURE_ACCEPT);
       if (file) addPanel(fig, file);
     });
   }
@@ -2113,6 +3344,10 @@ function figToolsDraw() {
   bar.style.top = Math.max(8, box.top - bar.offsetHeight - 6) + 'px';
   bar.hidden = false;
 }
+function figToolsShow(fig) {
+  clearTimeout(figTools.timer);
+  if (figTools.fig !== fig || !figTools.el || figTools.el.hidden) { figTools.fig = fig; figToolsDraw(); }
+}
 function figToolsHide(now) {
   clearTimeout(figTools.timer);
   const go = () => { if (figTools.el) figTools.el.hidden = true; figTools.fig = null; };
@@ -2122,14 +3357,30 @@ $('#chapters').addEventListener('mouseover', (e) => {
   if (!book || !isPaper() || NO_HOVER) return;
   const fig = e.target.closest && e.target.closest('#chapters figure.fig, #chapters figure.tbl');
   if (!fig) return;
-  clearTimeout(figTools.timer);
-  if (figTools.fig !== fig || !figTools.el || figTools.el.hidden) { figTools.fig = fig; figToolsDraw(); }
+  // the panel last pointed at, or written in, is the one its menu is for
+  const panel = e.target.closest('.panel');
+  if (panel) figTools.panel = panel;
+  figToolsShow(fig);
 });
 $('#chapters').addEventListener('mouseout', (e) => {
   if (!figTools.fig) return;
   const to = e.relatedTarget;
   if (to && (figTools.fig.contains(to) || (figTools.el && figTools.el.contains(to)))) return;
   figToolsHide();
+});
+// and while the caret is in its caption or cells: controls show on keyboard focus too
+$('#chapters').addEventListener('focusin', (e) => {
+  if (!book || !isPaper()) return;
+  const fig = e.target.closest && e.target.closest('#chapters figure.fig, #chapters figure.tbl');
+  if (!fig) return;
+  // the panel last pointed at, or written in, is the one its menu is for
+  const panel = e.target.closest('.panel');
+  if (panel) figTools.panel = panel;
+  figToolsShow(fig);
+});
+$('#chapters').addEventListener('focusout', (e) => {
+  if (!figTools.fig || (e.relatedTarget && figTools.fig.contains(e.relatedTarget))) return;
+  if (!figTools.fig.matches(':hover')) figToolsHide();
 });
 $('#paper-scroll').addEventListener('scroll', () => { if (figTools.fig) figToolsHide(true); }, { passive: true });
 
@@ -2230,8 +3481,11 @@ function cellHtml(cell) {
 
 // Keys inside a figure's caption or a table's cells
 function figureKey(e, body, chId) {
-  const cell = e.target.closest('th, td');
   const fig = e.target.closest('figure');
+  const place = e.target.closest('figcaption, .subcap, th, td');
+  const cell = e.target.closest('th, td');
+  if (!place) return e.key === 'Tab';
+  const plain = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
   if (e.key === 'Tab' && cell) {
     e.preventDefault();
     const cells = [...fig.querySelectorAll('th, td')];
@@ -2246,16 +3500,40 @@ function figureKey(e, body, chId) {
       }
       cell.closest('tr').after(tr);
       syncChapter(body, chId);
-      placeCaret(tr.firstElementChild, 0);
+      caretInto(tr.firstElementChild, false);
       return true;
     }
-    if (i < 0) { fig.querySelector('figcaption').focus(); return true; }
+    if (i < 0) { stepFigure(fig, cell, -1); return true; }
     const r = document.createRange();
     r.selectNodeContents(cells[i]);
     const s = window.getSelection();
     s.removeAllRanges();
     s.addRange(r);
     cells[i].focus();
+    return true;
+  }
+  // Tab from a caption: on to the next place to write, or out
+  if (e.key === 'Tab') { e.preventDefault(); stepFigure(fig, place, e.shiftKey ? -1 : 1); return true; }
+  // Esc: back to the paragraph after it, where the writing goes on
+  if (e.key === 'Escape' && plain) { e.preventDefault(); e.stopPropagation(); leaveFigure(fig, 1, { write: true }); return true; }
+  // the arrows past a caption's or cell's edge: the next one, or out of the figure
+  const sel = window.getSelection();
+  if (plain && /^Arrow(Up|Down|Left|Right)$/.test(e.key) && sel.rangeCount && sel.isCollapsed) {
+    const r = sel.getRangeAt(0);
+    const dir = e.key === 'ArrowUp' || e.key === 'ArrowLeft' ? -1 : 1;
+    const vertical = e.key === 'ArrowUp' || e.key === 'ArrowDown';
+    if (!(vertical ? caretOnEdgeLine(place, r, dir) : atBlockEdge(place, r, dir))) return true;
+    e.preventDefault();
+    if (vertical && cell) {
+      // up and down a table's column, as in a spreadsheet
+      const rows = [...fig.querySelectorAll('tr')];
+      const tr = cell.closest('tr');
+      const row = rows[rows.indexOf(tr) + dir];
+      if (row) { caretInto(row.children[Math.min([...tr.children].indexOf(cell), row.children.length - 1)], dir < 0); return true; }
+      stepFigure(fig, dir < 0 ? rows[0].firstElementChild : rows[rows.length - 1].lastElementChild, dir);
+      return true;
+    }
+    stepFigure(fig, place, dir);
     return true;
   }
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -2265,26 +3543,18 @@ function figureKey(e, body, chId) {
       const tr = cell.closest('tr');
       const k = [...tr.children].indexOf(cell);
       const next = tr.nextElementSibling;
-      if (next && next.children[k]) { placeCaret(next.children[k], 0); next.children[k].focus(); return true; }
-    } else if (e.target.matches('figcaption') && fig.classList.contains('tbl')) {
+      if (next && next.children[k]) { caretInto(next.children[k], false); return true; }
+    } else if (place.matches('figcaption') && fig.classList.contains('tbl')) {
       const first = fig.querySelector('th, td');
-      if (first) { first.focus(); placeCaret(first, 0); return true; }
+      if (first) { caretInto(first, false); return true; }
     }
     // out of the figure, to the paragraph after it
-    let after = fig.nextElementSibling;
-    if (!after || !after.matches('p:not(.eq)')) {
-      after = document.createElement('p');
-      after.innerHTML = '<br>';
-      fig.after(after);
-      syncChapter(body, chId);
-    }
-    body.focus({ preventScroll: true });
-    placeCaret(after, 0);
+    leaveFigure(fig, 1, { write: true });
     return true;
   }
   if (e.key === 'Enter') { e.preventDefault(); document.execCommand('insertLineBreak'); return true; }
   // a caption and cells are short: no breaks, no chapters, no poetry
-  return e.key === 'Tab';
+  return false;
 }
 
 // Words a table or figure takes with it go to Darlings, the way a deleted
@@ -2303,6 +3573,27 @@ async function paperToDarlings(text, what) {
   toast(t('{what} removed — its words are in Darlings, or {key} to undo', { what, key: KZ }));
 }
 const cellsText = (cells) => cells.map((c) => c.textContent.trim()).filter(Boolean);
+// the words a figure or table holds: its captions, or its caption and rows
+function figureWords(fig) {
+  const cap = fig.querySelector(':scope > figcaption');
+  const lines = fig.matches('figure.tbl')
+    ? [cap.textContent, ...[...fig.querySelectorAll('tr')].map((r) => cellsText([...r.children]).join('\t'))]
+    : [...[...fig.querySelectorAll(':scope > .panel .subcap')].map((c) => c.textContent), cap.textContent];
+  return lines.map((l) => l.trim()).filter(Boolean).join('\n');
+}
+const figureName = (fig) => (fig.matches('figure.tbl') ? t('Table {n}', { n: fig.dataset.num || '' }) : t('Figure {n}', { n: fig.dataset.num || '' }));
+// A selection deleted or typed over that holds a whole figure or table: the
+// engine takes it, and its words go to Darlings first (⌘Z brings it back)
+function paperSelectionTakes(e, body) {
+  const cmd = e.metaKey || e.ctrlKey;
+  if (!(e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Enter' || (e.key.length === 1 && !cmd))) return;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || sel.isCollapsed) return;
+  const r = sel.getRangeAt(0);
+  for (const fig of body.querySelectorAll('figure')) {
+    if (r.intersectsNode(fig) && !fig.contains(r.startContainer) && !fig.contains(r.endContainer)) paperToDarlings(figureWords(fig), figureName(fig));
+  }
+}
 
 async function tableMenu(e, cell) {
   const fig = cell.closest('figure.tbl');
@@ -2322,7 +3613,7 @@ async function tableMenu(e, cell) {
     { label: t('Copy a Reference to This Table'), value: 'xref' },
     '-',
     { label: t('Delete Table'), value: 'delete', danger: true }
-  ], { title: t('Table') });
+  ], { title: t('Table'), from: e.from });
   if (!choice) return;
   const body = fig.closest('.chapter-body');
   const chId = body.closest('.chapter').dataset.id;
@@ -2354,8 +3645,7 @@ async function tableMenu(e, cell) {
       c.replaceWith(n);
     }
   } else if (choice === 'delete') {
-    const cap = fig.querySelector('figcaption').textContent.trim();
-    await paperToDarlings([cap, ...rows.map((r) => cellsText([...r.children]).join('\t'))].filter(Boolean).join('\n'), t('Table {n}', { n: fig.dataset.num || '' }));
+    await paperToDarlings(figureWords(fig), figureName(fig));
     fig.remove();
   }
   syncChapter(body, chId);
@@ -2370,6 +3660,7 @@ async function figureMenu(e, fig) {
   const items = [
     { label: t('Layout and Placement…'), value: 'place' },
     { label: t('Add a Panel…'), value: 'panel' },
+    ...(panels.length > 1 ? [{ label: t('Panel Layout…'), value: 'panels' }] : []),
     ...(panel && panels.length > 1 ? [{ label: t('Remove Panel ({letter})', { letter: String.fromCharCode(97 + panels.indexOf(panel)) }), value: 'unpanel' }] : []),
     '-',
     { label: t('Description for Screen Readers…'), value: 'alt' },
@@ -2378,18 +3669,19 @@ async function figureMenu(e, fig) {
     '-',
     { label: t('Delete Figure'), value: 'delete', danger: true }
   ];
-  const choice = await popMenu(e.clientX, e.clientY, items, { title: t('Figure {n}', { n: fig.dataset.num || '' }) });
+  const choice = await popMenu(e.clientX, e.clientY, items, { title: t('Figure {n}', { n: fig.dataset.num || '' }), from: e.from });
   if (!choice) return;
   const body = fig.closest('.chapter-body');
   const chId = body.closest('.chapter').dataset.id;
   if (choice === 'xref') { copyXref(fig); return; }
   if (choice === 'place') { placementMenu(e.clientX, e.clientY, fig); return; }
   if (choice === 'panel') {
-    const file = await pickFile('image/png,image/jpeg,image/gif,image/webp,image/svg+xml');
+    const file = await pickFile(FIGURE_ACCEPT);
     if (file) addPanel(fig, file);
     return;
   }
   if (choice === 'unpanel') { removePanel(fig, panel); return; }
+  if (choice === 'panels') { await panelMenu(e.clientX, e.clientY, fig, panel, e.from); return; }
   if (choice === 'alt') {
     const img = (panel || fig).querySelector(':scope > img');
     const v = await askInput(t('Describe the figure'), t('What it shows, for someone who can’t see it'), img.alt || '');
@@ -2399,7 +3691,7 @@ async function figureMenu(e, fig) {
     return;
   }
   if (choice === 'replace') {
-    const file = await pickFile('image/png,image/jpeg,image/gif,image/webp,image/svg+xml');
+    const file = await pickFile(FIGURE_ACCEPT);
     if (!file) return;
     const name = await saveFigureFile(file);
     if (!name) return;
@@ -2413,8 +3705,7 @@ async function figureMenu(e, fig) {
   }
   if (choice === 'delete') {
     // the captions' words go to Darlings; the pictures stay in the paper's folder
-    const words = [...panels.map((p) => p.querySelector('.subcap').textContent.trim()), fig.querySelector(':scope > figcaption').textContent.trim()].filter(Boolean).join('\n');
-    await paperToDarlings(words, t('Figure {n}', { n: fig.dataset.num || '' }));
+    await paperToDarlings(figureWords(fig), figureName(fig));
     figToolsHide(true);
     figureChange(fig, 'figure', () => fig.remove());
   }
@@ -2513,8 +3804,11 @@ function paperPasteHtml(html) {
     const cls = n.classList;
     if (cls.contains('cite')) return citeHtml(citeData(n), n.hasAttribute('data-narrative'));
     if (cls.contains('xref')) return `<span class="xref" contenteditable="false" data-ref="${escHtml(n.dataset.ref || '')}">${escHtml(n.textContent)}</span>`;
-    if (cls.contains('math')) return `<span class="math" contenteditable="false">${escHtml(n.textContent)}</span>`;
-    if (cls.contains('eq')) return `<p class="eq" contenteditable="false" data-id="${paperId('eq')}">${escHtml(n.textContent)}</p>`;
+    if (cls.contains('math')) return `<span class="math" contenteditable="false">${escHtml(texOf(n))}</span>`;
+    // a symbol stays one when this paper defines it (pasted from another, it's its maths)
+    if (cls.contains('sym')) return symbolOf(n.dataset.sym) ? symHtml(symbolOf(n.dataset.sym)) : `<span class="math" contenteditable="false">${escHtml(texOf(n))}</span>`;
+    if (cls.contains('eq')) return `<p class="eq" contenteditable="false" data-id="${paperId('eq')}">${escHtml(texOf(n))}</p>`;
+    if (cls.contains('symtab')) return makeSymbolTable(['parameter', 'variable'].includes(n.dataset.kind) ? n.dataset.kind : '').outerHTML;
     // a figure or a table is made again from its parts: nothing else in
     // the clipboard's markup comes along
     if (tag === 'figure' && cls.contains('tbl')) {
@@ -2530,13 +3824,18 @@ function paperPasteHtml(html) {
       const okSrc = (v) => (/^figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)$/.test(v || '') ? v : '');
       const alt = (img) => escHtml(img ? img.alt : '').replace(/"/g, '&quot;');
       const cap = n.querySelector(':scope > figcaption');
-      const panels = [...n.querySelectorAll(':scope > .panel')].map((p) => `<div class="panel"${okSrc(p.dataset.src) ? ` data-src="${okSrc(p.dataset.src)}"` : ''}><img alt="${alt(p.querySelector('img'))}"><span class="subcap" contenteditable="true">${cellHtml(p.querySelector('.subcap') || document.createElement('i'))}</span></div>`);
+      const panels = [...n.querySelectorAll(':scope > .panel')].map((p) => `<div class="panel"${okSrc(p.dataset.src) ? ` data-src="${okSrc(p.dataset.src)}"` : ''}${['2', '3'].includes(p.dataset.colspan) ? ` data-colspan="${p.dataset.colspan}"` : ''}><img alt="${alt(p.querySelector('img'))}"><span class="subcap" contenteditable="true">${cellHtml(p.querySelector('.subcap') || document.createElement('i'))}</span></div>`);
       const one = !panels.length && okSrc(n.dataset.src) ? ` data-src="${okSrc(n.dataset.src)}"` : '';
       return `<figure class="fig" contenteditable="false" data-id="${paperId('fig')}"${one}${figureLayoutAttrs(n)}>${panels.length ? panels.join('') : `<img alt="${alt(n.querySelector(':scope > img'))}">`}<figcaption contenteditable="true">${cap ? cellHtml(cap) : ''}</figcaption></figure>`;
     }
     if (tag === 'p') {
       const level = HEADINGS.find((h) => cls.contains(h));
-      return level ? `<p class="${level}" data-id="${paperId('sec')}">${out(n)}</p>` : `<p>${out(n)}</p>`;
+      if (level) return `<p class="${level}" data-id="${paperId('sec')}">${out(n)}</p>`;
+      if (cls.contains('li') && ['ul', 'ol'].includes(n.dataset.list)) {
+        const deep = ['2', '3'].includes(n.dataset.level) ? ` data-level="${n.dataset.level}"` : '';
+        return `<p class="li" data-list="${n.dataset.list}"${deep}>${out(n)}</p>`;
+      }
+      return `<p>${out(n)}</p>`;
     }
     if (['i', 'em'].includes(tag)) return `<i>${out(n)}</i>`;
     if (['b', 'strong'].includes(tag)) return `<b>${out(n)}</b>`;
@@ -2584,19 +3883,72 @@ $('#paper-scroll').addEventListener('drop', paperDrop);
 
 $('#chapters').addEventListener('click', (e) => {
   if (!book || !isPaper()) return;
-  const node = e.target.closest('.cite, .math, .eq, .xref');
+  const node = e.target.closest('.cite, .math, .eq, .xref, .sym, p.symtab');
   if (!node || !node.closest('.chapter-body')) return;
   e.preventDefault();
   if (node.matches('.cite')) openCitePop(node);
   else if (node.matches('.math, .eq')) editMath(node);
+  else if (node.matches('.sym')) symbolMenu(e, node);
+  else if (node.matches('p.symtab')) symtabMenu(e, node);
   else xrefMenu(e, node);
 });
+// Shift+F10 (or the menu key): what a click or a right-click opens, for
+// where the caret is: a table's rows and columns, a figure's menu, a
+// citation's pages, a cross-reference's, the maths beside it
+let menuKeyAt = 0;
+function paperMenuKey(e) {
+  if (e.key !== 'ContextMenu' && !(e.key === 'F10' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey)) return false;
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return false;
+  const r = sel.getRangeAt(0);
+  const at = r.startContainer.nodeType === 3 ? r.startContainer.parentElement : r.startContainer;
+  if (!at || !at.closest) return false;
+  // the menu hangs from what it's for, there being no pointer
+  const from = (el) => ({ clientX: 0, clientY: 0, target: el, from: el });
+  const tbl = at.closest('figure.tbl');
+  const fig = at.closest('figure.fig');
+  const beside = [nodeBeside(r, -1), nodeBeside(r, 1)].find((n) => n && n.matches(ATOMS));
+  const flagged = editingFlagAt(r.startContainer, r.startOffset);
+  let open = null;
+  if (flagged) open = () => editingMenu(from(at), flagged);
+  else if (tbl) {
+    const cell = at.closest('th, td') || tbl.querySelector('th, td');
+    open = () => tableMenu(from(cell), cell);
+  } else if (fig) open = () => figureMenu(from(at), fig);
+  else if (beside && beside.matches('.cite')) open = () => openCitePop(beside, { keys: true });
+  else if (beside && beside.matches('.xref')) open = () => xrefMenu(from(beside), beside);
+  else if (beside && beside.matches('.sym')) open = () => symbolMenu(from(beside), beside);
+  else if (beside) open = () => mathMenu(from(beside), beside);
+  if (!open) return false;
+  e.preventDefault();
+  menuKeyAt = Date.now();
+  // when it's done, the caret is back where it was, if nothing else took it
+  const place = at.closest('figcaption, .subcap, th, td');
+  const was = r.cloneRange();
+  Promise.resolve(open()).then(() => {
+    if (!place || !place.isConnected || !place.contains(was.startContainer)) return;
+    if (document.querySelector('.modal-backdrop:not([hidden]), .pop-menu, .paper-pop')) return;
+    place.focus({ preventScroll: true });
+    const s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(was);
+  });
+  return true;
+}
 $('#chapters').addEventListener('contextmenu', (e) => {
+  // the menu key's own, already open
+  if (Date.now() - menuKeyAt < 800) { e.preventDefault(); return; }
   if (!book || !isPaper()) return;
+  // something the editing pass marked: why, and the fix (not the spellcheck's menu too)
+  const pos = editingOn && document.caretRangeFromPoint(e.clientX, e.clientY);
+  const hit = pos && editingFlagAt(pos.startContainer, pos.startOffset);
+  if (hit) { e.preventDefault(); e.stopPropagation(); editingMenu(e, hit); return; }
   const cell = e.target.closest('figure.tbl th, figure.tbl td, figure.tbl');
   const fig = e.target.closest('figure.fig');
+  const math = e.target.closest('.math:not(.editing)');
   if (cell) { e.preventDefault(); tableMenu(e, cell.matches('figure') ? cell.querySelector('td, th') : cell); }
   else if (fig) { e.preventDefault(); figureMenu(e, fig); }
+  else if (math) { e.preventDefault(); mathMenu(e, math); }
 });
 $('#chapters').addEventListener('mousedown', (e) => {
   // a figure's picture is clicked for its menu, not dragged off as a file
@@ -2611,11 +3963,16 @@ async function xrefMenu(e, node) {
   const choice = await popMenu(e.clientX, e.clientY, [
     { label: tgt ? t('Go to {what}', { what: tgt.label }) : t('Its target is gone'), value: 'go', disabled: !tgt },
     { label: t('Remove'), value: 'remove', danger: true }
-  ]);
+  ], { from: e.from });
   if (choice === 'go' && tgt) {
     tgt.el.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
     tgt.el.classList.add('flash');
     setTimeout(() => tgt.el.classList.remove('flash'), 1200);
+    // and the caret with it, to write there
+    const fig = tgt.el.closest('figure');
+    if (fig) enterFigure(fig, 1);
+    else if (tgt.el.matches('p.eq')) editMath(tgt.el);
+    else { tgt.el.closest('.chapter-body').focus({ preventScroll: true }); caretInto(tgt.el, true); }
   } else if (choice === 'remove') removeNode(node);
 }
 
@@ -2641,7 +3998,7 @@ function renderPaperNav() {
     return item;
   };
   row(t('Title and abstract'), '', 'ps-front', () => { $('#title-page').scrollIntoView({ behavior: scrollBehavior(), block: 'start' }); });
-  const heads = [...document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3')];
+  const heads = paperHeadings();
   const caret = caretBlock(document.activeElement && document.activeElement.closest ? document.activeElement.closest('.chapter-body') || $('#chapters') : $('#chapters'));
   heads.forEach((h, i) => {
     const words = sectionWords(h, heads[i + 1]);
@@ -2661,6 +4018,13 @@ function renderPaperNav() {
     }, words);
     if (caret && (caret === h || (h.compareDocumentPosition(caret) & Node.DOCUMENT_POSITION_FOLLOWING && (!heads[i + 1] || heads[i + 1].compareDocumentPosition(caret) & Node.DOCUMENT_POSITION_PRECEDING)))) item.classList.add('current');
     const r = item.querySelector('.n-row');
+    // ⌥↑ ⌥↓: the section moves past the one beside it, the keyboard's drag
+    r.addEventListener('keydown', (e) => {
+      if (!e.altKey || e.metaKey || e.ctrlKey || e.shiftKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      paperNudgeSection(h, e.key === 'ArrowUp' ? -1 : 1);
+    });
     r.draggable = true;
     r.addEventListener('dragstart', (e) => {
       e.dataTransfer.setData('application/x-neo-section', String(i));
@@ -2720,8 +4084,37 @@ function sectionWords(h, next) {
     paperMoveSection(from, to);
   });
 })();
+// A section past its neighbour at its own level, up (dir < 0) or down,
+// never out from under the section it's part of
+function paperNudgeSection(h, dir) {
+  const heads = paperHeadings();
+  const level = (el) => HEADINGS.indexOf(headingOf(el));
+  const i = heads.indexOf(h);
+  const own = level(h);
+  // the next heading at its level that way, or −1 past the end of its parent
+  const peer = (from) => {
+    for (let k = from + dir; k >= 0 && k < heads.length; k += dir) {
+      if (level(heads[k]) < own) return -1;
+      if (level(heads[k]) === own) return k;
+    }
+    return -1;
+  };
+  const k = peer(i);
+  if (k < 0) return;
+  let to = k;
+  if (dir > 0) {
+    // down: after all of the neighbour, before whatever follows it
+    to = heads.length;
+    for (let m = k + 1; m < heads.length; m++) if (level(heads[m]) <= own) { to = m; break; }
+  }
+  paperMoveSection(i, to);
+  renderPaperNav();
+  const rows = [...document.querySelectorAll('#nav-list .paper-sec:not(.ps-front):not(.ps-refs) .n-row')];
+  const row = rows[paperHeadings().indexOf(h)];
+  if (row) row.focus();
+}
 function paperMoveSection(from, to) {
-  const heads = [...document.querySelectorAll('#chapters p.h1, #chapters p.h2, #chapters p.h3')];
+  const heads = paperHeadings();
   const h = heads[from];
   if (!h || to === from || to === from + 1) return;
   const level = HEADINGS.indexOf(headingOf(h));
@@ -2795,7 +4188,8 @@ function paperReportState() {
   }
   window.neo.paperState({
     on, style: m.style || null, custom: m.customStyleTitle || '', heading,
-    numbered: m.numbered !== false, double: !!m.double, linked: !!paper.linkedPath, journal: m.journal || NeoJournals.DEFAULT
+    numbered: m.numbered !== false, double: !!m.double, linked: !!paper.linkedPath, journal: m.journal || NeoJournals.DEFAULT,
+    editing: on && editingOn, skim: on && skimOn, anonymous: !!m.anonymous
   });
 }
 document.addEventListener('selectionchange', () => {
@@ -2822,6 +4216,9 @@ async function paperMenu(msg) {
       await paperCiteNow();
     }
     await saveMeta();
+    // its words in the cross-references (Fig. 2, Figure 2), saved with the paper
+    paperRenumber();
+    for (const body of paperBodies()) syncChapter(body, body.closest('.chapter').dataset.id);
     const wrap = $('#tp-abstract-wrap');
     if (wrap && wrap.recount) wrap.recount();
     renderNav();
@@ -2831,13 +4228,12 @@ async function paperMenu(msg) {
   else if (c === 'feedback') paperFeedback();
   else if (c === 'equation') paperInsertEquation();
   else if (c === 'table') paperInsertTable();
-  else if (c === 'figure') {
-    const body = paperCaretBody();
-    if (!body) return;
-    const at = caretBlock(body);
-    const file = await pickFile('image/png,image/jpeg,image/gif,image/webp,image/svg+xml');
-    if (file) paperAddFigure(file, body, at);
-  } else if (c === 'heading') {
+  else if (c === 'figure') await paperInsertFigure();
+  else if (c === 'editing') paperEditing();
+  else if (c === 'editingNext') paperEditingNext(msg.value || 1);
+  else if (c === 'skim') paperSkim();
+  else if (c === 'anonymous') paperAnonymous();
+  else if (c === 'heading') {
     if (currentTab !== 'manuscript') return;
     paperSetHeading(msg.value || '');
   } else if (c === 'style') {
@@ -2905,6 +4301,17 @@ async function paperRefresh() {
     await paperSaveRefs(paper.refs);
   }
   paperRefreshLinked();
+  // the symbols the same way: theirs adopted when nothing changed here
+  if (symbolsWriting) return;
+  const syms = await window.neo.readJSON(book.id, 'symbols', []);
+  if (symbolsWriting || !book || !isPaper() || !Array.isArray(syms)) return;
+  const sj = JSON.stringify(syms);
+  if (sj === paper.symbolsSaved) return;
+  if (JSON.stringify(paper.symbols) === paper.symbolsSaved) {
+    paper.symbols = syms;
+    paper.symbolsSaved = sj;
+    paperSymbolsShown();
+  } else await paperSaveSymbols(paper.symbols);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2962,7 +4369,7 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
     const xml = await paperStyleXml(style);
     if (xml) aside = paperRenderCites(NeoCite.processor({ style: xml, locales: await paperLocales(), items: paper.refs }));
   }
-  const citeHtmlOf = (n) => (aside ? aside.text.get(n) : paper.citeText.get(n)) || n.innerHTML;
+  const citeHtmlOf = (n) => (aside ? aside.text.get(n) : paper.citeText.get(n)) || (typeof n === 'string' ? '' : n.innerHTML);
   paperRenumber();
   const m = paperMeta();
   // maths as an SVG drawing (pages, PDF), MathML (Word's own equations) and,
@@ -2988,7 +4395,9 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
         out.push({ xref: n.dataset.ref, kind: tgt ? tgt.kind : '', num: tgt ? tgt.num : '', label: n.textContent });
         continue;
       }
-      if (cls.contains('math')) { out.push({ math: n.textContent, ...(await mathRun(n.textContent, false)) }); continue; }
+      if (cls.contains('math')) { out.push({ math: texOf(n), ...(await mathRun(texOf(n), false)) }); continue; }
+      // a symbol: maths to every format, its own name to LaTeX (one no longer defined is only its maths)
+      if (cls.contains('sym')) { const tex = symTex(n); out.push({ ...(symbolOf(n.dataset.sym) ? { sym: n.dataset.sym } : {}), math: tex, ...(await mathRun(tex, false)) }); continue; }
       if (tag === 'br') { out.push({ text: '\n', ...fmt }); continue; }
       const next = { ...fmt };
       if (tag === 'i' || tag === 'em') next.i = !fmt.i;
@@ -3013,6 +4422,7 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
     numbered: m.numbered !== false,
     double: !!m.double,
     font: getComputedStyle(paperBodies()[0] || document.body).fontFamily,
+    symbols: paper.symbols.map((s) => ({ id: s.id, tex: s.tex })),
     blocks: []
   };
   const abs = document.createElement('div');
@@ -3021,7 +4431,18 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
   for (const body of paperBodies()) {
     for (const el of body.children) {
       if (el.matches('p.h1, p.h2, p.h3')) model.blocks.push({ type: 'heading', level: HEADINGS.indexOf(headingOf(el)) + 1, num: el.dataset.num || '', unnumbered: isBackMatter(el), id: el.dataset.id, runs: await runsOf(el) });
-      else if (el.matches('p.eq')) model.blocks.push({ type: 'equation', id: el.dataset.id, num: el.dataset.num || '', tex: el.textContent, ...(await mathRun(el.textContent, true)) });
+      else if (el.matches('p.eq')) model.blocks.push({ type: 'equation', id: el.dataset.id, num: el.dataset.num || '', tex: texOf(el), ...(await mathRun(texOf(el), true)) });
+      else if (el.matches('p.li')) model.blocks.push({ type: 'item', list: el.dataset.list === 'ol' ? 'ol' : 'ul', level: Math.min(3, listLevel(el)), runs: await runsOf(el) });
+      else if (el.matches('p.symtab')) {
+        // the table as it's drawn: its rows, their maths, their sources set in the paper's style
+        const rows = [];
+        for (const sym of symtabRows(el)) {
+          const html = sym.cite && sym.cite.length ? citeHtmlOf(symtabKey(el, sym.id)) : '';
+          rows.push({ id: sym.id, tex: sym.tex, meaning: sym.meaning || '', unit: sym.unit || '', value: sym.value || '', kind: sym.kind || '',
+            ...(await mathRun(sym.tex, false)), cite: html ? { cite: sym.cite, narrative: false, html: paperSafe(html) } : null });
+        }
+        model.blocks.push({ type: 'symbols', kind: el.dataset.kind || '', rows });
+      }
       else if (el.matches('figure.fig')) {
         // a picture: its file, and for Word and LaTeX a PNG of an SVG, and its size
         const picture = async (holder) => {
@@ -3035,15 +4456,15 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
         };
         const d = el.dataset;
         const fig = {
-          type: 'figure', id: d.id, num: d.num || '', width: d.width ? +d.width : 0,
+          type: 'figure', id: d.id, num: d.num || '', width: d.width ? +d.width : 0, cols: d.cols ? +d.cols : 0,
           wrap: d.wrap || '', place: d.place || '', span: d.span === 'page',
           caption: await runsOf(el.querySelector(':scope > figcaption') || document.createElement('i'))
         };
         const panels = [...el.querySelectorAll(':scope > .panel')];
         if (panels.length) {
           fig.panels = [];
-          for (const p of panels) fig.panels.push({ ...(await picture(p)), sub: await runsOf(p.querySelector('.subcap') || document.createElement('i')) });
-          Object.assign(fig, fig.panels[0], { sub: undefined });
+          for (const p of panels) fig.panels.push({ ...(await picture(p)), colspan: +(p.dataset.colspan || 1), sub: await runsOf(p.querySelector('.subcap') || document.createElement('i')) });
+          Object.assign(fig, fig.panels[0], { sub: undefined, colspan: undefined });
         } else Object.assign(fig, await picture(el));
         model.blocks.push(fig);
       } else if (el.matches('figure.tbl')) {
@@ -3071,7 +4492,9 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
   model.journal = NeoJournals.get(journal || m.journal || NeoJournals.DEFAULT);
   model.references = paper.refs.filter((r) => cited.has(r.id));
   model.bibtex = NeoReferences.toBibtex(model.references);
-  return model;
+  // the abstract's sentences by the move each makes (the talk outline's narrative)
+  model.moves = abstractMoves(model.abstract.map((p) => NeoPaperExport.runsText(p)).join(' ').replace(/\s+/g, ' ').trim());
+  return m.anonymous ? anonymize(model) : model;
 }
 
 // File → Export, for a paper (from doExport)
@@ -3096,6 +4519,9 @@ async function paperExport(format) {
     } else if (format === 'docx') {
       const model = await paperModel({ png: true });
       payload = { format: 'docx', defaultName: name, zipEntries: NeoPaperExport.docx(model) };
+    } else if (format === 'talk') {
+      const model = await paperModel({ png: true });
+      payload = { format: 'zip', defaultName: name + '-talk', zipEntries: NeoPaperExport.talk(model) };
     } else if (format === 'pdf' || format === 'html') {
       const model = await paperModel();
       payload = { format, defaultName: name, content: NeoPaperExport.html(model, { print: format === 'pdf' }), print: format === 'pdf' ? 'paper' : undefined };

@@ -463,29 +463,49 @@
 
   // Bring new items into the library. A work already there (same DOI, or
   // same title and year) is refreshed in place and keeps its key, so the
-  // citations in the paper still find it. Returns the merged list and what
-  // changed.
+  // citations in the paper still find it. Returns the merged list, what
+  // changed (a work already there and read again as it was is not
+  // updated), and the key each incoming item has in the list, in order.
   function mergeReferences(library, incoming, { keepKeys = false } = {}) {
     const items = library.map((x) => ({ ...x }));
     const taken = new Set(items.map((x) => x.id));
     const added = [];
     const updated = [];
+    const keys = [];
     for (const raw of incoming) {
       const it = { ...raw };
       if (it.id !== undefined && it.id !== null) it.id = String(it.id);
       const at = items.findIndex((x) => (keepKeys && it.id && x.id === it.id) || sameWork(x, it));
       if (at >= 0) {
         const id = items[at].id;
-        items[at] = { ...items[at], ...it, id };
-        updated.push(id);
+        const next = { ...items[at], ...it, id };
+        if (!sameContent(items[at], next)) { items[at] = next; updated.push(id); }
+        keys.push(id);
         continue;
       }
       if (!it.id || taken.has(it.id) || !KEY.test(it.id)) it.id = makeKey(it, taken);
       taken.add(it.id);
       items.push(it);
       added.push(it.id);
+      keys.push(it.id);
     }
-    return { items, added, updated };
+    return { items, added, updated, keys };
+  }
+  // the same fields and values, whatever order the keys came in
+  const sorted = (v) => (Array.isArray(v) ? v.map(sorted)
+    : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v);
+  const sameContent = (a, b) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
+
+  // references.json as this window is about to write it (mine), against the
+  // file as it was last written here (saved) and as it is now (disk): a
+  // reference another device added since comes in by key, so the write
+  // doesn't lose it. One that's on disk and was in saved but not in mine
+  // was deleted here, and stays deleted.
+  function keepTheirs(saved, mine, disk) {
+    if (!Array.isArray(disk)) return mine;
+    const known = new Set([...(saved || []), ...mine].filter(Boolean).map((r) => String(r.id)));
+    const theirs = disk.filter((r) => r && !known.has(String(r.id)));
+    return theirs.length ? mergeReferences(mine, theirs, { keepKeys: true }).items : mine;
   }
 
   function authorsText(it) {
@@ -522,7 +542,7 @@
 
   return {
     latexToUnicode, parseBibtex, parseRis, parseCslJson, parseAny, sniff, toBibtex,
-    findIdentifier, identifierDoi, cleanDoi, makeKey, mergeReferences, sameWork, KEY,
+    findIdentifier, identifierDoi, cleanDoi, makeKey, mergeReferences, keepTheirs, sameWork, KEY,
     yearOf, shortLabel, authorsText, score
   };
 });

@@ -688,7 +688,7 @@ ipcMain.handle('paper:asset', (_e, name) => {
 });
 ipcMain.handle('paper:lookup', async (_e, doi) => {
   doi = String(doi || '').trim();
-  if (!/^10\.\d{4,9}\/\S+$/.test(doi)) throw new Error('Not a DOI: ' + doi);
+  if (!/^10\.\d{4,9}\/\S+$/.test(doi)) throw new Error(t('Not a DOI: {doi}', { doi }));
   const { net } = require('electron');
   let res;
   try {
@@ -696,10 +696,11 @@ ipcMain.handle('paper:lookup', async (_e, doi) => {
       headers: { Accept: 'application/vnd.citationstyles.csl+json' }
     });
   } catch (err) {
-    throw new Error('No connection to doi.org (' + ((err && err.message) || err) + ')');
+    throw new Error(t('No connection to {service} ({error})', { service: 'doi.org', error: (err && err.message) || String(err) }));
   }
-  if (res.status === 404) throw new Error('doi.org has no record of ' + doi);
-  if (!res.ok) throw new Error('doi.org answered ' + res.status);
+  // the same words as Pocket's lookup, which asks Crossref or DataCite
+  if (res.status === 404) throw new Error(t('{service} has no record of {doi}', { service: 'doi.org', doi }));
+  if (!res.ok) throw new Error(t('{service} answered {status}', { service: 'doi.org', status: String(res.status) }));
   return res.json();
 });
 // Zotero, on this computer: Better BibTeX's search when it's installed
@@ -1751,13 +1752,13 @@ ipcMain.on('script:state', (_e, st) => {
 // A paper's menus: Insert, its citation style, its heading levels
 const NeoCite = require('./paper/cite.js');
 const NeoJournals = require('./paper/journals.js');
-let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false, journal: 'preprint' };
+let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false, journal: 'preprint', editing: false, skim: false, anonymous: false };
 ipcMain.on('paper:state', (_e, st) => {
   st = st || {};
   const next = {
     on: !!st.on, style: typeof st.style === 'string' ? st.style : null, custom: typeof st.custom === 'string' ? st.custom : '',
     heading: ['h1', 'h2', 'h3'].includes(st.heading) ? st.heading : '', numbered: st.numbered !== false, double: !!st.double, linked: !!st.linked,
-    journal: NeoJournals.get(st.journal).id
+    journal: NeoJournals.get(st.journal).id, editing: !!st.editing, skim: !!st.skim, anonymous: !!st.anonymous
   };
   if (JSON.stringify(next) === JSON.stringify(paperState)) return;
   paperState = next;
@@ -1839,6 +1840,18 @@ function buildMenu() {
     : isWin
       ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost', 'iA Writer Quattro']
       : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro', 'Jost', 'iA Writer Quattro'];
+  // a book's own items: a script or a paper sets its page its own way
+  const bookOnly = !scriptState.on && !paperState.on;
+  // a paper's journals, ticked at the one it's written for
+  const journalItems = (command) => NeoJournals.JOURNALS.map((j) => ({
+    label: j.name, type: 'radio', checked: paperState.journal === j.id,
+    click: () => sendToWindow({ type: 'paper', command, value: j.id })
+  }));
+  // the general citation styles, or those a journal asks for
+  const styleItems = (journal) => NeoCite.STYLES.filter((st) => !st.journal === !journal).map((st) => ({
+    label: st.title, type: 'radio', checked: paperState.style === st.id,
+    click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
+  }));
   const template = [
     // appMenu exists only on macOS — including it on Windows throws,
     // which is exactly what kept NEO from ever opening a window there
@@ -1867,6 +1880,7 @@ function buildMenu() {
             { label: t('LaTeX for Overleaf (.zip)'), click: () => sendToWindow({ type: 'export', format: 'latex' }) },
             { label: 'Markdown (.md)', click: () => sendToWindow({ type: 'export', format: 'md' }) },
             { label: t('Markdown for Pandoc, with Files (.zip)'), click: () => sendToWindow({ type: 'export', format: 'pandoc' }) },
+            { label: t('Talk Outline, with Figures (.zip)'), click: () => sendToWindow({ type: 'export', format: 'talk' }) },
             { label: t('Web Page (.html)'), click: () => sendToWindow({ type: 'export', format: 'html' }) },
             { label: 'EPUB (.epub)', click: () => sendToWindow({ type: 'export', format: 'epub' }) },
             { label: t('Plain Text (.txt)'), click: () => sendToWindow({ type: 'export', format: 'txt' }) },
@@ -1894,15 +1908,13 @@ function buildMenu() {
           ]
         },
         ...(paperState.on ? [
-          { label: t('Preview'), accelerator: 'CmdOrCtrl+Alt+P', click: () => sendToWindow({ type: 'paper', command: 'preview' }) },
+          // only ⌥⌘P: AltGr arrives as Ctrl+Alt on Windows and Linux, and
+          // AltGr+P types þ or ö on some layouts
+          { label: t('Preview'), ...(isMac ? { accelerator: 'Cmd+Alt+P' } : {}), click: () => sendToWindow({ type: 'paper', command: 'preview' }) },
           { label: t('Draft for Feedback…'), click: () => sendToWindow({ type: 'paper', command: 'feedback' }) },
-          {
-            label: t('Preview As'),
-            submenu: NeoJournals.JOURNALS.map((j) => ({
-              label: j.name, type: 'radio', checked: paperState.journal === j.id,
-              click: () => sendToWindow({ type: 'paper', command: 'preview', value: j.id })
-            }))
-          }
+          { label: t('Preview As'), submenu: journalItems('preview') },
+          // double-blind review: the authors and what names them left out of every way out
+          { label: t('Anonymous for Review'), type: 'checkbox', checked: paperState.anonymous, click: () => sendToWindow({ type: 'paper', command: 'anonymous' }) }
         ] : []),
         { type: 'separator' },
         {
@@ -1963,6 +1975,12 @@ function buildMenu() {
           accelerator: 'CmdOrCtrl+;',
           click: () => sendToWindow({ type: 'spellcheck' })
         },
+        // a paper's editing pass: the language rules, and what consistency asks
+        ...(paperState.on ? [
+          { label: t('Editing Pass'), type: 'checkbox', checked: paperState.editing, accelerator: 'CmdOrCtrl+Shift+;', click: () => sendToWindow({ type: 'paper', command: 'editing' }) },
+          { label: t('Next Thing to Look At'), accelerator: "CmdOrCtrl+'", enabled: paperState.editing, click: () => sendToWindow({ type: 'paper', command: 'editingNext', value: 1 }) },
+          { label: t('Previous Thing to Look At'), accelerator: "CmdOrCtrl+Shift+'", enabled: paperState.editing, click: () => sendToWindow({ type: 'paper', command: 'editingNext', value: -1 }) }
+        ] : []),
         {
           label: t('Spellcheck Language'),
           submenu: Object.entries(SPELL_LANGUAGES).map(([code, lang]) => ({
@@ -1992,25 +2010,13 @@ function buildMenu() {
           ]
         },
         ...(paperState.on ? [
-          {
-            label: t('Journal'),
-            submenu: NeoJournals.JOURNALS.map((j) => ({
-              label: j.name, type: 'radio', checked: paperState.journal === j.id,
-              click: () => sendToWindow({ type: 'paper', command: 'journal', value: j.id })
-            }))
-          },
+          { label: t('Journal'), submenu: journalItems('journal') },
           {
             label: t('Citation Style'),
             submenu: [
-              ...NeoCite.STYLES.filter((st) => !st.journal).map((st) => ({
-                label: st.title, type: 'radio', checked: paperState.style === st.id,
-                click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
-              })),
+              ...styleItems(false),
               { type: 'separator' },
-              ...NeoCite.STYLES.filter((st) => st.journal).map((st) => ({
-                label: st.title, type: 'radio', checked: paperState.style === st.id,
-                click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
-              })),
+              ...styleItems(true),
               ...(paperState.custom ? [{ type: 'separator' }, { label: paperState.custom, type: 'radio', checked: paperState.style === 'custom', click: () => sendToWindow({ type: 'paper', command: 'style', value: 'custom' }) }] : []),
               { type: 'separator' },
               { label: t('Other Style (.csl)…'), click: () => sendToWindow({ type: 'paper', command: 'styleFile' }) }
@@ -2021,7 +2027,7 @@ function buildMenu() {
           { type: 'separator' }
         ] : []),
         {
-          visible: !scriptState.on && !paperState.on,
+          visible: bookOnly,
           label: t('Drop Cap Style'),
           submenu: [
             { label: t('Literary'), type: 'radio', checked: viewState.dropCap === 'literary', click: () => sendToWindow({ type: 'dropCap', value: 'literary' }) },
@@ -2053,6 +2059,8 @@ function buildMenu() {
           checked: typewriterState,
           click: () => sendToWindow({ type: 'typewriter' })
         },
+        // a paper's paragraph check: each paragraph's first and last sentence, the rest dimmed
+        ...(paperState.on ? [{ label: t('First and Last Sentences'), type: 'checkbox', checked: paperState.skim, click: () => sendToWindow({ type: 'paper', command: 'skim' }) }] : []),
         { type: 'separator' },
         // tick when the caret sits in one; the keys are the editor's own
         // (they split or continue a paragraph, which a menu item can't), so
@@ -2070,18 +2078,21 @@ function buildMenu() {
         ...(paperState.on ? [
           [t('Section Heading'), 'h1', '1'], [t('Subsection Heading'), 'h2', '2'], [t('Subsubsection Heading'), 'h3', '3'], [t('Body Text'), '', '0']
         ].map(([label, value, key]) => ({
-          label, accelerator: 'CmdOrCtrl+Alt+' + key, type: 'radio', checked: paperState.heading === value,
+          // the window hears Ctrl+Alt+0–3 itself, and tells it from AltGr
+          // (which arrives as Ctrl+Alt and types }, ² and ³ on many layouts);
+          // a registered accelerator can't, so it's registered on the Mac only
+          label, accelerator: 'CmdOrCtrl+Alt+' + key, registerAccelerator: isMac, type: 'radio', checked: paperState.heading === value,
           click: () => sendToWindow({ type: 'paper', command: 'heading', value })
         })) : []),
         {
-          visible: !scriptState.on && !paperState.on,
+          visible: bookOnly,
           label: t('Flush Paragraph') + '\t' + (isMac ? '⇧Enter' : 'Shift+Enter'),
           type: 'checkbox',
           checked: flushState,
           click: () => sendToWindow({ type: 'flush' })
         },
         {
-          visible: !scriptState.on && !paperState.on,
+          visible: bookOnly,
           label: t('Poetry Paragraph') + '\t' + (isMac ? '⇧⌘Enter' : 'Ctrl+Shift+Enter'),
           type: 'checkbox',
           checked: poetryState,

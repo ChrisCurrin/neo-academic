@@ -139,13 +139,19 @@
   const escHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
   // "p. 4", "pp. 4–6", "chap. 3", "sec. 2": what a locator typed by hand
-  // means. Returns { label, locator }.
+  // means. Returns { label, locator }. A label is a whole word, cut short
+  // or not, then a full stop, a space or the number itself: "para 3" is a
+  // paragraph and "suppl. 2" a supplement, not page "ara 3" or section
+  // "uppl. 2". Each label's own name is here too, as the citation pane
+  // shows it ("paragraph 3"), so what it shows reads back the same.
   const LABELS = [
-    ['page', /^(?:pages|page|pp|p)\.?\s*/i], ['chapter', /^(?:chapter|chap|ch)\.?\s*/i],
-    ['section', /^(?:section|sect|sec|s|§)\.?\s*/i], ['figure', /^(?:figure|fig)\.?\s*/i],
-    ['line', /^(?:lines|line|ll|l)\.?\s*/i], ['note', /^(?:note|nn|n)\.?\s*/i],
-    ['paragraph', /^(?:paragraph|para|¶)\.?\s*/i], ['volume', /^(?:volume|vol)\.?\s*/i]
-  ];
+    ['page', 'pages|page|pp|p'], ['chapter', 'chapters|chapter|chaps|chap|chs|ch'],
+    ['section', 'sections|section|sects|sect|secs|sec|§§|§|s'], ['figure', 'figures|figure|figs|fig'],
+    ['table', 'tables|table|tabs|tab|tbl'], ['equation', 'equations|equation|eqns|eqn|eqs|eq'],
+    ['supplement', 'supplement|suppl|supp'], ['paragraph', 'paragraphs|paragraph|paras|para|¶¶|¶'],
+    ['line', 'lines|line|ll|l'], ['note', 'notes|note|nn|n'], ['column', 'columns|column|cols|col'],
+    ['part', 'parts|part|pts|pt'], ['volume', 'volumes|volume|vols|vol']
+  ].map(([label, words]) => [label, new RegExp('^(?:' + words + ')(?:\\.\\s*|\\s+|(?=\\d))', 'i')]);
   function parseLocator(s) {
     const text = String(s || '').trim();
     if (!text) return { label: '', locator: '' };

@@ -67,6 +67,38 @@ test('locators typed by hand', () => {
   assert.deepEqual(Cite.parseLocator('chap. 3'), { label: 'chapter', locator: '3' });
   assert.deepEqual(Cite.parseLocator('12'), { label: 'page', locator: '12' });
   assert.deepEqual(Cite.parseLocator(''), { label: '', locator: '' });
+  const reads = (s) => { const { label, locator } = Cite.parseLocator(s); return label + ' ' + locator; };
+  assert.equal(reads('pp. 3–5'), 'page 3–5');
+  assert.equal(reads('p4'), 'page 4');
+  assert.equal(reads('page 7'), 'page 7');
+  assert.equal(reads('chap. 2'), 'chapter 2');
+  assert.equal(reads('ch 2'), 'chapter 2');
+  assert.equal(reads('sec. 3'), 'section 3');
+  assert.equal(reads('§ 3'), 'section 3');
+  assert.equal(reads('§3.2'), 'section 3.2');
+  assert.equal(reads('s. 4'), 'section 4');
+  assert.equal(reads('fig. 2'), 'figure 2');
+  assert.equal(reads('Fig. 2b'), 'figure 2b');
+  assert.equal(reads('l. 10'), 'line 10');
+  assert.equal(reads('ll. 10-12'), 'line 10–12');
+  assert.equal(reads('n. 3'), 'note 3');
+  assert.equal(reads('vol. 2'), 'volume 2');
+  assert.equal(reads('tab. 1'), 'table 1');
+  assert.equal(reads('eq. 4'), 'equation 4');
+  // a short label is a whole word, never the first letter of a longer one
+  assert.equal(reads('para 3'), 'paragraph 3');
+  assert.equal(reads('para. 3'), 'paragraph 3');
+  assert.equal(reads('paragraph 3'), 'paragraph 3');
+  assert.equal(reads('¶ 3'), 'paragraph 3');
+  assert.equal(reads('suppl. 2'), 'supplement 2');
+  assert.equal(reads('supplement S4'), 'supplement S4');
+  assert.equal(reads('lemma 2'), 'page lemma 2');
+  assert.equal(reads('note 5'), 'note 5');
+  assert.equal(reads('pt. 2'), 'part 2');
+  // what the citation pane shows ("label locator") reads back the same
+  for (const label of ['chapter', 'section', 'figure', 'table', 'equation', 'supplement', 'paragraph', 'line', 'note', 'column', 'part', 'volume']) {
+    assert.equal(reads(label + ' 9'), label + ' 9', label);
+  }
   assert.equal(Cite.describeStyle(style('nature')).numeric, true);
   assert.equal(Cite.describeStyle(style('apa')).title, 'APA Style 7th edition');
 });
