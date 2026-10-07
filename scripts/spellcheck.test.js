@@ -22,6 +22,25 @@ test('Hunspell reads the pinned Romanian dictionary as published', async () => {
   for (const [word, ok] of Object.entries(res.result)) assert.equal(ok, true, word);
 });
 
+test('Hunspell reads the pinned Hungarian dictionary and suggests accents', async () => {
+  const dir = path.join(root, 'node_modules/dictionary-hu');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'))).version, '1.9.0');
+  const send = spellWorker();
+  assert.equal((await send({ type: 'load', language: 'hu', dir })).ok, true);
+  const good = await send({ type: 'check', words: ['ház', 'házaimban', 'gyönyörű', 'Budapesten', 'íróasztal', 'szerkesztőknek'] });
+  for (const [word, ok] of Object.entries(good.result)) assert.equal(ok, true, word);
+  const bad = await send({ type: 'check', words: ['gyonyoru', 'haz'] });
+  for (const [word, ok] of Object.entries(bad.result)) assert.equal(ok, false, word);
+  assert.ok((await send({ type: 'suggest', word: 'gyonyoru' })).result.includes('gyönyörű'));
+});
+
+test('the Hungarian dictionary takes every accusative (könyvet, szívet, évet)', async () => {
+  const send = spellWorker();
+  assert.equal((await send({ type: 'load', language: 'hu', dir: path.join(root, 'node_modules/dictionary-hu') })).ok, true);
+  const res = await send({ type: 'check', words: ['könyvet', 'szívet', 'évet', 'kertet', 'almát'] });
+  for (const [word, ok] of Object.entries(res.result)) assert.equal(ok, true, word);
+});
+
 function spellWorker() {
   let handle, reply;
   const context = vm.createContext({
@@ -31,7 +50,8 @@ function spellWorker() {
       postMessage: (message) => { reply = message; }
     } }
   });
-  vm.runInContext(source('spell-worker.js'), context);
+  // The string is the file on disk. filename is how Node attributes coverage to it.
+  vm.runInContext(source('spell-worker.js'), context, { filename: path.join(root, 'spell-worker.js') });
   let id = 0;
   const waiting = new Map();
   reply = null;
@@ -120,7 +140,7 @@ test('learning a Romanian word removes cached Unicode-variant underlines across 
     },
     Node: { TEXT_NODE: 3 }, NodeFilter: { SHOW_TEXT: 4 }, Range: TextRange,
     Highlight: Set, CSS: { highlights },
-    $: () => editors['aux-editor'], t: (text) => text, toast() {},
+    $: () => editors['aux-editor'], t: (text) => text, tk: (text) => text, toast() {},
     currentTab: 'manuscript', currentChapterId: 'ch-test', library: {},
     captureMenu: (_x, _y, _word, _suggestions, callbacks) => { actions = callbacks; },
     window: { neo: {
@@ -192,7 +212,8 @@ function mainContext(temp, systemLocale, settings = {}, library = {}, raw = null
     console,
     temp
   });
-  vm.runInContext(source('main.js'), context);
+  // The string is the file on disk. filename is how Node attributes coverage to it.
+  vm.runInContext(source('main.js'), context, { filename: path.join(root, 'main.js') });
   vm.runInContext('LIBRARY_DIR = temp; LIBRARY_FILE = require("path").join(temp, "library.json"); initLanguage(); initSpell();', context);
   return { context, loads, handlers, read: () => JSON.parse(fs.readFileSync(path.join(temp, 'library.json'))) };
 }
@@ -272,7 +293,7 @@ test('hyphenated words: the whole word first, then only the wrong pieces', async
       createTreeWalker: () => { let n = node; return { nextNode: () => { const x = n; n = null; return x; } }; }
     },
     NodeFilter: { SHOW_TEXT: 4 }, Range: TextRange, Highlight: Set, CSS: { highlights },
-    $: () => null, t: (text) => text, toast() {},
+    $: () => null, t: (text) => text, tk: (text) => text, toast() {},
     window: { neo: { spellCheckWords: async (words) => (await send({ type: 'check', words })).result } }
   });
   const app = source('app.js');
@@ -305,7 +326,7 @@ test('a hyphenated word underlined whole opens the menu; a stammer is no misspel
       execCommand: (_cmd, _ui, text) => { node.data = node.data.slice(0, selected.start) + text + node.data.slice(selected.end); }
     },
     Node: { TEXT_NODE: 3 }, NodeFilter: { SHOW_TEXT: 4 }, Range: TextRange, Highlight: Set, CSS: { highlights },
-    $: () => null, t: (text) => text, toast() {},
+    $: () => null, t: (text) => text, tk: (text) => text, toast() {},
     captureMenu: (_x, _y, word, suggestions, actions) => { menu = { word, suggestions, actions }; },
     window: {
       getSelection: () => ({ removeAllRanges() {}, addRange: (r) => { selected = r; } }),

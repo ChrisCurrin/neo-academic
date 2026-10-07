@@ -4,7 +4,7 @@
 /* Android: Documents/NEO Library, shared with the Mac via Syncthing.    */
 /* iOS: the app's own folder — inside iCloud Drive when the writer has  */
 /* it on (so desktop NEO can point at the same folder), else On My iPad. */
-/* Desktop-only powers (export, email, spellcheck, import) stub out      */
+/* Desktop-only powers (email, import) stub out                          */
 /* quietly; writing never does.                                          */
 
 (function () {
@@ -35,6 +35,10 @@
 
   // library-relative path -> the Filesystem plugin's idea of where that is
   const p = (...parts) => parts.join('/');
+  // i18n.js loads first; app.js picks the language before anyone calls this
+  const t = (text, vars) => window.NeoI18n.t(text, vars);
+  // a paper's own files, as main.js's PAPER_FILE: figures and style.csl
+  const PAPER_FILE = /^(?:figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)|style\.csl)$/;
   function at(rel) {
     if (HOME) return { path: rel ? HOME + '/' + rel.split('/').map(encodeURIComponent).join('/') : HOME };
     return { path: rel ? ROOT + '/' + rel : ROOT, directory: DIR };
@@ -66,10 +70,23 @@
     return r.data;
   }
 
+  // The desktop's rule on the phone too: the new text is written beside the
+  // old file and swapped in whole, so a save cut short (the app killed in
+  // the background, the battery gone) leaves the old version, never half
+  // of the new one. A system that won't do the swap gets a plain write.
   async function writeText(path, data) {
     await ready;
+    const tmp = path + '.tmp';
     try {
+      await FS().writeFile({ ...at(tmp), data, encoding: 'utf8', recursive: true });
+      try {
+        const from = at(tmp);
+        const to = at(path);
+        await FS().rename({ from: from.path, to: to.path, directory: from.directory, toDirectory: to.directory });
+        return;
+      } catch { /* no swap here: the plain write below */ }
       await FS().writeFile({ ...at(path), data, encoding: 'utf8', recursive: true });
+      try { await FS().deleteFile(at(tmp)); } catch { /* fine */ }
     } catch (err) {
       showErrorDetail('Could not save ' + path + ': ' + (err && err.message || err));
       throw err;
@@ -110,12 +127,44 @@
     } catch { /* never let the reporter itself hiccup */ }
   }
 
+  // JSON reads fall back on the copies a write leaves, as on the desktop:
+  // the .tmp a write was making when it stopped, then .bak, the last
+  // version that read whole. What they recover is put back as the file.
   async function readJSONFile(path, fallback) {
-    try { return JSON.parse(await readText(path)); } catch { return fallback; }
+    try { return JSON.parse(await readText(path)); } catch { /* the spares, below */ }
+    for (const spare of [path + '.tmp', path + '.bak']) {
+      let v;
+      try { v = JSON.parse(await readText(spare)); } catch { continue; }
+      try { await writeText(path, JSON.stringify(v, null, 2)); } catch { /* still recovered for now */ }
+      return v;
+    }
+    return fallback;
   }
 
   async function writeJSONFile(path, data) {
+    // the version on disk, while it reads whole, becomes the .bak
+    try {
+      const old = await readText(path);
+      JSON.parse(old);
+      await FS().writeFile({ ...at(path + '.bak'), data: old, encoding: 'utf8', recursive: true });
+    } catch { /* no whole old copy to keep: the write still goes ahead */ }
     await writeText(path, JSON.stringify(data, null, 2));
+  }
+
+  // the same rule as main.js chapterDiverged: the disk copy differs from
+  // what this device last knew, holds words, and has a word the new text lacks
+  function chapterDiverged(cur, expected, html) {
+    if (cur === expected || cur === html) return false;
+    const bag = (h) => {
+      const m = new Map();
+      for (const w of String(h || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').split(/\s+/)) if (w) m.set(w, (m.get(w) || 0) + 1);
+      return m;
+    };
+    const there = bag(cur);
+    if (!there.size) return false;
+    const here = bag(html);
+    for (const [w, n] of there) if (n > (here.get(w) || 0)) return true;
+    return false;
   }
 
   const bookDir = (bookId) => p(bookId);
@@ -145,7 +194,12 @@
     return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
   }
 
+  // Letter in the Americas and the Philippines, A4 elsewhere (as main.js)
+  const LETTER = ['US', 'CA', 'MX', 'PH', 'CL', 'CO', 'VE', 'GT', 'CR', 'PA', 'DO', 'PR', 'SV', 'HN', 'NI', 'BZ'];
+  const region = (() => { try { return new Intl.Locale(navigator.language).maximize().region || ''; } catch { return ''; } })();
+
   window.neo = {
+    paper: LETTER.includes(region) ? 'Letter' : 'A4',
     /* ---------- library ---------- */
     readLibrary: async () => {
       if (!(await checkAccess())) return { authorName: '', penNames: [], firstRunDone: false, shelves: [{ id: 'shelf-1', name: 'Works in Progress', bookIds: [] }] };
@@ -209,11 +263,18 @@
       await writeJSONFile(p(id, 'stickies.json'), []);
       return book;
     },
-    // the folder goes; on iOS the Files app keeps it in Recently Deleted
+    // the folder moves to "Deleted Books" inside the library, where it can
+    // be found and moved back (Files on iOS, any file manager on Android);
+    // nothing is erased
     deleteBook: async (bookId) => {
       try {
         await ready;
-        await FS().rmdir({ ...at(bookId), recursive: true });
+        await ensureDir('Deleted Books');
+        let dest = p('Deleted Books', bookId);
+        try { await FS().stat(at(dest)); dest += '-' + Date.now().toString(36); } catch { /* free */ }
+        const from = at(bookId);
+        const to = at(dest);
+        await FS().rename({ from: from.path, to: to.path, directory: from.directory, toDirectory: to.directory });
         return true;
       } catch (err) {
         showErrorDetail('Could not delete ' + bookId + ': ' + (err && err.message || err));
@@ -239,11 +300,19 @@
     },
     readChapter: async (bookId, chId) => {
       await fetchCloud(p(bookId, 'chapters', chId + '.html'));
-      try { return await readText(p(bookId, 'chapters', chId + '.html')); } catch { return ''; }
+      // (a swap the system cut short leaves only the .tmp: the words are there)
+      try { return await readText(p(bookId, 'chapters', chId + '.html')); } catch { /* the spare, below */ }
+      try { return await readText(p(bookId, 'chapters', chId + '.html.tmp')); } catch { return ''; }
     },
-    writeChapter: async (bookId, chId, html) => {
+    writeChapter: async (bookId, chId, html, expected) => {
       await ensureDir(bookDir(bookId) + '/chapters');
-      await writeText(p(bookId, 'chapters', chId + '.html'), html);
+      const file = p(bookId, 'chapters', chId + '.html');
+      if (typeof expected === 'string') {
+        let cur = null;
+        try { cur = await readText(file); } catch { /* not there */ }
+        if (cur !== null && chapterDiverged(cur, expected, html)) return { conflict: cur };
+      }
+      await writeText(file, html);
       return true;
     },
     deleteChapter: async (bookId, chId) => {
@@ -253,11 +322,42 @@
 
     /* ---------- notes / outline / json sidecars ---------- */
     readAux: async (bookId, name) => {
-      try { return await readText(p(bookId, name + '.html')); } catch { return ''; }
+      try { return await readText(p(bookId, name + '.html')); } catch { /* the spare, below */ }
+      try { return await readText(p(bookId, name + '.html.tmp')); } catch { return ''; }
     },
     writeAux: async (bookId, name, html) => { await writeText(p(bookId, name + '.html'), html); return true; },
     readJSON: (bookId, name, fallback) => readJSONFile(p(bookId, name + '.json'), fallback),
     writeJSON: async (bookId, name, data) => { await writeJSONFile(p(bookId, name + '.json'), data); return true; },
+
+    /* ---------- a paper's figures and style; DOIs looked up ---------- */
+    paperRead: async (bookId, name) => {
+      if (!PAPER_FILE.test(name)) throw new Error('Not a paper file: ' + name);
+      try { await ready; return (await FS().readFile(at(p(bookId, name)))).data; } catch { return null; }
+    },
+    paperWrite: async (bookId, name, base64) => {
+      if (!PAPER_FILE.test(name)) throw new Error('Not a paper file: ' + name);
+      await ready;
+      await FS().writeFile({ ...at(p(bookId, name)), data: base64, recursive: true });
+      return true;
+    },
+    // Crossref answers a web view directly; arXiv's DOIs are DataCite's.
+    // The words are main.js's (paper:lookup), so they share its translations
+    paperLookup: async (doi) => {
+      const datacite = /^10\.48550\//.test(doi);
+      const service = datacite ? 'DataCite' : 'Crossref';
+      const url = datacite
+        ? 'https://api.datacite.org/application/vnd.citationstyles.csl+json/' + encodeURIComponent(doi)
+        : 'https://api.crossref.org/works/' + encodeURIComponent(doi) + '/transform/application/vnd.citationstyles.csl+json';
+      let res;
+      try {
+        res = await fetch(url);
+      } catch (err) {
+        throw new Error(t('No connection to {service} ({error})', { service, error: (err && err.message) || String(err) }));
+      }
+      if (res.status === 404) throw new Error(t('{service} has no record of {doi}', { service, doi }));
+      if (!res.ok) throw new Error(t('{service} answered {status}', { service, status: String(res.status) }));
+      return res.json();
+    },
 
     /* ---------- API keys & painting: desktop only ---------- */
     hasSecret: async () => false,
@@ -318,10 +418,27 @@
     openRelease: async () => true,
     fullscreenEscape: async () => false,
     fullscreenToggle: async () => true,
-    spellCheckWords: async (words) => { const o = {}; for (const w of words) o[w] = true; return o; },
-    spellSuggest: async () => [],
-    spellLearn: async () => true,
-    setSpellLanguage: async () => false, // the spellcheck pass is a desktop thing
+    spellCheckWords: async (words) => {
+      const out = {};
+      for (const w of words) out[w] = true; // no checker: nothing is wrong
+      if (!(await spellEnsure())) return out;
+      spellCatchUp();
+      const r = await spellEngine()({ type: 'check', words });
+      return r.ok ? r.result : out;
+    },
+    spellSuggest: async (word) => {
+      if (!(await spellEnsure())) return [];
+      const r = await spellEngine()({ type: 'suggest', word });
+      return r.ok ? r.result : [];
+    },
+    spellLearn: async (word) => {
+      if (typeof word === 'string' && word) {
+        spellAdded.add(word);
+        if (spellReady) await spellEngine()({ type: 'add', word });
+      }
+      return true;
+    },
+    setSpellLanguage: async (code) => spellEnsure(code),
     appVersion: async () => 'Pocket 0.1.0',
     logError: async (msg) => {
       try {
@@ -336,9 +453,10 @@
     // messages the desktop menus do, and the tick marks come back here
     onMenu: (fn) => { window.pocketMenu = fn; },
     poetryState: (on) => { window.pocketState.poetry = !!on; },
+    flushState: (on) => { window.pocketState.flush = !!on; },
     typewriterState: (on) => { window.pocketState.typewriter = !!on; }
   };
-  window.pocketState = { poetry: false, typewriter: false };
+  window.pocketState = { poetry: false, flush: false, typewriter: false };
 
   // Interface language: the same locales/ files as the desktop, picked by
   // the device's language (regional file over its base, English beneath).
@@ -363,6 +481,117 @@
     return { locale: regional ? want : base, dict: { ...(baseDict || {}), ...(regional || {}) }, base: english };
   }
   try { window.neo.i18n = loadLocale(); } catch { /* English it is */ }
+
+  // Spellcheck: desktop NEO's Hunspell and dictionaries (pocket-spell.js),
+  // in a web worker so the page never waits on a dictionary. The language
+  // is the library's (library.json syncs it from the desktop), else the
+  // interface's when NEO has its dictionary, else US English: the same rule
+  // as defaultSpellLanguage() in main.js.
+  let spellCodes = null;   // { code: label }, from dict/languages.json
+  let spellReady = null;   // { language, ok: Promise<boolean> }
+  const spellAdded = new Set(); // the writer's own words, given to the checker
+  let engine = null;
+  window.pocketSpellLanguages = () => spellCodes || {};
+  window.pocketSpellLanguage = () => (spellReady ? spellReady.language : spellCodes ? wantedLanguage(spellCodes) : null);
+
+  async function spellLanguages() {
+    if (!spellCodes) {
+      try { spellCodes = JSON.parse(await (await fetch('dict/languages.json')).text()); } catch { spellCodes = null; return {}; }
+    }
+    return spellCodes;
+  }
+  const lib = () => (typeof library !== 'undefined' && library) || {}; // app.js's library.json
+  function wantedLanguage(codes) {
+    const chosen = lib().spellLanguage;
+    if (codes[chosen]) return chosen;
+    const ui = String((window.neo.i18n && window.neo.i18n.locale) || 'en');
+    if (codes[ui]) return ui;
+    if (ui === 'pt' || ui === 'pt-BR') return 'pt-BR';
+    const base = ui.split('-')[0];
+    return codes[base] ? base : 'en-US';
+  }
+
+  function spellEngine() {
+    if (engine) return engine;
+    // an older web view without module workers: check on the page instead
+    let direct = null;
+    let queue = Promise.resolve();
+    const onPage = (msg) => (queue = queue.then(async () => {
+      if (!direct) direct = await import('./pocket-spell.js');
+      return direct.handle(msg);
+    }).catch((err) => ({ ok: false, error: String(err && err.message || err) })));
+    let worker = null;
+    try { worker = new Worker('pocket-spell.js', { type: 'module' }); } catch { worker = null; }
+    if (!worker) return (engine = onPage);
+    const waiting = new Map();
+    let seq = 0;
+    let broken = false;
+    worker.onmessage = (e) => {
+      const w = waiting.get(e.data && e.data.id);
+      if (w) { waiting.delete(e.data.id); w.done(e.data); }
+    };
+    worker.onerror = (e) => {
+      if (e && e.preventDefault) e.preventDefault();
+      broken = true;
+      try { worker.terminate(); } catch { /* gone */ }
+      for (const w of waiting.values()) onPage(w.msg).then(w.done);
+      waiting.clear();
+    };
+    return (engine = (msg) => broken ? onPage(msg) : new Promise((resolve) => {
+      const id = ++seq;
+      waiting.set(id, { msg, done: resolve });
+      worker.postMessage({ ...msg, id });
+    }));
+  }
+
+  spellLanguages(); // the list is tiny; the ⋯ sheet wants it at hand
+
+  // load the dictionary the writer wants (or the one asked for), once
+  async function spellEnsure(code) {
+    const codes = await spellLanguages();
+    const language = code || wantedLanguage(codes);
+    if (!codes[language]) return false;
+    if (spellReady && spellReady.language === language) return spellReady.ok;
+    const custom = (lib().customWords || []).filter((w) => typeof w === 'string' && w);
+    const ready = {
+      language,
+      ok: spellEngine()({ type: 'load', language, custom }).then((r) => {
+        if (!r.ok) window.neo.logError('spell: ' + language + ' did not load: ' + r.error);
+        return !!r.ok;
+      })
+    };
+    spellReady = ready;
+    spellAdded.clear();
+    for (const w of custom) spellAdded.add(w);
+    return ready.ok;
+  }
+
+  // words learned on another device since the dictionary loaded
+  function spellCatchUp() {
+    for (const w of lib().customWords || []) {
+      if (typeof w !== 'string' || !w || spellAdded.has(w)) continue;
+      spellAdded.add(w);
+      spellEngine()({ type: 'add', word: w });
+    }
+  }
+
+  // No right-click on a phone: with spellcheck on, a tap on an underlined
+  // word opens the same suggestions (app.js answers the contextmenu event)
+  document.addEventListener('click', (e) => {
+    const hl = window.CSS && CSS.highlights && CSS.highlights.get('neo-spell');
+    if (!hl || !hl.size || !document.caretRangeFromPoint) return;
+    if (!e.target.closest || !e.target.closest('.chapter-body, #aux-editor')) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    const pos = document.caretRangeFromPoint(e.clientX, e.clientY);
+    if (!pos) return;
+    let hit = false;
+    for (const r of hl) {
+      try { if (r.isPointInRange(pos.startContainer, pos.startOffset)) { hit = true; break; } } catch { /* stale range */ }
+    }
+    if (!hit) return;
+    e.target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: e.clientX, clientY: e.clientY }));
+  });
 
   // iOS puts a shortcuts bar (bold, italic, mic, ⌘ hints) above its keyboard;
   // it covers Pocket's own bar, and NEO has its own idea of formatting
@@ -413,22 +642,23 @@
     } catch { /* not on this platform */ }
   });
 
-  // Pocket is written on a real keyboard, so Android's on-screen one stays
-  // down: every editable field gets inputmode="none", which keeps the caret
-  // and hardware typing but never summons the soft keyboard. Long-press the
-  // ☰ button to bring it back for an emergency (and again to send it away).
+  // Android's on-screen keyboard follows the hardware: down while a physical
+  // keyboard is attached (every editable field gets inputmode="none", which
+  // keeps the caret and hardware typing but never summons the soft
+  // keyboard), up as usual when there isn't one. Long-press ☰ flips it for
+  // the moment; plugging a keyboard in or out goes back to following it.
   // iPadOS already hides its keyboard whenever a hardware one is attached,
   // so there the on-screen keyboard behaves normally unless toggled off.
   const EDITABLE = '[contenteditable], input, textarea';
-  let softKeyboard = isIOS();
-  try {
-    const saved = localStorage.getItem('pocket-soft-keyboard');
-    if (saved) softKeyboard = saved === 'on';
-  } catch { /* fine */ }
+  let hardwareKeyboard = false;
+  let flipped = false; // long-press ☰ until the keyboard situation changes
+  try { localStorage.removeItem('pocket-soft-keyboard'); } catch { /* the old always-off setting */ }
+  const softKeyboardOn = () => isIOS() ? !flipped : (hardwareKeyboard === flipped);
   function applyKeyboardMode(root) {
+    const soft = softKeyboardOn();
     const els = root.matches && root.matches(EDITABLE) ? [root] : [];
     (root.querySelectorAll ? [...els, ...root.querySelectorAll(EDITABLE)] : els).forEach((el) => {
-      if (softKeyboard) el.removeAttribute('inputmode');
+      if (soft) el.removeAttribute('inputmode');
       else el.setAttribute('inputmode', 'none');
       // iOS would otherwise autocorrect, capitalise, underline and suggest
       // its way through a manuscript. The page is the writer's alone.
@@ -440,15 +670,33 @@
       }
     });
   }
+  window.pocketSoftKeyboardOn = softKeyboardOn;
   window.pocketToggleSoftKeyboard = () => {
     if (isIOS()) return true; // iOS decides for itself: on screen when no keyboard is attached
-    softKeyboard = !softKeyboard;
-    try { localStorage.setItem('pocket-soft-keyboard', softKeyboard ? 'on' : 'off'); } catch { /* fine */ }
+    flipped = !flipped;
     applyKeyboardMode(document);
-    if (softKeyboard && document.activeElement) { document.activeElement.blur(); }
-    if (typeof toast === 'function') toast(softKeyboard ? 'On-screen keyboard on' : 'On-screen keyboard off — long-press ☰ to bring it back');
-    return softKeyboard;
+    const on = softKeyboardOn();
+    // a field already focused takes the change on its next focus
+    const el = document.activeElement;
+    if (el && el.matches && el.matches(EDITABLE)) { el.blur(); if (on) setTimeout(() => el.focus(), 50); }
+    if (typeof toast === 'function') toast(on ? 'On-screen keyboard on' : 'On-screen keyboard off — long-press ☰ to bring it back');
+    return on;
   };
+  // from MainActivity, when a keyboard is connected or disconnected
+  window.pocketHardwareKeyboard = (attached) => {
+    if (attached === hardwareKeyboard) return;
+    hardwareKeyboard = !!attached;
+    flipped = false;
+    applyKeyboardMode(document);
+    const el = document.activeElement;
+    if (!hardwareKeyboard && el && el.matches && el.matches(EDITABLE)) { el.blur(); setTimeout(() => el.focus(), 50); }
+  };
+  if (!isIOS()) {
+    try {
+      const bars = window.Capacitor.registerPlugin('NeoBars');
+      bars.keyboard().then((r) => window.pocketHardwareKeyboard(!!(r && r.hardware))).catch(() => {});
+    } catch { /* older shell */ }
+  }
   document.addEventListener('DOMContentLoaded', () => {
     applyKeyboardMode(document);
     new MutationObserver((muts) => {

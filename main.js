@@ -6,10 +6,31 @@ const { app, BrowserWindow, ipcMain, dialog, Menu, MenuItem, utilityProcess, scr
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { Buffer } = require('buffer');
+
+// Every disk request from the page passes through here: a write the system
+// refuses (see reportBlockedWrite) is explained to the writer, then the error
+// goes back to the page as before.
+{
+  const handle = ipcMain.handle.bind(ipcMain);
+  ipcMain.handle = (channel, fn) => handle(channel, (...args) => {
+    // a handler's answer keeps its own timing: sync stays sync
+    let out;
+    // (and any failure lands in the error log, named by its channel, for
+    // whatever bug report follows)
+    try { out = fn(...args); } catch (err) { reportBlockedWrite(err); logError('ipc ' + channel, err); throw err; }
+    if (out && typeof out.then === 'function') out.catch((err) => { reportBlockedWrite(err); logError('ipc ' + channel, err); });
+    return out;
+  });
+}
 
 // macOS Chromium's "smart delete" also removes whitespace around a deleted
 // selection, and that pass can duplicate characters. Deletes stay literal.
 app.commandLine.appendSwitch('blink-settings', 'smartInsertDeleteEnabled=false');
+// Linux: Chromium hears the system's voices (espeak, Piper, RHVoice…) only
+// through speech-dispatcher, and only when asked to. Without it Read Aloud
+// finds no voice at all (#287).
+if (process.platform === 'linux') app.commandLine.appendSwitch('enable-speech-dispatcher');
 
 // ---------------------------------------------------------------------------
 // Library location: a folder of plain files the user can inspect, sync, back up.
@@ -28,7 +49,9 @@ function readSettings() {
 }
 function writeSettings(obj) {
   fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
-  fs.writeFileSync(settingsPath(), JSON.stringify(obj, null, 2));
+  // the same whole-or-nothing write as the library: a settings file cut
+  // short would forget a chosen library folder
+  writeFileDurable(settingsPath(), JSON.stringify(obj, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +191,170 @@ async function chooseLibraryFolder() {
   app.exit(0);
 }
 
+// Can NEO write in this folder? Windows' Controlled folder access (Defender's
+// ransomware protection) refuses new files in Documents to apps it doesn't
+// know, and NEO is one. A small file written and removed tells.
+let lastFolderError = null;
+function folderWritable(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, '.neo-write-test');
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+    lastFolderError = null;
+    return true;
+  } catch (err) {
+    lastFolderError = err;
+    logError('library folder not writable: ' + dir, err);
+    return false;
+  }
+}
+const isBlockedWrite = (err) => !!err && ['EPERM', 'EACCES', 'EROFS'].includes(err.code);
+// a folder that isn't there to write in (not a refusal): a OneDrive folder
+// on a computer where OneDrive isn't set up, a drive that's gone
+const isMissingFolder = (err) => !!err && ['ENOENT', 'ENOTDIR'].includes(err.code);
+function blockedDetail(dir, err) {
+  return t('Your books can\'t be saved in:\n{dir}', { dir }) + '\n\n' + (isMissingFolder(err)
+    ? t('The folder isn\'t there, or can\'t be reached. A OneDrive folder on a computer where OneDrive isn\'t set up does this. Choose another folder to keep your library in.')
+    : process.platform === 'win32'
+      ? t('This is usually Windows Security\'s Controlled folder access (Virus & threat protection → Ransomware protection). Allow NEO there, or keep your library in another folder.')
+      : t('Check that the folder exists and that NEO may write to it, or keep your library in another folder.'));
+}
+
+// Where a first library goes when Documents itself can't hold one. Beside
+// Documents, not nowhere: the writer is never left at "Start writing" with
+// no way on.
+function fallbackLibraryDir() {
+  const home = app.getPath('home');
+  const spots = [];
+  try {
+    const docs = path.join(home, 'Documents');
+    if (fs.statSync(docs).isDirectory()) spots.push(path.join(docs, 'NEO Library'));
+  } catch { /* no plain Documents folder here */ }
+  spots.push(path.join(home, 'NEO Library'));
+  return spots.find((dir) => dir !== LIBRARY_DIR && folderWritable(dir)) || null;
+}
+function useLibraryDir(dir) {
+  LIBRARY_DIR = dir;
+  LIBRARY_FILE = path.join(LIBRARY_DIR, 'library.json');
+  // remembered, so a OneDrive that comes back later doesn't swap libraries
+  const settings = readSettings();
+  settings.libraryDir = LIBRARY_DIR;
+  try { writeSettings(settings); } catch (err) { logError('settings', err); }
+}
+// The writer's own library folder, missing at launch: a drive not plugged
+// in, a NAS or cloud folder not mounted yet. Never swapped quietly for the
+// default (new books would land there and seem lost when the drive came
+// back). Asked once: Try Again once it's there, Choose Folder…, or Continue
+// with the default folder for this session only; the choice stays saved.
+function isDir(dir) { try { return fs.statSync(dir).isDirectory(); } catch { return false; } }
+function awaitChosenLibrary(chosen) {
+  const fallback = path.join(app.getPath('documents'), 'NEO Library');
+  while (!isDir(chosen)) {
+    const r = dialog.showMessageBoxSync({
+      type: 'warning',
+      message: t('NEO can\'t save in your library folder'),
+      detail: blockedDetail(chosen, { code: 'ENOENT' }),
+      buttons: [t('Try Again'), t('Choose Folder…'), t('Continue')],
+      defaultId: 0,
+      cancelId: 2
+    });
+    if (r === 2) return fallback;
+    if (r === 1) {
+      const picked = dialog.showOpenDialogSync({
+        title: t('Choose a folder for your NEO library'),
+        defaultPath: os.homedir(),
+        properties: ['openDirectory', 'createDirectory']
+      });
+      if (picked && picked[0]) { useLibraryDir(picked[0]); return picked[0]; }
+    }
+  }
+  return chosen;
+}
+// said once, after the window is up, only when it happened
+let libraryFallback = null;
+function announceLibraryFallback() {
+  if (!libraryFallback) return;
+  const { to } = libraryFallback;
+  libraryFallback = null;
+  dialog.showMessageBox({
+    type: 'info',
+    message: t('NEO is keeping your books in another folder'),
+    detail: t('Your Documents folder can\'t be written to, so your books will live in:\n{dir}\n\nFile → Library Folder… changes it.', { dir: to }),
+    buttons: [t('OK')]
+  }).catch(() => {});
+}
+// At startup, before any window: a library that can't be written is said
+// plainly, once, with a way out — not a hiccup at "Start writing"
+function checkLibraryWritable() {
+  // (only where it can happen: on Windows, and anywhere before a first
+  // library exists; a synced library elsewhere isn't sent a test file
+  // every launch)
+  if (process.platform !== 'win32' && fs.existsSync(LIBRARY_FILE)) return;
+  // A first library that Documents can't hold goes beside it. Never when a
+  // library already lives here or the writer picked this folder: their books
+  // stay where they are, and the question below is theirs to answer.
+  if (!fs.existsSync(LIBRARY_FILE) && !readSettings().libraryDir && !folderWritable(LIBRARY_DIR)) {
+    const from = LIBRARY_DIR;
+    const spot = fallbackLibraryDir();
+    if (spot) {
+      useLibraryDir(spot);
+      libraryFallback = { from, to: spot };
+      return;
+    }
+  }
+  while (!folderWritable(LIBRARY_DIR)) {
+    const r = dialog.showMessageBoxSync({
+      type: 'warning',
+      message: t('NEO can\'t save in your library folder'),
+      detail: blockedDetail(LIBRARY_DIR, lastFolderError),
+      buttons: [t('Choose Folder…'), t('Try Again'), t('Continue')],
+      defaultId: 0,
+      cancelId: 2
+    });
+    if (r === 2) return;
+    if (r === 0) {
+      const picked = dialog.showOpenDialogSync({
+        title: t('Choose a folder for your NEO library'),
+        defaultPath: os.homedir(),
+        properties: ['openDirectory', 'createDirectory']
+      });
+      if (!picked || !picked[0]) continue;
+      useLibraryDir(picked[0]);
+    }
+  }
+}
+// Later on (the protection switched on mid-session), a refused save says so
+// once. The words stay on the page; NEO saves them as soon as it may.
+let blockedShown = false;
+function reportBlockedWrite(err) {
+  if (blockedShown || !isBlockedWrite(err)) return;
+  // the library's own files only (an export to a protected folder is the
+  // export's business)
+  const rel = err.path ? path.relative(LIBRARY_DIR, err.path) : '..';
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return;
+  blockedShown = true;
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const opts = {
+    type: 'warning',
+    message: t('NEO can\'t save in your library folder'),
+    detail: blockedDetail(LIBRARY_DIR, err) + '\n\n' + t('Your words stay on the page until it can.'),
+    buttons: [t('OK')]
+  };
+  (win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)).catch(() => {});
+}
+
+// A brand-new library starts with one empty shelf. A library.json that has
+// gone missing beside its spare copies or its books is not a new library:
+// library:read recovers it (from .tmp/.bak, else from the book folders)
+// instead of an empty seed hiding every book.
+function libraryHasHistory() {
+  if (fs.existsSync(LIBRARY_FILE + '.bak') || fs.existsSync(LIBRARY_FILE + '.tmp')) return true;
+  try { return fs.readdirSync(LIBRARY_DIR).some((d) => d.startsWith('book-')); } catch { return false; }
+}
 function ensureLibrary() {
   if (!fs.existsSync(LIBRARY_DIR)) fs.mkdirSync(LIBRARY_DIR, { recursive: true });
-  if (!fs.existsSync(LIBRARY_FILE)) {
+  if (!fs.existsSync(LIBRARY_FILE) && !libraryHasHistory()) {
     const seed = {
       authorName: '',
       penNames: [],
@@ -215,27 +399,118 @@ function writeCatalog() {
       } catch { /* not a valid book folder */ }
     }
     lines.sort((a, b) => a.localeCompare(b));
-    fs.writeFileSync(path.join(LIBRARY_DIR, '_catalog.txt'),
-      t('NEO LIBRARY CATALOG — which folder is which book') + '\n' +
+    const text = t('NEO LIBRARY CATALOG — which folder is which book') + '\n' +
       t('(regenerated automatically; edits here do nothing)') + '\n\n' +
-      lines.join('\n') + '\n');
+      lines.join('\n') + '\n';
+    const file = path.join(LIBRARY_DIR, '_catalog.txt');
+    // unchanged, it's left alone: a rewrite on every save is a file for
+    // iCloud and Syncthing to send back and forth (and to clash over)
+    let old = null;
+    try { old = fs.readFileSync(file, 'utf8'); } catch { /* none yet */ }
+    if (old !== text) fs.writeFileSync(file, text);
   } catch (err) {
     logError('catalog', err);
   }
 }
 
-function readJSON(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
+// Writing that survives the power going out. A new file is written beside
+// the old one, pushed all the way to the disk (fsync), and only then swapped
+// in. Without the push, a power cut right after the swap can leave the swap
+// done and the words not: an empty book.json, and the book gone from its
+// shelf (#219). A missing file or an unlucky moment never costs more than
+// the last few seconds.
+// On Windows the swap is refused while anything else has the file open, even
+// for a moment: antivirus looking at what was just written, the search
+// indexer, a backup or sync client, a tool reading the library. Wait a beat
+// and try again (up to ~0.6 s) before calling the save failed, so a passing
+// glance never reaches the writer as "NEO can't save". A folder that really
+// refuses writes still fails, and is still explained.
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function renameIntoPlace(from, to) {
+  for (let wait = 5; ; wait *= 2) {
+    try { return fs.renameSync(from, to); } catch (err) {
+      if (process.platform !== 'win32' || wait > 320 || !['EPERM', 'EACCES', 'EBUSY'].includes(err.code)) throw err;
+      sleepSync(wait);
+    }
   }
 }
 
-function writeJSON(file, data) {
+function writeFileDurable(file, data) {
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file); // atomic-ish: never leave a half-written file
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    // a write can take less than it was given; keep going until every byte
+    // is down, and never swap in a file that's only partly written
+    for (let off = 0; off < buf.length;) {
+      const n = fs.writeSync(fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw Object.assign(new Error('Short write: ' + tmp), { code: 'EIO', path: tmp });
+      off += n;
+    }
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  renameIntoPlace(tmp, file);
+  // the swap itself, on systems that let a folder be pushed too
+  if (process.platform !== 'win32') {
+    try { const d = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } } catch { /* fine */ }
+  }
+}
+
+// JSON reads fall back on the copies a write leaves: the .tmp a write was
+// making when it stopped, then .bak, the last version that read whole. What
+// they recover is put back as the file itself.
+function parseJSONFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
+}
+function readJSON(file, fallback) {
+  const main = parseJSONFile(file);
+  if (main !== undefined) return main;
+  if (!fs.existsSync(file) && !fs.existsSync(file + '.bak') && !fs.existsSync(file + '.tmp')) return fallback;
+  for (const spare of [file + '.tmp', file + '.bak']) {
+    const v = parseJSONFile(spare);
+    if (v === undefined) continue;
+    logError('recovered', `${file} was unreadable; restored from ${path.basename(spare)}`);
+    try { writeFileDurable(file, JSON.stringify(v, null, 2)); } catch (err) { logError('recover write', err); }
+    return v;
+  }
+  return fallback;
+}
+
+function writeJSON(file, data) {
+  // the version on disk, while it reads whole, becomes the .bak
+  if (parseJSONFile(file) !== undefined) {
+    try { fs.copyFileSync(file, file + '.bak'); } catch { /* the write still goes ahead */ }
+  }
+  writeFileDurable(file, JSON.stringify(data, null, 2));
+}
+
+// A book whose book.json is gone for good (and no .bak) still has its
+// chapters: the book comes back with them in the order they were made, its
+// title from the catalog, rather than vanishing from the shelf.
+function rebuildBookMeta(bookId) {
+  const dir = bookDir(bookId);
+  const chDir = path.join(dir, 'chapters');
+  if (!fs.existsSync(chDir)) return null;
+  let title = '';
+  try {
+    const cat = fs.readFileSync(path.join(LIBRARY_DIR, '_catalog.txt'), 'utf8');
+    const line = cat.split('\n').find((l) => l.includes('  —  ' + bookId + '  —  '));
+    if (line) title = line.split('  —  ')[0].trim();
+  } catch { /* no catalog */ }
+  const order = fs.readdirSync(chDir).filter((f) => f.endsWith('.html')).map((f) => f.slice(0, -5)).sort();
+  const meta = {
+    id: bookId,
+    title: title || t('Untitled'),
+    subtitle: '', series: '', author: t('Anonymous'), wordGoal: 0,
+    created: new Date().toISOString(), modified: new Date().toISOString(),
+    chapterOrder: order,
+    tabNames: { notes: 'Notes', outline: 'Outline' }
+  };
+  logError('recovered', `${bookId}/book.json was lost; rebuilt from ${order.length} chapter files`);
+  try { writeJSON(path.join(dir, 'book.json'), meta); } catch (err) { logError('recover write', err); }
+  return meta;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +519,21 @@ function writeJSON(file, data) {
 
 ipcMain.handle('library:read', () => {
   ensureLibrary();
-  return readJSON(LIBRARY_FILE, null);
+  const lib = readJSON(LIBRARY_FILE, null);
+  if (lib) return lib;
+  // library.json lost with no copy to fall back on: every book in the
+  // folder goes onto one shelf, so nothing disappears
+  const ids = [];
+  try {
+    for (const d of fs.readdirSync(LIBRARY_DIR)) {
+      if (d.startsWith('book-') && fs.existsSync(path.join(LIBRARY_DIR, d, 'chapters'))) ids.push(d);
+    }
+  } catch { /* empty */ }
+  const seed = { authorName: '', penNames: [], firstRunDone: ids.length > 0, pageTheme: 'night',
+    shelves: [{ id: 'shelf-1', name: t('Works in Progress'), bookIds: ids }] };
+  logError('recovered', `library.json was lost; ${ids.length} books put back on one shelf`);
+  try { writeJSON(LIBRARY_FILE, seed); } catch (err) { logError('recover write', err); }
+  return seed;
 });
 
 ipcMain.handle('library:write', (_e, data) => {
@@ -293,14 +582,26 @@ ipcMain.handle('library:listBooks', () => {
     for (const d of fs.readdirSync(LIBRARY_DIR)) {
       if (!d.startsWith('book-')) continue;
       const m = readJSON(path.join(LIBRARY_DIR, d, 'book.json'), null);
-      if (m && m.id) out.push({ id: m.id, title: m.title || t('Untitled'), author: m.author || '', modified: m.modified || '', kind: m.kind || '' });
+      // the folder is the book: a copied folder ("book-x copy") is its own
+      // book, even though the book.json inside still names the original
+      if (m && m.id) out.push({ id: d, title: m.title || t('Untitled'), author: m.author || '', modified: m.modified || '', kind: m.kind || '' });
     }
   } catch (err) { logError('listBooks', err); }
   return out;
 });
 
 ipcMain.handle('book:readMeta', (_e, bookId) => {
-  return readJSON(path.join(bookDir(bookId), 'book.json'), null);
+  const dir = bookDir(bookId);
+  const meta = readJSON(path.join(dir, 'book.json'), null);
+  if (meta) {
+    if (meta.id !== bookId) meta.id = bookId; // a copied folder answers to its own name
+    return meta;
+  }
+  // iCloud (on older macOS) holds a file it hasn't downloaded as
+  // ".book.json.icloud": the book is there, just not here yet. Rebuilding
+  // it would put a bare book.json over the real one.
+  if (fs.existsSync(path.join(dir, '.book.json.icloud'))) return null;
+  return rebuildBookMeta(bookId);
 });
 
 ipcMain.handle('book:writeMeta', (_e, bookId, meta) => {
@@ -338,13 +639,38 @@ ipcMain.handle('chapter:read', (_e, bookId, chapterId) => {
   }
 });
 
-ipcMain.handle('chapter:write', (_e, bookId, chapterId, html) => {
+// `expected` is the text the window last read or wrote for this chapter.
+// When the file holds something else (another device wrote it since, and
+// it isn't just an older copy of these words), nothing is written: the
+// window is handed that text to keep as its own chapter first, so neither
+// version is lost to a save that happened before the next look at the disk.
+ipcMain.handle('chapter:write', (_e, bookId, chapterId, html, expected) => {
   const dir = path.join(bookDir(bookId), 'chapters');
   const file = path.join(dir, libName(chapterId) + '.html');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(file, html);
+  if (typeof expected === 'string') {
+    let cur = null;
+    try { cur = fs.readFileSync(file, 'utf8'); } catch { /* not there: nothing to keep */ }
+    if (cur !== null && chapterDiverged(cur, expected, html)) return { conflict: cur };
+  }
+  writeFileDurable(file, html);
   return true;
 });
+// shared with Pocket's bridge (same rule): the disk copy differs from what
+// this device last knew, holds words, and has a word the new text lacks
+function chapterDiverged(cur, expected, html) {
+  if (cur === expected || cur === html) return false;
+  const bag = (h) => {
+    const m = new Map();
+    for (const w of String(h || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').split(/\s+/)) if (w) m.set(w, (m.get(w) || 0) + 1);
+    return m;
+  };
+  const there = bag(cur);
+  if (!there.size) return false;
+  const here = bag(html);
+  for (const [w, n] of there) if (n > (here.get(w) || 0)) return true;
+  return false;
+}
 
 ipcMain.handle('chapter:delete', (_e, bookId, chapterId) => {
   const file = path.join(bookDir(bookId), 'chapters', libName(chapterId) + '.html');
@@ -363,7 +689,7 @@ ipcMain.handle('aux:read', (_e, bookId, name) => {
 });
 
 ipcMain.handle('aux:write', (_e, bookId, name, html) => {
-  fs.writeFileSync(path.join(bookDir(bookId), libName(name) + '.html'), html);
+  writeFileDurable(path.join(bookDir(bookId), libName(name) + '.html'), html);
   return true;
 });
 
@@ -436,9 +762,13 @@ ipcMain.handle('cover:set', (_e, bookId, srcPath) => {
   if (!COVER_EXTS.includes(ext)) return null;
   const dir = bookDir(bookId);
   if (!fs.existsSync(dir)) return null;
-  clearCovers(dir);
+  // the new cover is copied in before the old ones go (the picked file may
+  // be one of them)
   const fname = 'cover-' + Date.now() + '.' + (ext === 'jpeg' ? 'jpg' : ext);
   fs.copyFileSync(srcPath, path.join(dir, fname));
+  for (const f of fs.readdirSync(dir)) {
+    if (/^cover-\d+\./.test(f) && f !== fname) fs.unlinkSync(path.join(dir, f));
+  }
   return fname;
 });
 
@@ -446,6 +776,245 @@ ipcMain.handle('cover:remove', (_e, bookId) => {
   const dir = bookDir(bookId);
   if (fs.existsSync(dir)) clearCovers(dir);
   return true;
+});
+
+// ---------------------------------------------------------------------------
+// Papers. A paper's figures and the citation style a writer brought in live
+// in its folder beside the chapters (figure-<id>.png, style.csl); the styles
+// NEO ships live in paper/csl. A DOI is looked up only when the writer asks,
+// and only the DOI leaves the machine.
+const PAPER_FILE = /^(?:figure-[a-z0-9]{4,40}\.(?:png|jpe?g|gif|webp|svg)|style\.csl)$/;
+function paperFile(bookId, name) {
+  name = libName(name);
+  if (!PAPER_FILE.test(name)) throw new Error('Not a paper file: ' + name);
+  return path.join(bookDir(bookId), name);
+}
+ipcMain.handle('paper:read', (_e, bookId, name) => {
+  const file = paperFile(bookId, name);
+  return fs.existsSync(file) ? fs.readFileSync(file).toString('base64') : null;
+});
+ipcMain.handle('paper:write', (_e, bookId, name, base64) => {
+  writeFileDurable(paperFile(bookId, name), Buffer.from(String(base64), 'base64'));
+  return true;
+});
+ipcMain.handle('paper:asset', (_e, name) => {
+  if (!/^[\w-]+\.(?:csl|xml)$/.test(name)) throw new Error('Not a citation style: ' + name);
+  return fs.readFileSync(path.join(__dirname, 'paper', 'csl', name), 'utf8');
+});
+ipcMain.handle('paper:lookup', async (_e, doi) => {
+  doi = String(doi || '').trim();
+  if (!/^10\.\d{4,9}\/\S+$/.test(doi)) throw new Error(t('Not a DOI: {doi}', { doi }));
+  const { net } = require('electron');
+  let res;
+  try {
+    res = await net.fetch('https://doi.org/' + encodeURI(doi).replace(/#/g, '%23'), {
+      headers: { Accept: 'application/vnd.citationstyles.csl+json' }
+    });
+  } catch (err) {
+    throw new Error(t('No connection to {service} ({error})', { service: 'doi.org', error: (err && err.message) || String(err) }));
+  }
+  // the same words as Pocket's lookup, which asks Crossref or DataCite
+  if (res.status === 404) throw new Error(t('{service} has no record of {doi}', { service: 'doi.org', doi }));
+  if (!res.ok) throw new Error(t('{service} answered {status}', { service: 'doi.org', status: String(res.status) }));
+  return res.json();
+});
+// Zotero, on this computer: Better BibTeX's search when it's installed
+// (its items carry their citation keys), else Zotero 7's own local API
+// (Settings → Advanced → "Allow other applications on this computer to
+// communicate with Zotero"). Only ever 127.0.0.1; null when neither answers.
+ipcMain.handle('paper:zotero', async (_e, q) => {
+  q = String(q || '').slice(0, 120).trim();
+  if (q.length < 2) return [];
+  const { net } = require('electron');
+  const ask = async (url, opts = {}) => {
+    const res = await net.fetch(url, { ...opts, signal: AbortSignal.timeout(1500) });
+    if (!res.ok) throw new Error('Zotero answered ' + res.status);
+    return res.json();
+  };
+  try {
+    const out = await ask('http://127.0.0.1:23119/better-bibtex/json-rpc', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'item.search', params: [q], id: 1 })
+    });
+    if (Array.isArray(out.result)) return out.result.slice(0, 8).map((it) => ({ ...it, id: it.citekey || it.citationKey || it['citation-key'] || '' }));
+  } catch { /* no Better BibTeX: Zotero's own API */ }
+  try {
+    const out = await ask('http://127.0.0.1:23119/api/users/0/items/top?format=csljson&limit=8&qmode=titleCreatorYear&q=' + encodeURIComponent(q), {
+      headers: { 'Zotero-API-Version': '3', 'Zotero-Allowed-Request': '1' }
+    });
+    const items = Array.isArray(out) ? out : out.items || [];
+    return items.slice(0, 8).map((it) => ({ ...it, id: it['citation-key'] || it.citationKey || '' }));
+  } catch {
+    return null;
+  }
+});
+
+// A reference file the writer keeps elsewhere (Zotero's Better BibTeX
+// keeps one up to date). Which file, for which paper, is this computer's
+// own business: it's kept in userData, written only when the writer picks
+// the file here, and only a file picked that way is ever read. (book.json
+// syncs; a path in it could name any file on the other machine.)
+const LINKS_FILE = () => path.join(app.getPath('userData'), 'paper-links.json');
+const readLinks = () => readJSON(LINKS_FILE(), {}) || {};
+ipcMain.handle('paper:link', async (_e, bookId) => {
+  bookId = libName(bookId);
+  const win = BrowserWindow.getFocusedWindow();
+  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    properties: ['openFile'],
+    filters: [{ name: 'References', extensions: ['bib', 'json', 'ris'] }]
+  });
+  if (canceled || !filePaths[0]) return null;
+  const file = filePaths[0];
+  const links = readLinks();
+  links[bookId] = file;
+  writeFileDurable(LINKS_FILE(), JSON.stringify(links, null, 2));
+  return { path: file, text: fs.readFileSync(file, 'utf8'), mtime: fs.statSync(file).mtimeMs };
+});
+// A venue's LaTeX template (a NeurIPS or ICML zip, or its loose .tex and
+// .sty files), kept beside the paper as template.zip: plain files, the
+// writer's own copy, never bundled with NEO. Read back as its files, the
+// text ones as text, for the LaTeX export to fill.
+const TEMPLATE_TEXT = /\.(?:tex|sty|cls|bst|cfg|clo|def|bbx|cbx|bib|txt|md)$/i;
+const TEMPLATE_LIMIT = 30 * 1024 * 1024;
+// one path inside the template, made safe: forward slashes, no absolute
+// path or .., none of a Mac's zip litter
+function templatePath(name) {
+  const parts = String(name).replace(/\\/g, '/').split('/').filter((p) => p && p !== '.');
+  if (!parts.length || parts.some((p) => p === '..' || p.includes('\0')) || /^[a-z]:$/i.test(parts[0])) return null;
+  if (parts[0] === '__MACOSX' || parts[parts.length - 1] === '.DS_Store' || parts[parts.length - 1].startsWith('._')) return null;
+  return parts.join('/');
+}
+async function templateFiles(zip) {
+  const files = [];
+  let total = 0;
+  for (const entry of Object.values(zip.files)) {
+    if (entry.dir) continue;
+    const name = templatePath(entry.name);
+    if (!name) continue;
+    const data = await entry.async('nodebuffer');
+    total += data.length;
+    if (total > TEMPLATE_LIMIT || files.length >= 500) throw new Error(t('That template is too large to keep with the paper'));
+    files.push(TEMPLATE_TEXT.test(name) ? { path: name, text: data.toString('utf8') } : { path: name, base64: data.toString('base64') });
+  }
+  // a zip that holds one folder: its contents, as the template
+  const tops = new Set(files.map((f) => f.path.split('/')[0]));
+  if (tops.size === 1 && files.every((f) => f.path.includes('/'))) for (const f of files) f.path = f.path.slice(f.path.indexOf('/') + 1);
+  return files;
+}
+const templateFile = (bookId) => path.join(bookDir(bookId), 'template.zip');
+ipcMain.handle('paper:template-import', async (_e, bookId) => {
+  bookId = libName(bookId);
+  const JSZip = require('jszip');
+  const { canceled, filePaths } = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow(), {
+    title: t('A LaTeX template'),
+    message: t('The venue’s template: its .zip, or its .tex, .sty, .cls and .bst files'),
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: t('LaTeX template'), extensions: ['zip', 'tex', 'sty', 'cls', 'bst', 'cfg', 'clo', 'def', 'bib'] }]
+  });
+  if (canceled || !filePaths.length) return null;
+  let files;
+  if (filePaths.length === 1 && /\.zip$/i.test(filePaths[0])) {
+    if (fs.statSync(filePaths[0]).size > TEMPLATE_LIMIT) throw new Error(t('That template is too large to keep with the paper'));
+    files = await templateFiles(await JSZip.loadAsync(fs.readFileSync(filePaths[0])));
+  } else {
+    const zip = new JSZip();
+    for (const fp of filePaths.filter((f) => !/\.zip$/i.test(f))) zip.file(path.basename(fp), fs.readFileSync(fp));
+    files = await templateFiles(zip);
+  }
+  // kept as the cleaned files, zipped again: what NEO reads is what's stored
+  const out = new JSZip();
+  for (const f of files) out.file(f.path, f.text !== undefined ? f.text : Buffer.from(f.base64, 'base64'));
+  writeFileDurable(templateFile(bookId), await out.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
+  return { files, from: path.basename(filePaths[0]) };
+});
+ipcMain.handle('paper:template', async (_e, bookId) => {
+  const file = templateFile(libName(bookId));
+  if (!fs.existsSync(file)) return null;
+  const JSZip = require('jszip');
+  return { files: await templateFiles(await JSZip.loadAsync(fs.readFileSync(file))) };
+});
+// The command palette (View → Command Palette…, ⌘⇧P): every command the
+// menus offer right now, read from the menu itself so the two never differ,
+// and run by clicking that same item (its tick, its radio, its role)
+function menuCommands() {
+  const out = [];
+  const walk = (items, where) => items.forEach((it, i) => {
+    if (it.type === 'separator' || it.visible === false) return;
+    const label = String(it.label || '').replace(/&&/g, '&');
+    if (it.submenu) { walk(it.submenu.items, [...where, label]); return; }
+    if (!it.enabled || !label) return;
+    out.push({ item: it, id: [...where, label, i].join('\u0000'), label, path: where, accel: it.accelerator || '', checked: it.type === 'checkbox' || it.type === 'radio' ? !!it.checked : null });
+  });
+  const menu = Menu.getApplicationMenu();
+  if (menu) walk(menu.items, []);
+  return out;
+}
+ipcMain.handle('commands:list', () => menuCommands().map(({ item, ...c }) => c));
+ipcMain.handle('commands:run', (e, id) => {
+  const found = menuCommands().find((c) => c.id === id);
+  if (!found) return false;
+  found.item.click(undefined, BrowserWindow.fromWebContents(e.sender), e.sender);
+  return true;
+});
+// to the system trash, as a book is: the writer's file, never deleted outright
+ipcMain.handle('paper:template-remove', async (_e, bookId) => {
+  const file = templateFile(libName(bookId));
+  if (!fs.existsSync(file)) return true;
+  const { shell } = require('electron');
+  await shell.trashItem(file);
+  return true;
+});
+ipcMain.handle('paper:unlink', (_e, bookId) => {
+  const links = readLinks();
+  delete links[libName(bookId)];
+  writeFileDurable(LINKS_FILE(), JSON.stringify(links, null, 2));
+  return true;
+});
+ipcMain.handle('paper:linked', (_e, bookId, since) => {
+  const file = readLinks()[libName(bookId)];
+  if (!file || typeof file !== 'string') return null;
+  try {
+    const mtime = fs.statSync(file).mtimeMs;
+    if (mtime === since) return { path: file, mtime, same: true };
+    return { path: file, mtime, text: fs.readFileSync(file, 'utf8') };
+  } catch {
+    return { path: file, missing: true };
+  }
+});
+
+// A paper as its journal would print it, in a window of its own: one
+// window, reused, its title naming the journal
+let previewWin = null;
+ipcMain.handle('paper:preview', async (_e, html, title, opts = {}) => {
+  const pdf = await renderPDF(String(html), 'paper');
+  const file = path.join(app.getPath('temp'), `neo-preview-${process.pid}-${Date.now()}.pdf`);
+  fs.writeFileSync(file, pdf);
+  if (!previewWin || previewWin.isDestroyed()) {
+    const main = BrowserWindow.getFocusedWindow();
+    const at = main ? main.getBounds() : null;
+    previewWin = new BrowserWindow({
+      width: 860, height: Math.min(1100, at ? at.height : 1000), x: at ? at.x + 40 : undefined, y: at ? at.y + 20 : undefined,
+      backgroundColor: '#3a3a3a', show: false,
+      webPreferences: { plugins: true, sandbox: true, contextIsolation: true, nodeIntegration: false }
+    });
+    previewWin.on('page-title-updated', (e) => e.preventDefault());
+    previewWin.on('closed', () => {
+      previewWin = null;
+      sendToWindow({ type: 'paper', command: 'previewClosed' });
+    });
+  }
+  const old = previewWin.neoFile;
+  previewWin.neoFile = file;
+  previewWin.setTitle(String(title || 'Preview'));
+  // open at the page where the writer is: the section the caret is in
+  const pages = opts.focus ? pdfAnchorPages(pdf) : {};
+  const page = pages[String(opts.focus)];
+  await previewWin.loadURL(require('url').pathToFileURL(file).href + (page ? '#page=' + page : ''));
+  // a quiet redraw while writing doesn't take the writer away from the page
+  if (!opts.quiet) previewWin.show();
+  else if (!previewWin.isVisible()) previewWin.showInactive();
+  if (old) { try { fs.unlinkSync(old); } catch { /* gone */ } }
+  return { page: page || 1 };
 });
 
 ipcMain.handle('cover:read', (_e, bookId, fname) => {
@@ -573,7 +1142,32 @@ ipcMain.handle('fullscreen:escape', (e) => {
 // Export + email
 // ---------------------------------------------------------------------------
 
-async function renderPDF(html) {
+// A script prints on US letter whatever the country (the industry's page),
+// with the margins laid out in the page itself
+const SCREENPLAY_PRINT = { pageSize: 'Letter', margins: { top: 0, bottom: 0, left: 0, right: 0 }, printBackground: false, preferCSSPageSize: true, generateTaggedPDF: true, generateDocumentOutline: false };
+// A paper's page is its journal's: the size and margins come from its
+// @page rule, and the page numbers sit in the bottom margin
+const PAPER_PRINT = {
+  preferCSSPageSize: true,
+  printBackground: true,
+  displayHeaderFooter: true,
+  headerTemplate: '<div></div>',
+  footerTemplate: '<div style="width:100%;text-align:center;font:8px Helvetica,Arial,sans-serif;color:#555"><span class="pageNumber"></span></div>',
+  generateTaggedPDF: true,
+  generateDocumentOutline: true
+};
+// Letter is a habit of the Americas (and the Philippines); most of the world
+// prints A4. The computer's region decides, for the PDF and the Word file
+// alike. (A script is Letter everywhere: SCREENPLAY_PRINT.)
+const LETTER_COUNTRIES = ['US', 'CA', 'MX', 'PH', 'CL', 'CO', 'VE', 'GT', 'CR', 'PA', 'DO', 'PR', 'SV', 'HN', 'NI', 'BZ'];
+function paperSize() {
+  let cc = '';
+  try { cc = app.getLocaleCountryCode() || ''; } catch { /* unknown */ }
+  return LETTER_COUNTRIES.includes(cc.toUpperCase()) ? 'Letter' : 'A4';
+}
+ipcMain.on('paper:get', (e) => { e.returnValue = paperSize(); });
+
+async function renderPDF(html, print) {
   // The book reaches the PDF printer as a file, not as a data: URL. A URL
   // stops at 2 MB, and a long novel is bigger than that once it's encoded; a
   // book in Russian or Chinese gets there far sooner, because every letter
@@ -582,10 +1176,8 @@ async function renderPDF(html) {
   const tmp = path.join(app.getPath('temp'), `neo-print-${process.pid}-${Date.now()}.html`);
   fs.writeFileSync(tmp, html, 'utf8');
   const pdfWin = new BrowserWindow({ show: false, webPreferences: { sandbox: true } });
-  // Letter is a North American habit; most of the world prints A4.
-  const letterCountries = ['US', 'CA', 'MX', 'PH'];
-  const options = {
-    pageSize: letterCountries.includes(app.getLocaleCountryCode()) ? 'Letter' : 'A4',
+  const options = print === 'screenplay' ? SCREENPLAY_PRINT : print === 'paper' ? PAPER_PRINT : {
+    pageSize: paperSize(),
     margins: { top: 1, bottom: 1, left: 1, right: 1 },
     printBackground: false,
     // chapter headings become the PDF's bookmarks, for jumping around in
@@ -678,7 +1270,7 @@ async function buildZip(zipEntries) {
   });
 }
 
-ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntries }) => {
+ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntries, base64, print }) => {
   const win = BrowserWindow.getFocusedWindow();
   const { canceled, filePath } = await dialog.showSaveDialog(win, {
     defaultPath: path.join(os.homedir(), 'Documents', defaultName + '.' + format),
@@ -688,8 +1280,11 @@ ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntr
   try {
     if (zipEntries) {
       fs.writeFileSync(filePath, await buildZip(zipEntries));
+    } else if (base64) {
+      // pictures (a saved cover) arrive as base64
+      fs.writeFileSync(filePath, Buffer.from(content, 'base64'));
     } else if (format === 'pdf') {
-      fs.writeFileSync(filePath, await renderPDF(content));
+      fs.writeFileSync(filePath, await renderPDF(content, print));
     } else {
       fs.writeFileSync(filePath, content, 'utf8');
     }
@@ -705,13 +1300,13 @@ ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntr
 
 // Writes a timestamped snapshot to the library's Exports folder, then hands it
 // to your email — an outside-the-machine paper trail for provenance.
-ipcMain.handle('email:draft', async (_e, { to, subject, body, html, defaultName, method }) => {
+ipcMain.handle('email:draft', async (_e, { to, subject, body, html, defaultName, method, print }) => {
   const { shell } = require('electron');
   const exportsDir = path.join(LIBRARY_DIR, 'Exports');
   if (!fs.existsSync(exportsDir)) fs.mkdirSync(exportsDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const file = path.join(exportsDir, `${defaultName}-${stamp}.pdf`);
-  fs.writeFileSync(file, await renderPDF(html));
+  fs.writeFileSync(file, await renderPDF(html, print));
 
   if (method === 'gmail') {
     // Gmail compose in the browser can't take an attachment from outside,
@@ -750,9 +1345,16 @@ ipcMain.handle('email:draft', async (_e, { to, subject, body, html, defaultName,
 // Import: .docx / .txt / .md → chapters
 // ---------------------------------------------------------------------------
 
+// numeric references too, and &amp; last, so a literal "&lt;" in the text
+// stays "&lt;" instead of turning into "<"
 const decodeEntities = (s) => s
-  .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-  .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+  .replace(/&#x([0-9a-f]+);/gi, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return m; } })
+  .replace(/&#(\d+);/g, (m, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return m; } })
+  .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+  .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+// a document's own * _ and \ are text, not emphasis: they travel escaped,
+// the way Markdown writes them, and the window turns them back into letters
+const escapeMarks = (s) => s.replace(/[\\*_]/g, '\\$&');
 
 // Is a formatting tag (<w:b>, <w:i>) present, and is it on? Returns true,
 // false (present but switched off — Word writes <w:i w:val="0"/> to cancel
@@ -777,7 +1379,10 @@ function docxStyleFormats(stylesXml) {
     const basedOn = (body.match(/<w:basedOn\s+w:val="([^"]+)"/) || [])[1];
     // only the style's own run properties, not the paragraph-mark ones
     const rpr = (body.match(/<w:rPr>[\s\S]*?<\/w:rPr>/) || [''])[0];
-    raw[m[1]] = { basedOn, bold: docxFormatOn(rpr, 'w:b'), italic: docxFormatOn(rpr, 'w:i') };
+    // the style's name: always English in the file ("heading 1", "Title"),
+    // while its id follows Word's language ("berschrift1", "Titre1")
+    const name = (body.match(/<w:name\s+w:val="([^"]*)"/) || [])[1] || '';
+    raw[m[1]] = { basedOn, name, bold: docxFormatOn(rpr, 'w:b'), italic: docxFormatOn(rpr, 'w:i') };
   }
   const resolve = (id, depth) => {
     if (out[id]) return out[id];
@@ -785,6 +1390,7 @@ function docxStyleFormats(stylesXml) {
     if (!st || depth > 8) return { bold: false, italic: false };
     const base = st.basedOn ? resolve(st.basedOn, depth + 1) : { bold: false, italic: false };
     out[id] = {
+      name: st.name,
       bold: st.bold === undefined ? base.bold : st.bold,
       italic: st.italic === undefined ? base.italic : st.italic
     };
@@ -802,18 +1408,28 @@ function docxParagraphToMarkdown(p, styles = {}) {
   // gives it its title — regardless of locale, the underlying style id is
   // always "Heading*".
   const pStyle = (p.match(/<w:pStyle\s+w:val="([^"]*)"/) || [])[1] || '';
-  const heading = /^heading\s*\d*$/i.test(pStyle);
+  const sName = (styles[pStyle] && styles[pStyle].name) || '';
+  const heading = /^heading\s*\d*$/i.test(pStyle) || /^heading\s*\d*$/i.test(sName);
   // Google Docs exports each of a document's tabs under a "Title"-styled
   // line, and the book's own title page uses the same style: the first one
   // names the book, later ones start chapters (see chapterize)
-  const title = /^title$/i.test(pStyle);
+  const title = /^title$/i.test(pStyle) || /^title$/i.test(sName);
   // what the paragraph's style says, before any run has its say
   const pBase = styles[pStyle] || { bold: false, italic: false };
   const runs = [...p.matchAll(/<w:r[ >][\s\S]*?<\/w:r>/g)].map((rm) => {
     const r = rm[0];
     const rpr = (r.match(/<w:rPr>[\s\S]*?<\/w:rPr>/) || [''])[0];
-    const text = [...r.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
-      .map((t) => decodeEntities(t[1])).join('');
+    // the run's text in order: its words, and the tabs, line breaks and
+    // no-break hyphens between them (only <w:t> used to count, which ran
+    // "red,⏎violets" together into "red,violets")
+    const text = [...r.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:tab\/>|<w:br(\s[^>]*)?\/>|<w:cr\/>|<w:noBreakHyphen\/>/g)]
+      .map((t) => {
+        if (t[1] !== undefined) return escapeMarks(decodeEntities(t[1]));
+        if (t[0].startsWith('<w:tab')) return ' ';
+        if (t[0].startsWith('<w:noBreakHyphen')) return '\u2011';
+        if (/w:type="(page|column)"/.test(t[0])) return '';
+        return '\n';
+      }).join('');
     const rStyle = (rpr.match(/<w:rStyle\s+w:val="([^"]*)"/) || [])[1];
     const rBase = rStyle && styles[rStyle] ? styles[rStyle] : pBase;
     const b = docxFormatOn(rpr, 'w:b');
@@ -827,12 +1443,20 @@ function docxParagraphToMarkdown(p, styles = {}) {
     if (last && last.bold === run.bold && last.italic === run.italic) last.text += run.text;
     else merged.push({ ...run });
   }
-  const text = merged.map((run) => {
-    let t = run.text;
+  // markers hug the words: "** bold **" isn't emphasis to a reader of
+  // Markdown, and a run with no words (a tab, a break) gets none at all
+  // (each line of a run on its own: the paragraph is cut at its line
+  // breaks later, and an italic poem keeps its italics on every line)
+  const wrap = (run, piece) => {
+    const m = piece.match(/^(\s*)([\s\S]*?)(\s*)$/);
+    let t = m[2];
+    if (!t) return piece;
     if (run.bold) t = '**' + t + '**';
     if (run.italic) t = '*' + t + '*';
-    return t;
-  }).join('').trim();
+    return m[1] + t + m[3];
+  };
+  const text = merged.map((run) => run.text.split('\n').map((piece) => wrap(run, piece)).join('\n'))
+    .join('').replace(/[ \t]*\n[ \t]*/g, '\n').trim();
   return { text, pageBreak, heading, title };
 }
 
@@ -848,17 +1472,46 @@ const CHAPTER_WORDS = new RegExp('^(' + [
   // ro (prolog, epilog above). A bare "Capitol" only before a number:
   // on its own it is an English word, and "Capitol Hill was quiet." is prose
   'capitol(?=\\s+\\d)', 'capitolul', 'partea',
-  'глава', 'пролог', 'эпилог', 'часть'                             // ru
+  'глава', 'пролог', 'эпилог', 'часть',                            // ru
+  'κεφάλαιο', 'κεφαλαιο', 'πρόλογος', 'προλογος',
+  'επίλογος', 'επιλογος', 'μέρος', 'μερος',
+  'ραψωδία', 'ραψωδια',                                             // el
+  // hu: the number comes first ("3. fejezet", "II. rész")
+  'prológus', 'prologus', 'epilógus', 'epilogus',
+  '(?:\\d{1,3}|[ivxlc]{1,7})\\.\\s*(?:fejezet|rész|resz)'
 ].join('|') + ')(?![\\p{L}\\d])', 'iu');
 
 // A manuscript's own Prologue / Epilogue headings give those chapters their role
-const PROLOGUE_WORDS = /^(prologue|prólogo|prologo|prolog|proloog)(?![\p{L}\d])/iu;
-const EPILOGUE_WORDS = /^(epilogue|épilogue|epílogo|epilogo|epilog|epiloog)(?![\p{L}\d])/iu;
+const PROLOGUE_WORDS = /^(prologue|prólogo|prologo|prolog|proloog|prológus|prologus)(?![\p{L}\d])/iu;
+const EPILOGUE_WORDS = /^(epilogue|épilogue|epílogo|epilogo|epilog|epiloog|epilógus|epilogus)(?![\p{L}\d])/iu;
+
+// A text file in whatever it was saved as: UTF-8 (with or without its
+// mark), UTF-16 (Notepad's "Unicode"), or, when it isn't valid UTF-8, the
+// Windows code page Word's plain-text export uses
+function readTextFile(fp) {
+  const buf = fs.readFileSync(fp);
+  const { TextDecoder } = require('util');
+  if (buf[0] === 0xFF && buf[1] === 0xFE) return new TextDecoder('utf-16le').decode(buf.subarray(2));
+  if (buf[0] === 0xFE && buf[1] === 0xFF) return new TextDecoder('utf-16be').decode(buf.subarray(2));
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf).replace(/^\uFEFF/, '');
+  } catch {
+    // Latin-1 plus the code page's own 0x80–0x9F (curly quotes, dashes, €)
+    const cp = '\u20AC\uFFFD\u201A\u0192\u201E\u2026\u2020\u2021\u02C6\u2030\u0160\u2039\u0152\uFFFD\u017D\uFFFD' +
+      '\uFFFD\u2018\u2019\u201C\u201D\u2022\u2013\u2014\u02DC\u2122\u0161\u203A\u0153\uFFFD\u017E\u0178';
+    return buf.toString('latin1').replace(/[\u0080-\u009F]/g, (c) => cp[c.charCodeAt(0) - 0x80]);
+  }
+}
 
 async function importFile(fp) {
   const name = path.basename(fp).replace(/\.[^.]+$/, '');
   const ext = path.extname(fp).toLowerCase();
   let paras = [];
+  // a script (Fountain, or Final Draft's XML) is read as it stands; the
+  // window sorts it into its elements (spFromFountain, spFromFdx in app.js)
+  if (ext === '.fountain' || ext === '.fdx') {
+    return { name, script: ext.slice(1), source: fs.readFileSync(fp, 'utf8').replace(/^\uFEFF/, '') };
+  }
 
   if (ext === '.docx') {
     const JSZip = require('jszip');
@@ -869,11 +1522,24 @@ async function importFile(fp) {
     const stylesFile = zip.file('word/styles.xml');
     const styles = docxStyleFormats(stylesFile ? await stylesFile.async('string') : '');
     paras = [...xml.matchAll(/<w:p[ >][\s\S]*?<\/w:p>/g)]
-      .map((m) => docxParagraphToMarkdown(m[0], styles));
+      .map((m) => docxParagraphToMarkdown(m[0], styles))
+      // a line break inside a Word paragraph (a poem, an address) becomes
+      // a paragraph of its own: NEO's lines are paragraphs
+      .flatMap((p) => !p.text.includes('\n') ? [p]
+        : p.text.split('\n').map((text, i) => ({ ...p, text: text.trim(), pageBreak: p.pageBreak && i === 0, heading: p.heading && i === 0, title: p.title && i === 0 })));
   } else {
-    const raw = fs.readFileSync(fp, 'utf8');
-    paras = raw.split(/\r?\n\s*\r?\n/)
-      .map((b) => ({ text: b.replace(/\s*\r?\n\s*/g, ' ').trim(), pageBreak: false }))
+    const raw = readTextFile(fp);
+    // Paragraphs are split on blank lines, unless the file barely has any
+    // and puts each paragraph on a line of its own (Word's "Plain Text",
+    // Notepad, Scrivener): then every line is a paragraph
+    const lines = raw.split(/\r\n|\r|\n/);
+    const blanks = lines.filter((l) => !l.trim()).length;
+    const filled = lines.length - blanks;
+    // (a file hard-wrapped at ~70 columns, Project Gutenberg style, has a
+    // blank line between paragraphs: it keeps the blank-line rule)
+    const perLine = ext === '.txt' && filled > 3 && blanks <= Math.max(1, filled / 20);
+    paras = (perLine ? lines : raw.split(/(?:\r\n|\r|\n)\s*(?:\r\n|\r|\n)/))
+      .map((b) => ({ text: (perLine ? b : b.replace(/\s*(?:\r\n|\r|\n)\s*/g, ' ')).trim(), pageBreak: false }))
       .filter((p) => p.text);
   }
 
@@ -884,7 +1550,9 @@ async function importFile(fp) {
   const isNumeralish = (t) => /^\d{1,3}\.?$/.test(t) || /^[IVXLC]{1,7}\.?$/.test(t) || SPELLED.test(t);
   // Bare numbers only count as chapter markers when there's a ladder of them —
   // a story that merely OPENS with "Seven." keeps its seven.
-  const numeralMode = paras.filter((p) => p.text && isNumeralish(p.text.trim())).length >= 2;
+  // a heading set in bold ("**Chapter 1**") is still a heading
+  const bare = (t) => String(t || '').replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/\\([\\*_])/g, '$1').trim();
+  const numeralMode = paras.filter((p) => p.text && isNumeralish(bare(p.text))).length >= 2;
   // A markdown heading: one or more "#" then text — any "size" (depth) counts.
   const isMdHeading = (t) => /^#{1,6}\s+\S/.test(t);
   const mdTitleOf = (t) => t.replace(/^#{1,6}\s*/, '').trim();
@@ -897,12 +1565,12 @@ async function importFile(fp) {
     (CHAPTER_WORDS.test(t) && t.length < 60 && !readsAsSentence(t)) ||
     (numeralMode && isNumeralish(t))
   );
-  const isHeading = (t) => t && (isMdHeading(t) || isNumberedHeading(t));
+  const isHeading = (t) => t && (isMdHeading(t) || isNumberedHeading(bare(t)));
   // The chapter title that a heading contributes. Markdown hashes and any
   // emphasis markers are stripped, and pure numbering yields no title.
   const titleOf = (t) => {
     if (isMdHeading(t)) t = mdTitleOf(t);
-    t = t.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1');
+    t = bare(t).replace(/(^|[^\p{L}\p{N}_])_([^_]+)_(?![\p{L}\p{N}_])/gu, '$1$2');
     return isNumberedHeading(t) ? '' : t;
   };
   const isBreak = (t) => /^\s*([*#•~⁂—–-]\s*){1,7}$/.test(t || '');
@@ -996,12 +1664,12 @@ async function importFile(fp) {
       (t0 === t0.toUpperCase() && /\p{Lu}.*\p{Lu}/u.test(t0) && t0.length < 60)
     );
     if (titleish) {
-      title = t0;
+      title = bare(t0);
       first.paras.shift();
     }
     const bl = first.paras.length ? bylineOf((first.paras[0].text || '').trim()) : null;
     if (bl) {
-      author = bl.trim();
+      author = bare(bl);
       first.paras.shift();
     }
     if (!first.paras.length) chapters.shift();
@@ -1012,6 +1680,7 @@ async function importFile(fp) {
   chapters.forEach((ch, i) => {
     if ((ch.role === 'prologue' && i !== 0) || (ch.role === 'epilogue' && i !== chapters.length - 1) || chapters.length < 2) ch.role = null;
   });
+  if (styledTitle && title === styledTitle) title = bare(title);
   return { name, title, author, chapters };
 }
 
@@ -1019,7 +1688,7 @@ async function importFile(fp) {
 ipcMain.handle('import:files', async (_e, paths) => {
   const out = [];
   for (const fp of paths || []) {
-    if (!/\.(docx|txt|md)$/i.test(fp)) continue;
+    if (!/\.(docx|txt|md|fountain|fdx)$/i.test(fp)) continue;
     try {
       out.push(await importFile(fp));
     } catch (err) {
@@ -1035,7 +1704,7 @@ ipcMain.handle('import:pick', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
     title: t('Bring your manuscripts home'),
     properties: ['openFile', 'multiSelections'],
-    filters: [{ name: t('Manuscripts'), extensions: ['docx', 'txt', 'md'] }]
+    filters: [{ name: t('Manuscripts'), extensions: ['docx', 'txt', 'md', 'fountain', 'fdx'] }]
   });
   if (canceled || !filePaths.length) return [];
   const out = [];
@@ -1056,11 +1725,15 @@ ipcMain.handle('import:pick', async () => {
 const ERROR_LOG = () => path.join(LIBRARY_DIR, 'neo-errors.log');
 
 function logError(source, err) {
+  const line = `[${new Date().toISOString()}] [${source}] ${err && err.stack ? err.stack : String(err)}\n`;
   try {
     ensureLibrary();
-    const line = `[${new Date().toISOString()}] [${source}] ${err && err.stack ? err.stack : String(err)}\n`;
     fs.appendFileSync(ERROR_LOG(), line);
-  } catch { /* never let logging crash the app */ }
+  } catch {
+    // the library can't be written (the very case worth logging): NEO's own
+    // app folder takes the line instead
+    try { fs.appendFileSync(path.join(app.getPath('userData'), 'neo-errors.log'), line); } catch { /* never let logging crash the app */ }
+  }
 }
 
 process.on('uncaughtException', (err) => logError('main', err));
@@ -1069,6 +1742,7 @@ ipcMain.handle('log:error', (_e, msg) => logError('renderer', msg));
 
 // One zip of the whole library per day, keeping the last 14. Cheap insurance.
 async function dailyBackup() {
+  if (backupRunning) return; // one at a time (the hourly look can meet a slow one)
   try {
     ensureLibrary();
     const backupsDir = path.join(LIBRARY_DIR, 'Backups');
@@ -1076,6 +1750,7 @@ async function dailyBackup() {
     const today = new Date().toISOString().slice(0, 10);
     const target = path.join(backupsDir, `neo-backup-${today}.zip`);
     if (fs.existsSync(target)) return;
+    backupRunning = true;
 
     const JSZip = require('jszip');
     const zip = new JSZip();
@@ -1089,6 +1764,9 @@ async function dailyBackup() {
       try { names = fs.readdirSync(dir); } catch (err) { missed.push(`${rel || '.'} (${err.code || err.message})`); return; }
       for (const name of names) {
         if (rel === '' && skip.has(name)) continue;
+        // only NEO's own things: a library kept in a busy folder (Dropbox,
+        // Documents) doesn't zip everything else in there every day
+        if (rel === '' && !(name.startsWith('book-') || name.startsWith('library.json') || name === '_catalog.txt')) continue;
         if (name === '.DS_Store' || /^\..+\.icloud$/.test(name)) continue; // Finder litter; iCloud's stand-in for a file not downloaded
         const full = path.join(dir, name);
         const relPath = rel ? rel + '/' + name : name;
@@ -1106,15 +1784,23 @@ async function dailyBackup() {
       zip.file('_left-out-of-this-backup.txt', missed.join('\n') + '\n');
       logError('backup', new Error('left out of today\'s backup: ' + missed.join(', ')));
     }
-    fs.writeFileSync(target, await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
+    // written beside its real name and swapped in whole, so a backup cut
+    // short never stands in for the day's backup
+    const data = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    await JSZip.loadAsync(data); // reads back whole, or it doesn't count
+    writeFileDurable(target, data);
 
     // prune old backups
-    const backups = fs.readdirSync(backupsDir).filter((f) => f.startsWith('neo-backup-')).sort();
+    const backups = fs.readdirSync(backupsDir).filter((f) => /^neo-backup-.*\.zip$/.test(f)).sort();
     while (backups.length > 14) fs.unlinkSync(path.join(backupsDir, backups.shift()));
   } catch (err) {
     logError('backup', err);
+    try { fs.unlinkSync(path.join(LIBRARY_DIR, 'Backups', `neo-backup-${new Date().toISOString().slice(0, 10)}.zip.tmp`)); } catch { /* none */ }
+  } finally {
+    backupRunning = false;
   }
 }
+let backupRunning = false;
 
 // ---------------------------------------------------------------------------
 // Window
@@ -1144,9 +1830,13 @@ function createWindow() {
   }
   const win = new BrowserWindow({
     ...bounds,
-    minWidth: 800,
+    minWidth: 700,
     minHeight: 600,
-    titleBarStyle: 'hiddenInset',
+    // the Mac's inset traffic lights. Only there: on Linux any title bar
+    // style but the default leaves the window frameless, and on Wayland the
+    // menu bar lives in that frame (KDE Plasma showed no menu, and Alt
+    // found nothing to show)
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : {}),
     backgroundColor: roomColor(libraryPageTheme()),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -1168,17 +1858,25 @@ function createWindow() {
     if (win.isDestroyed()) return;
     win.webContents.send('menu', { type: 'fullScreen', value: full }); // the page's bottom bar too
     if (process.platform === 'darwin') return;
-    win.setMenuBarVisibility(!full && !win.isMenuBarAutoHide());
+    // full screen hides the bar until Alt brings it up (and it tucks away
+    // again after a choice), the way Windows apps do; out of full screen
+    // it's always there
+    win.setAutoHideMenuBar(full);
+    win.setMenuBarVisibility(!full);
   });
   win.on('enter-full-screen', () => fullScreenChanged(true));
   win.on('leave-full-screen', () => fullScreenChanged(false));
   win.webContents.on('did-finish-load', () => { if (win.isFullScreen()) fullScreenChanged(true); });
   const remember = () => {
+    clearTimeout(rememberTimer);
     if (win.isDestroyed() || win.isFullScreen() || win.isMinimized()) return;
-    writeSettings({ ...readSettings(), window: win.getNormalBounds() });
+    try { writeSettings({ ...readSettings(), window: win.getNormalBounds() }); } catch (err) { logError('settings', err); }
   };
-  win.on('resize', remember);
-  win.on('move', remember);
+  // a drag sends dozens of these a second: the place is written once it settles
+  let rememberTimer = null;
+  const rememberSoon = () => { clearTimeout(rememberTimer); rememberTimer = setTimeout(remember, 500); };
+  win.on('resize', rememberSoon);
+  win.on('move', rememberSoon);
   win.on('close', remember);
 
   // Right-click on text: Cut, Copy, Paste, Select All — and nothing else.
@@ -1191,6 +1889,12 @@ function createWindow() {
     if (!params.isEditable && !params.selectionText) return;
     const can = params.editFlags || {};
     const items = [];
+    // a line of a script: a page can start there
+    const line = scriptContext;
+    scriptContext = null;
+    if (params.isEditable && line) {
+      items.push({ label: line.pageBreak ? t('Remove Page Break') : t('Page Break Here'), click: () => sendToWindow({ type: 'scriptPageBreak' }) }, { type: 'separator' });
+    }
     if (params.isEditable) items.push({ role: 'cut', label: t('Cut'), enabled: !!can.canCut });
     items.push({ role: 'copy', label: t('Copy'), enabled: !!can.canCopy });
     if (params.isEditable) items.push({ role: 'paste', label: t('Paste'), enabled: !!can.canPaste });
@@ -1224,7 +1928,9 @@ const SPELL_LANGUAGES = {
   'pl': { label: 'Polski', pkg: 'dictionary-pl' },
   'pt-BR': { label: 'Português (Brasil)', pkg: 'dictionary-pt' },
   'ro': { label: 'Română', pkg: 'dictionary-ro' },
-  'ru': { label: 'Русский', pkg: 'dictionary-ru' }
+  'hu': { label: 'Magyar', pkg: 'dictionary-hu' },
+  'ru': { label: 'Русский', pkg: 'dictionary-ru' },
+  'el': { label: 'Ελληνικά', pkg: 'dictionary-el' }
 };
 
 // The dictionary work runs in a helper process (spell-worker.js), so the
@@ -1233,8 +1939,18 @@ let spellChild = null;
 let spellSeq = 0;
 const spellWaiting = new Map();
 
+let spellLoaded = null; // the language the running helper has loaded
 function spellRequest(msg) {
   return new Promise((resolve) => {
+    // the helper went away (it crashed, the system reclaimed it): start a
+    // new one and load the dictionary again, rather than calling every
+    // word right for the rest of the session
+    if (!spellChild && msg.type !== 'load' && spellLoaded) {
+      const lang = spellLoaded;
+      spellLoaded = null;
+      loadSpellDictionary(lang).then(() => spellRequest(msg)).then(resolve, () => resolve({ ok: false, error: 'no spell process' }));
+      return;
+    }
     if (!spellChild) { resolve({ ok: false, error: 'no spell process' }); return; }
     const id = ++spellSeq;
     spellWaiting.set(id, resolve);
@@ -1273,6 +1989,7 @@ async function loadSpellDictionary(code) {
   const res = await spellRequest({ type: 'load', language: known, dir: path.join(__dirname, 'node_modules', entry.pkg), custom });
   if (!res.ok) { logError('spell', new Error(res.error || 'dictionary failed to load')); return false; }
   spellLanguage = known;
+  spellLoaded = known;
   return true;
 }
 
@@ -1338,11 +2055,52 @@ function sendToWindow(msg) {
 // the Format menu's ticks: whether the caret is in a poetry paragraph, and
 // whether typewriter scrolling is on
 let poetryState = false;
+let flushState = false;
+// A script open in the window: the Format menu offers its elements (the
+// keys are the editor's own, ⌘1–⌘7), and Export its two ways out
+let scriptState = { on: false, element: null, underline: false, contd: true };
+const SCRIPT_ELEMENTS = ['heading', 'action', 'character', 'paren', 'dialogue', 'transition', 'shot'];
+// the script line a right-click is on: { pageBreak } (whether it starts a
+// page already), or null when the click wasn't on one
+let scriptContext = null;
+ipcMain.on('script:context', (e, st) => {
+  scriptContext = st && typeof st === 'object' ? { pageBreak: !!st.pageBreak } : null;
+  e.returnValue = true;
+});
+ipcMain.on('script:state', (_e, st) => {
+  st = st || {};
+  const next = { on: !!st.on, element: SCRIPT_ELEMENTS.includes(st.element) ? st.element : null, underline: !!st.underline, contd: st.contd !== false };
+  if (next.on === scriptState.on && next.element === scriptState.element && next.underline === scriptState.underline && next.contd === scriptState.contd) return;
+  scriptState = next;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
+// A paper's menus: Insert, its citation style, its heading levels
+const NeoCite = require('./paper/cite.js');
+const NeoJournals = require('./paper/journals.js');
+let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false, journal: 'preprint', editing: false, skim: false, anonymous: false, template: '' };
+ipcMain.on('paper:state', (_e, st) => {
+  st = st || {};
+  const next = {
+    on: !!st.on, style: typeof st.style === 'string' ? st.style : null, custom: typeof st.custom === 'string' ? st.custom : '',
+    heading: ['h1', 'h2', 'h3'].includes(st.heading) ? st.heading : '', numbered: st.numbered !== false, double: !!st.double, linked: !!st.linked,
+    journal: st.journal === 'template' ? 'template' : NeoJournals.get(st.journal).id, editing: !!st.editing, skim: !!st.skim, anonymous: !!st.anonymous,
+    template: typeof st.template === 'string' ? st.template.slice(0, 80) : ''
+  };
+  if (JSON.stringify(next) === JSON.stringify(paperState)) return;
+  paperState = next;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
 let typewriterState = false;
 ipcMain.on('poetry:state', (_e, on) => {
   on = !!on;
   if (on === poetryState) return;
   poetryState = on;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
+ipcMain.on('flush:state', (_e, on) => {
+  on = !!on;
+  if (on === flushState) return;
+  flushState = on;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
 ipcMain.on('typewriter:state', (_e, on) => {
@@ -1367,11 +2125,19 @@ ipcMain.on('uizoom:state', (_e, z) => {
   uiZoomState = z;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
-// View menu ticks: the focus level, the page, and Brighter Interface
-let viewState = { focus: 'off', pageTheme: 'night', uiBright: false };
+// View and Format menu ticks: the focus level, the page, Brighter Interface, and the writing
+// format the page is using (body font, drop cap style, paragraph alignment).
+let viewState = { focus: 'off', pageTheme: 'night', uiBright: false, bodyFont: '', dropCap: 'literary', align: null };
 ipcMain.on('view:state', (e, st) => {
   st = st || {};
-  const next = { focus: st.focus || 'off', pageTheme: st.pageTheme || 'night', uiBright: !!st.uiBright };
+  const next = {
+    focus: st.focus || 'off',
+    pageTheme: st.pageTheme || 'night',
+    uiBright: !!st.uiBright,
+    bodyFont: typeof st.bodyFont === 'string' ? st.bodyFont : '',
+    dropCap: typeof st.dropCap === 'string' ? st.dropCap : 'literary',
+    align: ['left', 'center', 'right', 'justify'].includes(st.align) ? st.align : null
+  };
   if (JSON.stringify(next) === JSON.stringify(viewState)) return;
   if (next.pageTheme !== viewState.pageTheme) {
     const w = BrowserWindow.fromWebContents(e.sender);
@@ -1396,10 +2162,22 @@ function buildMenu() {
   // them, so the menu names the faces bundled in fonts/ (see styles.css).
   // The Windows list stays the one the renderer already understands.
   const bodyFonts = isMac
-    ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost']
+    ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost', 'iA Writer Quattro']
     : isWin
-      ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost']
-      : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro', 'Jost'];
+      ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost', 'iA Writer Quattro']
+      : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro', 'Jost', 'iA Writer Quattro'];
+  // a book's own items: a script or a paper sets its page its own way
+  const bookOnly = !scriptState.on && !paperState.on;
+  // a paper's journals, ticked at the one it's written for
+  const journalItems = (command) => NeoJournals.JOURNALS.map((j) => ({
+    label: j.name, type: 'radio', checked: paperState.journal === j.id,
+    click: () => sendToWindow({ type: 'paper', command, value: j.id })
+  }));
+  // the general citation styles, or those a journal asks for
+  const styleItems = (journal) => NeoCite.STYLES.filter((st) => !st.journal === !journal).map((st) => ({
+    label: st.title, type: 'radio', checked: paperState.style === st.id,
+    click: () => sendToWindow({ type: 'paper', command: 'style', value: st.id })
+  }));
   const template = [
     // appMenu exists only on macOS — including it on Windows throws,
     // which is exactly what kept NEO from ever opening a window there
@@ -1422,7 +2200,23 @@ function buildMenu() {
       submenu: [
         {
           label: t('Export'),
-          submenu: [
+          submenu: paperState.on ? [
+            { label: 'PDF (.pdf)', click: () => sendToWindow({ type: 'export', format: 'pdf' }) },
+            { label: 'Word (.docx)', click: () => sendToWindow({ type: 'export', format: 'docx' }) },
+            { label: t('LaTeX for Overleaf (.zip)'), click: () => sendToWindow({ type: 'export', format: 'latex' }) },
+            { label: 'Markdown (.md)', click: () => sendToWindow({ type: 'export', format: 'md' }) },
+            { label: t('Markdown for Pandoc, with Files (.zip)'), click: () => sendToWindow({ type: 'export', format: 'pandoc' }) },
+            { label: t('Talk Outline, with Figures (.zip)'), click: () => sendToWindow({ type: 'export', format: 'talk' }) },
+            { label: t('Web Page (.html)'), click: () => sendToWindow({ type: 'export', format: 'html' }) },
+            { label: 'EPUB (.epub)', click: () => sendToWindow({ type: 'export', format: 'epub' }) },
+            { label: t('Plain Text (.txt)'), click: () => sendToWindow({ type: 'export', format: 'txt' }) },
+            { type: 'separator' },
+            { label: t('References as BibTeX (.bib)'), click: () => sendToWindow({ type: 'export', format: 'bib' }) }
+          ] : scriptState.on ? [
+            { label: 'PDF (.pdf)', click: () => sendToWindow({ type: 'export', format: 'pdf' }) },
+            { label: 'Fountain (.fountain)', click: () => sendToWindow({ type: 'export', format: 'fountain' }) },
+            { label: 'Final Draft (.fdx)', click: () => sendToWindow({ type: 'export', format: 'fdx' }) }
+          ] : [
             { label: t('Plain Text (.txt)'), click: () => sendToWindow({ type: 'export', format: 'txt' }) },
             { label: 'Markdown (.md)', click: () => sendToWindow({ type: 'export', format: 'md' }) },
             { label: t('Web Page (.html)'), click: () => sendToWindow({ type: 'export', format: 'html' }) },
@@ -1439,6 +2233,15 @@ function buildMenu() {
             }
           ]
         },
+        ...(paperState.on ? [
+          // only ⌥⌘P: AltGr arrives as Ctrl+Alt on Windows and Linux, and
+          // AltGr+P types þ or ö on some layouts
+          { label: t('Preview'), ...(isMac ? { accelerator: 'Cmd+Alt+P' } : {}), click: () => sendToWindow({ type: 'paper', command: 'preview' }) },
+          { label: t('Draft for Feedback…'), click: () => sendToWindow({ type: 'paper', command: 'feedback' }) },
+          { label: t('Preview As'), submenu: journalItems('preview') },
+          // double-blind review: the authors and what names them left out of every way out
+          { label: t('Anonymous for Review'), type: 'checkbox', checked: paperState.anonymous, click: () => sendToWindow({ type: 'paper', command: 'anonymous' }) }
+        ] : []),
         { type: 'separator' },
         {
           label: t('Email Draft to Myself'),
@@ -1465,6 +2268,12 @@ function buildMenu() {
           accelerator: 'CmdOrCtrl+Shift+I',
           click: () => sendToWindow({ type: 'import' })
         },
+        ...(paperState.on ? [
+          { label: t('Import References…'), click: () => sendToWindow({ type: 'paper', command: 'importReferences' }) },
+          paperState.linked
+            ? { label: t('Unlink Reference Library'), click: () => sendToWindow({ type: 'paper', command: 'unlinkLibrary' }) }
+            : { label: t('Link Reference Library…'), click: () => sendToWindow({ type: 'paper', command: 'linkLibrary' }) }
+        ] : []),
         { label: t('Reshelve a Book…'), click: () => sendToWindow({ type: 'reshelve' }) },
         { label: t('Library Folder…'), click: () => { chooseLibraryFolder().catch((err) => logError('library folder', err)); } },
         { type: 'separator' },
@@ -1490,8 +2299,19 @@ function buildMenu() {
         {
           label: t('Spellcheck Pass'),
           accelerator: 'CmdOrCtrl+;',
+          // shown, not registered: the window answers the ; character itself
+          // (isSpellcheckShortcut). Windows matches an accelerator by key
+          // position, so on some layouts this one and ⌘/ landed on the same
+          // key and one press did both (#282).
+          registerAccelerator: false,
           click: () => sendToWindow({ type: 'spellcheck' })
         },
+        // a paper's editing pass: the language rules, and what consistency asks
+        ...(paperState.on ? [
+          { label: t('Editing Pass'), type: 'checkbox', checked: paperState.editing, accelerator: 'CmdOrCtrl+Shift+;', click: () => sendToWindow({ type: 'paper', command: 'editing' }) },
+          { label: t('Next Thing to Look At'), accelerator: "CmdOrCtrl+'", enabled: paperState.editing, click: () => sendToWindow({ type: 'paper', command: 'editingNext', value: 1 }) },
+          { label: t('Previous Thing to Look At'), accelerator: "CmdOrCtrl+Shift+'", enabled: paperState.editing, click: () => sendToWindow({ type: 'paper', command: 'editingNext', value: -1 }) }
+        ] : []),
         {
           label: t('Spellcheck Language'),
           submenu: Object.entries(SPELL_LANGUAGES).map(([code, lang]) => ({
@@ -1507,33 +2327,76 @@ function buildMenu() {
       label: t('Format'),
       submenu: [
         {
+          visible: !scriptState.on, // a script is set in Courier Prime
           label: t('Body Font'),
           submenu: [
+            // A font the writer picked from their own computer is not in the list, and a radio
+            // group with nothing checked shows the first built-in as chosen. Show the font in use
+            // (#295).
+            ...(viewState.bodyFont && !bodyFonts.includes(viewState.bodyFont)
+              ? [{
+                  label: viewState.bodyFont,
+                  type: 'radio',
+                  checked: true,
+                  click: () => sendToWindow({ type: 'bodyFont', value: viewState.bodyFont })
+                }]
+              : []),
             ...bodyFonts.map((f) => ({
               label: f,
+              type: 'radio',
+              checked: viewState.bodyFont === f,
               click: () => sendToWindow({ type: 'bodyFont', value: f })
             })),
             { type: 'separator' },
             { label: t('Other Font…'), click: () => sendToWindow({ type: 'bodyFontPick' }) }
           ]
         },
+        ...(paperState.on ? [
+          {
+            label: t('Journal'),
+            submenu: [
+              // a venue's own LaTeX template, imported with the paper
+              ...(paperState.template ? [{ label: t('{name} (your template)', { name: paperState.template }), type: 'radio', checked: paperState.journal === 'template', click: () => sendToWindow({ type: 'paper', command: 'journal', value: 'template' }) }, { type: 'separator' }] : []),
+              ...journalItems('journal'),
+              { type: 'separator' },
+              { label: t('From a LaTeX Template…'), click: () => sendToWindow({ type: 'paper', command: 'templateImport' }) },
+              ...(paperState.template ? [{ label: t('Remove the Template'), click: () => sendToWindow({ type: 'paper', command: 'templateRemove' }) }] : [])
+            ]
+          },
+          {
+            label: t('Citation Style'),
+            submenu: [
+              ...styleItems(false),
+              { type: 'separator' },
+              ...styleItems(true),
+              ...(paperState.custom ? [{ type: 'separator' }, { label: paperState.custom, type: 'radio', checked: paperState.style === 'custom', click: () => sendToWindow({ type: 'paper', command: 'style', value: 'custom' }) }] : []),
+              { type: 'separator' },
+              { label: t('Other Style (.csl)…'), click: () => sendToWindow({ type: 'paper', command: 'styleFile' }) }
+            ]
+          },
+          { label: t('Numbered Headings'), type: 'checkbox', checked: paperState.numbered, click: () => sendToWindow({ type: 'paper', command: 'numbered' }) },
+          { label: t('Double Spacing'), type: 'checkbox', checked: paperState.double, click: () => sendToWindow({ type: 'paper', command: 'double' }) },
+          { type: 'separator' }
+        ] : []),
         {
+          visible: bookOnly,
           label: t('Drop Cap Style'),
           submenu: [
-            { label: t('Literary'), click: () => sendToWindow({ type: 'dropCap', value: 'literary' }) },
-            { label: t('Fantasy'), click: () => sendToWindow({ type: 'dropCap', value: 'fantasy' }) },
-            { label: t('Sci-Fi'), click: () => sendToWindow({ type: 'dropCap', value: 'scifi' }) },
+            { label: t('Literary'), type: 'radio', checked: viewState.dropCap === 'literary', click: () => sendToWindow({ type: 'dropCap', value: 'literary' }) },
+            { label: t('Fantasy'), type: 'radio', checked: viewState.dropCap === 'fantasy', click: () => sendToWindow({ type: 'dropCap', value: 'fantasy' }) },
+            { label: t('Sci-Fi'), type: 'radio', checked: viewState.dropCap === 'scifi', click: () => sendToWindow({ type: 'dropCap', value: 'scifi' }) },
             { type: 'separator' },
-            { label: t('Off'), click: () => sendToWindow({ type: 'dropCap', value: 'none' }) }
+            { label: t('Off'), type: 'radio', checked: viewState.dropCap === 'none', click: () => sendToWindow({ type: 'dropCap', value: 'none' }) }
           ]
         },
         {
+          visible: !scriptState.on, // a script's elements are placed where they print
           label: t('Align Paragraph'),
           submenu: [
-            { label: t('Left'), accelerator: 'CmdOrCtrl+Shift+L', click: () => sendToWindow({ type: 'align', value: 'left' }) },
-            { label: t('Center'), accelerator: 'CmdOrCtrl+Shift+C', click: () => sendToWindow({ type: 'align', value: 'center' }) },
-            { label: t('Right'), accelerator: 'CmdOrCtrl+Shift+R', click: () => sendToWindow({ type: 'align', value: 'right' }) },
-            { label: t('Justify'), accelerator: 'CmdOrCtrl+Shift+J', click: () => sendToWindow({ type: 'align', value: 'justify' }) }
+            { label: t('Left'), accelerator: 'CmdOrCtrl+Shift+L', type: 'radio', checked: viewState.align === 'left', click: () => sendToWindow({ type: 'align', value: 'left' }) },
+            { label: t('Center'), accelerator: 'CmdOrCtrl+Shift+C', type: 'radio', checked: viewState.align === 'center', click: () => sendToWindow({ type: 'align', value: 'center' }) },
+            { label: t('Right'), accelerator: 'CmdOrCtrl+Shift+R', type: 'radio', checked: viewState.align === 'right', click: () => sendToWindow({ type: 'align', value: 'right' }) },
+            { label: t('Justify'), accelerator: 'CmdOrCtrl+Shift+J', type: 'radio', checked: viewState.align === 'justify', click: () => sendToWindow({ type: 'align', value: 'justify' }) }
           ]
         },
         { type: 'separator' },
@@ -1548,11 +2411,47 @@ function buildMenu() {
           checked: typewriterState,
           click: () => sendToWindow({ type: 'typewriter' })
         },
+        // a paper's paragraph check: each paragraph's first and last sentence, the rest dimmed
+        ...(paperState.on ? [{ label: t('First and Last Sentences'), type: 'checkbox', checked: paperState.skim, click: () => sendToWindow({ type: 'paper', command: 'skim' }) }] : []),
         { type: 'separator' },
-        // ticks when the caret sits in a poetry paragraph; ⇧Enter is the
-        // editor's own key, so no accelerator here
+        // tick when the caret sits in one; the keys are the editor's own
+        // (they split or continue a paragraph, which a menu item can't), so
+        // they're named here without an accelerator
+        // a script's elements stand where a book's paragraph kinds do
+        ...(scriptState.on ? [
+          [t('Scene Heading'), 'heading'], [t('Action'), 'action'], [t('Character'), 'character'], [t('Parenthetical'), 'paren'],
+          [t('Dialogue'), 'dialogue'], [t('Transition'), 'transition'], [t('Shot'), 'shot']
+        ].map(([label, value], i) => ({
+          label: label + '\t' + (isMac ? '⌘' : 'Ctrl+') + (i + 1),
+          type: 'radio',
+          checked: scriptState.element === value,
+          click: () => sendToWindow({ type: 'scriptElement', value })
+        })) : []),
+        ...(paperState.on ? [
+          [t('Section Heading'), 'h1', '1'], [t('Subsection Heading'), 'h2', '2'], [t('Subsubsection Heading'), 'h3', '3'], [t('Body Text'), '', '0']
+        ].map(([label, value, key]) => ({
+          // the window hears Ctrl+Alt+0–3 itself, and tells it from AltGr
+          // (which arrives as Ctrl+Alt and types }, ² and ³ on many layouts);
+          // a registered accelerator can't, so it's registered on the Mac only
+          label, accelerator: 'CmdOrCtrl+Alt+' + key, registerAccelerator: isMac, type: 'radio', checked: paperState.heading === value,
+          click: () => sendToWindow({ type: 'paper', command: 'heading', value })
+        })) : []),
+        // the script's own style, kept with that script
+        ...(scriptState.on ? [
+          { type: 'separator' },
+          { label: t('Underline Scene Headings'), type: 'checkbox', checked: scriptState.underline, click: () => sendToWindow({ type: 'scriptStyle', value: 'underline' }) },
+          { label: t('(CONT\'D) for a Returning Speaker'), type: 'checkbox', checked: scriptState.contd, click: () => sendToWindow({ type: 'scriptStyle', value: 'contd' }) }
+        ] : []),
         {
-          label: t('Poetry Paragraph') + '\t⇧Enter',
+          visible: bookOnly,
+          label: t('Flush Paragraph') + '\t' + (isMac ? '⇧Enter' : 'Shift+Enter'),
+          type: 'checkbox',
+          checked: flushState,
+          click: () => sendToWindow({ type: 'flush' })
+        },
+        {
+          visible: bookOnly,
+          label: t('Poetry Paragraph') + '\t' + (isMac ? '⇧⌘Enter' : 'Ctrl+Shift+Enter'),
           type: 'checkbox',
           checked: poetryState,
           click: () => sendToWindow({ type: 'poetry' })
@@ -1574,8 +2473,10 @@ function buildMenu() {
         {
           label: t('Keyboard Shortcuts…'),
           accelerator: 'CmdOrCtrl+/',
+          registerAccelerator: false, // the window answers / and ? itself (isHelpShortcut)
           click: () => sendToWindow({ type: 'help' })
         },
+        { label: t('Command Palette…'), accelerator: 'CmdOrCtrl+Shift+P', click: () => sendToWindow({ type: 'palette' }) },
         { type: 'separator' },
         {
           label: t('Full Screen'),
@@ -1639,6 +2540,17 @@ function buildMenu() {
         }
       ]
     },
+    ...(paperState.on ? [{
+      label: t('Insert'),
+      submenu: [
+        { label: t('Citation…'), accelerator: 'CmdOrCtrl+Shift+K', click: () => sendToWindow({ type: 'paper', command: 'cite' }) },
+        { label: t('Cross-Reference…'), click: () => sendToWindow({ type: 'paper', command: 'xref' }) },
+        { type: 'separator' },
+        { label: t('Equation'), accelerator: 'CmdOrCtrl+Shift+M', click: () => sendToWindow({ type: 'paper', command: 'equation' }) },
+        { label: t('Figure…'), click: () => sendToWindow({ type: 'paper', command: 'figure' }) },
+        { label: t('Table'), click: () => sendToWindow({ type: 'paper', command: 'table' }) }
+      ]
+    }] : []),
     {
       role: 'windowMenu',
       label: t('Window'),
@@ -2014,7 +2926,7 @@ app.whenReady().then(() => {
       LIBRARY_DIR = path.join(app.getPath('documents'), 'NEO Library');
       // …unless the writer chose their own folder (File → Library Folder…)
       const chosen = readSettings().libraryDir;
-      if (chosen && fs.existsSync(chosen) && fs.statSync(chosen).isDirectory()) LIBRARY_DIR = chosen;
+      if (chosen) LIBRARY_DIR = awaitChosenLibrary(chosen);
       LIBRARY_FILE = path.join(LIBRARY_DIR, 'library.json');
     } catch (err) {
       logError('paths', err);
@@ -2042,11 +2954,16 @@ app.whenReady().then(() => {
     }
 
     try { initLanguage(); } catch (err) { logError('language', err); }
+    try { checkLibraryWritable(); } catch (err) { logError('library check', err); }
     try { ensureLibrary(); } catch (err) { logError('library', err); }
     createWindow();
+    try { announceLibraryFallback(); } catch (err) { logError('library notice', err); }
     try { initSpell(); } catch (err) { logError('spell', err); }
     try { buildMenu(); } catch (err) { logError('menu', err); }
     try { dailyBackup(); } catch (err) { logError('backup', err); }
+    // NEO left open for days still makes each day's backup (and retries one
+    // that failed); an existing day's zip makes this a no-op
+    setInterval(() => { dailyBackup().catch(() => {}); }, 60 * 60 * 1000).unref?.();
     try { checkForUpdates(); } catch (err) { logError('updater', err); }
   } catch (err) {
     // catastrophic: tell the human instead of dying in silence

@@ -12,7 +12,7 @@ contextBridge.exposeInMainWorld('neo', {
 
   readChapter: (bookId, chId) => ipcRenderer.invoke('chapter:read', bookId, chId),
   chapterStamps: (bookId) => ipcRenderer.invoke('chapter:stamps', bookId),
-  writeChapter: (bookId, chId, html) => ipcRenderer.invoke('chapter:write', bookId, chId, html),
+  writeChapter: (bookId, chId, html, expected) => ipcRenderer.invoke('chapter:write', bookId, chId, html, expected),
   deleteChapter: (bookId, chId) => ipcRenderer.invoke('chapter:delete', bookId, chId),
 
   readAux: (bookId, name) => ipcRenderer.invoke('aux:read', bookId, name),
@@ -25,6 +25,15 @@ contextBridge.exposeInMainWorld('neo', {
   emailDraft: (payload) => ipcRenderer.invoke('email:draft', payload),
   logError: (msg) => ipcRenderer.invoke('log:error', msg),
   importPick: () => ipcRenderer.invoke('import:pick'),
+  paperRead: (bookId, name) => ipcRenderer.invoke('paper:read', bookId, name),
+  paperWrite: (bookId, name, base64) => ipcRenderer.invoke('paper:write', bookId, name, base64),
+  paperAsset: (name) => ipcRenderer.invoke('paper:asset', name),
+  paperLookup: (doi) => ipcRenderer.invoke('paper:lookup', doi),
+  paperZotero: (q) => ipcRenderer.invoke('paper:zotero', q),
+  paperLink: (bookId) => ipcRenderer.invoke('paper:link', bookId),
+  paperLinked: (bookId, since) => ipcRenderer.invoke('paper:linked', bookId, since),
+  paperUnlink: (bookId) => ipcRenderer.invoke('paper:unlink', bookId),
+  paperPreview: (html, title, opts) => ipcRenderer.invoke('paper:preview', html, title, opts),
   libraryPath: () => ipcRenderer.invoke('library:path'),
   pickCover: () => ipcRenderer.invoke('cover:pick'),
   setCover: (bookId, srcPath) => ipcRenderer.invoke('cover:set', bookId, srcPath),
@@ -47,11 +56,23 @@ contextBridge.exposeInMainWorld('neo', {
   openRelease: () => ipcRenderer.invoke('update:openRelease'),
 
   poetryState: (on) => ipcRenderer.send('poetry:state', on),
+  flushState: (on) => ipcRenderer.send('flush:state', on),
+  scriptState: (st) => ipcRenderer.send('script:state', st),
+  paperState: (st) => ipcRenderer.send('paper:state', st),
+  commands: () => ipcRenderer.invoke('commands:list'),
+  runCommand: (id) => ipcRenderer.invoke('commands:run', id),
+  paperTemplateImport: (bookId) => ipcRenderer.invoke('paper:template-import', bookId),
+  paperTemplate: (bookId) => ipcRenderer.invoke('paper:template', bookId),
+  paperTemplateRemove: (bookId) => ipcRenderer.invoke('paper:template-remove', bookId),
+  // sent (and waited for) as a script line is right-clicked, so the menu
+  // that opens next can offer Page Break Here
+  scriptContext: (st) => ipcRenderer.sendSync('script:context', st),
   typewriterState: (st) => ipcRenderer.send('typewriter:state', st),
   vimState: (on) => ipcRenderer.send('vim:state', on),
   uiZoomState: (z) => ipcRenderer.send('uizoom:state', z),
   // interface language, fetched once before the page's scripts run
   i18n: ipcRenderer.sendSync('i18n:get'),
+  paper: ipcRenderer.sendSync('paper:get'), // 'Letter' or 'A4', from the computer's region
   reloadForLanguage: () => ipcRenderer.invoke('i18n:reload'),
 
   writingStyleState: (st) => ipcRenderer.send('style:state', st),
