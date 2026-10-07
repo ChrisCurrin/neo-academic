@@ -3561,15 +3561,16 @@ function figureKey(e, body, chId) {
 // chapter's do, and the writer is told
 async function paperToDarlings(text, what) {
   if (!text.trim()) return;
-  darlings.push({
-    id: 'd-' + Date.now().toString(36),
+  // newest first, written the way every Darling is (kept, retried, merged with another device's)
+  darlings.unshift({
+    id: 'd-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     html: text.split('\n').map((l) => `<p>${escHtml(l)}</p>`).join(''),
     text: text.slice(0, 2000),
     chapterId: null,
     chapterLabel: what,
     date: new Date().toISOString()
   });
-  await window.neo.writeJSON(book.id, 'darlings', darlings);
+  await writeSidecar(book.id, 'darlings', darlings);
   toast(t('{what} removed — its words are in Darlings, or {key} to undo', { what, key: KZ }));
 }
 const cellsText = (cells) => cells.map((c) => c.textContent.trim()).filter(Boolean);

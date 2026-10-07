@@ -565,7 +565,7 @@ test('figures, tables, citations and sections from the keyboard', async () => {
   await tick(300);
   assert.equal(await js(`document.querySelectorAll('.chapter-body figure.tbl').length`), 1);
   assert.equal(await js(`darlings.length`), kept + 1);
-  assert.match(await js(`darlings[darlings.length - 1].text`), /a\tb\nc\td/);
+  assert.match(await js(`darlings[0].text`), /a\tb\nc\td/);
   await js(`(() => {
     const kb = document.querySelector('#kb');
     while (kb.nextElementSibling) kb.nextElementSibling.remove();
