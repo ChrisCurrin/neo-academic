@@ -35,7 +35,7 @@ A book whose `book.json` says `"format": "paper"` is an academic paper. Right-cl
 - `book.paper.journal` picks the journal (default `preprint`); choosing one also sets the citation style. File → Preview prints the paper's HTML, in the journal's CSS, through `paper:preview` into a PDF window; Preview As does the same in another journal's look and style, rendering the citations aside (`paperRenderCites`) so the page is untouched. The LaTeX export uses the journal's class; every journal's compiles (checked with tectonic).
 - The engine's `insertHTML` puts an uneditable span outside its paragraph at a line's end, so `placeAtom` inserts them by hand, snapshots the structure first and sends ⌘Z to the structural undo. `stripJunkSpans` unwraps every span but NEO's own (`KEPT_SPANS` in `app.js`: placeholders, `.cite`, `.xref`, `.math`, a panel's `.subcap`); add a new span class there.
 - References are `references.json` (CSL JSON, the citation key as `id`). Figures are `figure-<id>.<ext>` and a writer's own style is `style.csl`, all in the book folder, read and written through `paper:read` and `paper:write`, which accept only those names. A linked reference file's path lives in `userData/paper-links.json`, per machine (a synced path could name any file on another device); `paper:linked` reads only the path stored there. `paper:lookup` sends a DOI to doi.org, only when the writer asks; Pocket asks Crossref (DataCite for arXiv DOIs) directly. `paper:zotero` asks Zotero on 127.0.0.1 only (Better BibTeX's JSON-RPC `item.search`, else Zotero 7's local API) and backs off for a minute when nothing answers.
-- MathJax (`mathjax-full`) and citeproc-js load the first time a paper opens. citeproc is CPAL/AGPL; see `licenses/citeproc`. Styles and locales are CC BY-SA (`licenses/csl`).
+- MathJax (`mathjax-full`) and citeproc-js load the first time a paper opens. MathJax runs without its `html`, `require` and `autoload` extensions (no `\href`, `\class`, `\style`), and `texSvg` strips any link from what it draws; only `es5/tex-svg-full.js` is packaged (`build.files`). citeproc is CPAL/AGPL; see `licenses/citeproc`. Styles and locales are CC BY-SA (`licenses/csl`).
 - `scripts/paper-*.test.js` test the plain modules (every Word and EPUB part goes through `xmllint` where it's installed); `npm run test:paper` drives a paper end to end in Electron and takes every way out, reading the .docx back with `textutil` and compiling the LaTeX with `tectonic` where they're installed (`NEO_SHOTS=<folder>` saves screenshots and the exports). The EPUB passes W3C EPUBCheck, and Microsoft Word opens the .docx with its equations as Word equations.
 
 ## Where the code is
@@ -97,7 +97,7 @@ index.html + app.js  →  preload.js (window.neo)  →  main.js  →  NEO Librar
                                                spell-worker.js
 ```
 
-The window is created with `contextIsolation: true` and `nodeIntegration: false`. New renderer capabilities are added in three places: an `ipcMain.handle` in `main.js`, a method on `window.neo` in `preload.js`, and the call site in `app.js`.
+The window is created with `contextIsolation: true` and `nodeIntegration: false`, and never navigates away from `index.html` or opens a window (`will-navigate`, `setWindowOpenHandler` in `createWindow`): `window.neo` would go with any page it showed. Open a link in the browser with `shell.openExternal`. New renderer capabilities are added in three places: an `ipcMain.handle` in `main.js`, a method on `window.neo` in `preload.js`, and the call site in `app.js`.
 
 ## Files on disk
 

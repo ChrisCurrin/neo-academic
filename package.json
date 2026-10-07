@@ -131,7 +131,9 @@
       "!dictionaries/**",
       "!locales/_template.json",
       "!node_modules/koffi/build/koffi/{freebsd,linux,musl,openbsd,win32}_*/**",
-      "!node_modules/koffi/{src,vendor,doc}/**"
+      "!node_modules/koffi/{src,vendor,doc}/**",
+      "!node_modules/mathjax-full/{components,ts,js,es5}/**",
+      "node_modules/mathjax-full/es5/tex-svg-full.js"
     ],
     "toolsets": {
       "appimage": "1.0.3"

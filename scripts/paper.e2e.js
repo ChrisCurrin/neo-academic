@@ -158,6 +158,11 @@ test('the empty abstract shows its six moves; writing it leaves only their names
 test('MathJax and citeproc load', async () => {
   for (let i = 0; i < 60 && !(await js('!!(window.MathJax && window.MathJax.tex2svg && window.CSL)')); i++) await tick(200);
   assert.equal(await js('!!(window.MathJax && window.MathJax.tex2svg)'), true);
+  // maths is drawn, never a link or a styled element: no \\href, \\class, \\style, \\require
+  for (const tex of ['\\href{https://example.com/x}{V}', '\\class{x}{V}', '\\style{color:red}{V}', '\\require{html}\\href{https://example.com}{V}']) {
+    assert.equal(await js(`(() => { const s = texSvg(${JSON.stringify(tex)}, false); return s ? s.querySelectorAll('a, [style*="red"]').length : 0; })()`), 0, tex);
+  }
+  assert.ok(await js(`!!texSvg(${JSON.stringify('\\frac{a}{b}')}, false)`), 'and ordinary maths still draws');
   assert.equal(await js('!!window.CSL'), true);
   assert.equal(await js('typeof window.module'), 'undefined', 'citeproc leaves no module behind');
 });
@@ -590,6 +595,27 @@ test('/ on a line of its own: a figure, a table, a heading, by a word or a LaTeX
   await key('Enter');
   await type('/');
   assert.ok((await rows()).includes('Figure…'), 'everything, before a word');
+  // a list longer than the room scrolls, and the row the arrows reach stays in view
+  const win = BrowserWindow.fromWebContents(wc);
+  const [w, h] = win.getSize();
+  win.setSize(w, 420);
+  await tick(300);
+  await js(`pickerUpdate()`);
+  const inView = () => js(`(() => {
+    const el = document.querySelector('.paper-picker');
+    const a = el.querySelector('.pp-row.active').getBoundingClientRect();
+    const b = el.getBoundingClientRect();
+    return { scrolls: el.scrollHeight > el.clientHeight, inside: a.top >= b.top - 1 && a.bottom <= b.bottom + 1 };
+  })()`);
+  assert.equal((await inView()).scrolls, true, 'more rows than room');
+  for (let i = 0; i < 9; i++) {
+    await key('Down');
+    assert.equal((await inView()).inside, true, 'the active row, down ' + (i + 1));
+  }
+  await key('Up');
+  assert.equal((await inView()).inside, true);
+  win.setSize(w, h);
+  await tick(300);
   await type('ref');
   assert.equal((await rows())[0], 'Cross-Reference…', 'LaTeX’s \\ref');
   await key('Escape');

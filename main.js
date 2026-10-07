@@ -1849,6 +1849,13 @@ function createWindow() {
     }
   });
   win.loadFile('index.html');
+  // The window shows NEO's page and nothing else. window.neo (the whole
+  // library, and the disk) comes with whatever page it shows, so no link
+  // (in a chapter from another device, a pasted reference, a file dropped
+  // on it) may take it anywhere, and nothing in it opens a window. Links
+  // meant for the browser go through shell.openExternal.
+  win.webContents.on('will-navigate', (e, url) => { if (url !== win.webContents.getURL()) e.preventDefault(); });
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   // The menu bar follows the real full-screen state, whoever changed it.
   // Electron only puts the bar back after a full screen it entered itself,
   // so once a window manager's own full-screen key had been used (Sway, i3),

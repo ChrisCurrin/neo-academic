@@ -86,7 +86,9 @@ function paperLoad() {
   if (paper.ready) return paper.ready;
   window.MathJax = {
     startup: { typeset: false },
-    tex: { packages: { '[+]': ['ams', 'newcommand', 'boldsymbol', 'mathtools', 'physics', 'cancel', 'color', 'braket'] } },
+    // no \href, \class, \style or \cssId (MathJax's html extension), and
+    // no \require or autoload to bring it back: maths is drawn, never a link
+    tex: { packages: { '[+]': ['ams', 'newcommand', 'boldsymbol', 'mathtools', 'physics', 'cancel', 'color', 'braket'], '[-]': ['html', 'require', 'autoload'] } },
     svg: { fontCache: 'none' },
     options: { enableMenu: false }
   };
@@ -1192,12 +1194,15 @@ function mathCaretIn() {
   return sel && sel.anchorNode && mathEditing.node.contains(sel.anchorNode) ? mathEditing.node : null;
 }
 
-// TeX → an <svg>, or null when the TeX doesn't parse
+// TeX → an <svg>, or null when the TeX doesn't parse. Never a link, even
+// if one got past the configuration: a click on maths opens nothing
 function texSvg(tex, display) {
   try {
     const out = window.MathJax.tex2svg(tex, { display });
     const svg = out.querySelector('svg');
     if (!svg || out.querySelector('[data-mjx-error]')) return null;
+    for (const a of svg.querySelectorAll('a')) a.replaceWith(...a.childNodes);
+    for (const r of svg.querySelectorAll('rect[data-hitbox]')) r.remove();
     return svg;
   } catch {
     return null;
@@ -2056,6 +2061,7 @@ function pickerUpdate() {
 }
 function pickerDraw(q) {
   const el = picker.el;
+  const scrolled = el.scrollTop; // drawn again, the list stays where it was scrolled to
   el.innerHTML = '';
   picker.rows.forEach((row, i) => {
     const item = document.createElement('div');
@@ -2090,15 +2096,24 @@ function pickerDraw(q) {
     if (row.kind !== 'hint') item.addEventListener('click', () => { picker.idx = i; pickerChoose(); });
     el.appendChild(item);
   });
-  // under the @, kept on screen
+  // under the @ (or over it, where there's more room), never taller than
+  // that room and never over the line being typed: a long list scrolls,
+  // and the row the arrows reach is always in view
   const r = document.createRange();
   r.setStart(picker.at.node, picker.at.offset);
   r.setEnd(picker.at.node, picker.at.offset + 1);
   const box = r.getBoundingClientRect();
   const w = el.offsetWidth;
   el.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, box.left - 12)) + 'px';
-  const below = box.bottom + 6;
-  el.style.top = (below + el.offsetHeight > window.innerHeight - 8 ? Math.max(8, box.top - el.offsetHeight - 6) : below) + 'px';
+  el.style.maxHeight = '';
+  const below = window.innerHeight - box.bottom - 14;
+  const above = box.top - 14;
+  const up = el.offsetHeight > below && above > below;
+  el.style.maxHeight = Math.max(80, Math.min(el.offsetHeight, up ? above : below)) + 'px';
+  el.style.top = (up ? box.top - 6 - el.offsetHeight : box.bottom + 6) + 'px';
+  el.scrollTop = scrolled;
+  const active = el.children[picker.idx];
+  if (active) active.scrollIntoView({ block: 'nearest' });
 }
 function pickerKey(e) {
   if (!picker.el) return false;
