@@ -870,6 +870,100 @@ ipcMain.handle('paper:link', async (_e, bookId) => {
   writeFileDurable(LINKS_FILE(), JSON.stringify(links, null, 2));
   return { path: file, text: fs.readFileSync(file, 'utf8'), mtime: fs.statSync(file).mtimeMs };
 });
+// A venue's LaTeX template (a NeurIPS or ICML zip, or its loose .tex and
+// .sty files), kept beside the paper as template.zip: plain files, the
+// writer's own copy, never bundled with NEO. Read back as its files, the
+// text ones as text, for the LaTeX export to fill.
+const TEMPLATE_TEXT = /\.(?:tex|sty|cls|bst|cfg|clo|def|bbx|cbx|bib|txt|md)$/i;
+const TEMPLATE_LIMIT = 30 * 1024 * 1024;
+// one path inside the template, made safe: forward slashes, no absolute
+// path or .., none of a Mac's zip litter
+function templatePath(name) {
+  const parts = String(name).replace(/\\/g, '/').split('/').filter((p) => p && p !== '.');
+  if (!parts.length || parts.some((p) => p === '..' || p.includes('\0')) || /^[a-z]:$/i.test(parts[0])) return null;
+  if (parts[0] === '__MACOSX' || parts[parts.length - 1] === '.DS_Store' || parts[parts.length - 1].startsWith('._')) return null;
+  return parts.join('/');
+}
+async function templateFiles(zip) {
+  const files = [];
+  let total = 0;
+  for (const entry of Object.values(zip.files)) {
+    if (entry.dir) continue;
+    const name = templatePath(entry.name);
+    if (!name) continue;
+    const data = await entry.async('nodebuffer');
+    total += data.length;
+    if (total > TEMPLATE_LIMIT || files.length >= 500) throw new Error(t('That template is too large to keep with the paper'));
+    files.push(TEMPLATE_TEXT.test(name) ? { path: name, text: data.toString('utf8') } : { path: name, base64: data.toString('base64') });
+  }
+  // a zip that holds one folder: its contents, as the template
+  const tops = new Set(files.map((f) => f.path.split('/')[0]));
+  if (tops.size === 1 && files.every((f) => f.path.includes('/'))) for (const f of files) f.path = f.path.slice(f.path.indexOf('/') + 1);
+  return files;
+}
+const templateFile = (bookId) => path.join(bookDir(bookId), 'template.zip');
+ipcMain.handle('paper:template-import', async (_e, bookId) => {
+  bookId = libName(bookId);
+  const JSZip = require('jszip');
+  const { canceled, filePaths } = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow(), {
+    title: t('A LaTeX template'),
+    message: t('The venue’s template: its .zip, or its .tex, .sty, .cls and .bst files'),
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: t('LaTeX template'), extensions: ['zip', 'tex', 'sty', 'cls', 'bst', 'cfg', 'clo', 'def', 'bib'] }]
+  });
+  if (canceled || !filePaths.length) return null;
+  let files;
+  if (filePaths.length === 1 && /\.zip$/i.test(filePaths[0])) {
+    if (fs.statSync(filePaths[0]).size > TEMPLATE_LIMIT) throw new Error(t('That template is too large to keep with the paper'));
+    files = await templateFiles(await JSZip.loadAsync(fs.readFileSync(filePaths[0])));
+  } else {
+    const zip = new JSZip();
+    for (const fp of filePaths.filter((f) => !/\.zip$/i.test(f))) zip.file(path.basename(fp), fs.readFileSync(fp));
+    files = await templateFiles(zip);
+  }
+  // kept as the cleaned files, zipped again: what NEO reads is what's stored
+  const out = new JSZip();
+  for (const f of files) out.file(f.path, f.text !== undefined ? f.text : Buffer.from(f.base64, 'base64'));
+  writeFileDurable(templateFile(bookId), await out.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
+  return { files, from: path.basename(filePaths[0]) };
+});
+ipcMain.handle('paper:template', async (_e, bookId) => {
+  const file = templateFile(libName(bookId));
+  if (!fs.existsSync(file)) return null;
+  const JSZip = require('jszip');
+  return { files: await templateFiles(await JSZip.loadAsync(fs.readFileSync(file))) };
+});
+// The command palette (View → Command Palette…, ⌘⇧P): every command the
+// menus offer right now, read from the menu itself so the two never differ,
+// and run by clicking that same item (its tick, its radio, its role)
+function menuCommands() {
+  const out = [];
+  const walk = (items, where) => items.forEach((it, i) => {
+    if (it.type === 'separator' || it.visible === false) return;
+    const label = String(it.label || '').replace(/&&/g, '&');
+    if (it.submenu) { walk(it.submenu.items, [...where, label]); return; }
+    if (!it.enabled || !label) return;
+    out.push({ item: it, id: [...where, label, i].join('\u0000'), label, path: where, accel: it.accelerator || '', checked: it.type === 'checkbox' || it.type === 'radio' ? !!it.checked : null });
+  });
+  const menu = Menu.getApplicationMenu();
+  if (menu) walk(menu.items, []);
+  return out;
+}
+ipcMain.handle('commands:list', () => menuCommands().map(({ item, ...c }) => c));
+ipcMain.handle('commands:run', (e, id) => {
+  const found = menuCommands().find((c) => c.id === id);
+  if (!found) return false;
+  found.item.click(undefined, BrowserWindow.fromWebContents(e.sender), e.sender);
+  return true;
+});
+// to the system trash, as a book is: the writer's file, never deleted outright
+ipcMain.handle('paper:template-remove', async (_e, bookId) => {
+  const file = templateFile(libName(bookId));
+  if (!fs.existsSync(file)) return true;
+  const { shell } = require('electron');
+  await shell.trashItem(file);
+  return true;
+});
 ipcMain.handle('paper:unlink', (_e, bookId) => {
   const links = readLinks();
   delete links[libName(bookId)];
@@ -1983,13 +2077,14 @@ ipcMain.on('script:state', (_e, st) => {
 // A paper's menus: Insert, its citation style, its heading levels
 const NeoCite = require('./paper/cite.js');
 const NeoJournals = require('./paper/journals.js');
-let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false, journal: 'preprint', editing: false, skim: false, anonymous: false };
+let paperState = { on: false, style: null, custom: '', heading: '', numbered: true, double: false, linked: false, journal: 'preprint', editing: false, skim: false, anonymous: false, template: '' };
 ipcMain.on('paper:state', (_e, st) => {
   st = st || {};
   const next = {
     on: !!st.on, style: typeof st.style === 'string' ? st.style : null, custom: typeof st.custom === 'string' ? st.custom : '',
     heading: ['h1', 'h2', 'h3'].includes(st.heading) ? st.heading : '', numbered: st.numbered !== false, double: !!st.double, linked: !!st.linked,
-    journal: NeoJournals.get(st.journal).id, editing: !!st.editing, skim: !!st.skim, anonymous: !!st.anonymous
+    journal: st.journal === 'template' ? 'template' : NeoJournals.get(st.journal).id, editing: !!st.editing, skim: !!st.skim, anonymous: !!st.anonymous,
+    template: typeof st.template === 'string' ? st.template.slice(0, 80) : ''
   };
   if (JSON.stringify(next) === JSON.stringify(paperState)) return;
   paperState = next;
@@ -2257,7 +2352,17 @@ function buildMenu() {
           ]
         },
         ...(paperState.on ? [
-          { label: t('Journal'), submenu: journalItems('journal') },
+          {
+            label: t('Journal'),
+            submenu: [
+              // a venue's own LaTeX template, imported with the paper
+              ...(paperState.template ? [{ label: t('{name} (your template)', { name: paperState.template }), type: 'radio', checked: paperState.journal === 'template', click: () => sendToWindow({ type: 'paper', command: 'journal', value: 'template' }) }, { type: 'separator' }] : []),
+              ...journalItems('journal'),
+              { type: 'separator' },
+              { label: t('From a LaTeX Template…'), click: () => sendToWindow({ type: 'paper', command: 'templateImport' }) },
+              ...(paperState.template ? [{ label: t('Remove the Template'), click: () => sendToWindow({ type: 'paper', command: 'templateRemove' }) }] : [])
+            ]
+          },
           {
             label: t('Citation Style'),
             submenu: [
@@ -2371,6 +2476,7 @@ function buildMenu() {
           registerAccelerator: false, // the window answers / and ? itself (isHelpShortcut)
           click: () => sendToWindow({ type: 'help' })
         },
+        { label: t('Command Palette…'), accelerator: 'CmdOrCtrl+Shift+P', click: () => sendToWindow({ type: 'palette' }) },
         { type: 'separator' },
         {
           label: t('Full Screen'),

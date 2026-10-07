@@ -485,3 +485,81 @@ test('talk: Pandoc makes PowerPoint and Beamer slides of it', { skip: !pandocBin
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// a venue's template, imported with the paper: its files, its main .tex filled
+const NT = require('../paper/template.js');
+const { readdirSync, readFileSync } = require('node:fs');
+const TEMPLATES = require('node:path').join(__dirname, 'fixtures', 'templates');
+const templateFiles = (kind, folder = '') => readdirSync(`${TEMPLATES}/${kind}`).sort()
+  .map((n) => ({ path: folder + n, text: readFileSync(`${TEMPLATES}/${kind}/${n}`, 'utf8') }));
+const withTemplate = (m, kind, extra = [], folder = '') => {
+  const files = [...templateFiles(kind, folder), ...extra];
+  return { ...m, template: { info: NT.read(files), files } };
+};
+
+test('LaTeX in a venue\'s template: its files, the filled main .tex, the references and figures; nothing escapes', () => {
+  const m = withTemplate(model(), 'iclr', [
+    { path: 'T/logo.png', base64: 'AAAA' },
+    { path: 'T/../evil.sty', text: 'x' },
+    { path: '/abs.sty', text: 'x' },
+    { path: 'T/references.bib', text: '@misc{theirs}' },
+    { path: 'T/figures/figure-cd34.png', base64: 'BBBB' },
+    { path: 'T/README.txt', text: 'theirs' }
+  ], 'T/');
+  const files = X.latex(m);
+  assert.deepEqual(files.map((f) => f.path), ['iclr2025_conference.bib', 'iclr2025_conference.sty', 'math_commands.tex', 'logo.png',
+    'iclr2025_conference.tex', 'references.bib', 'README.txt', 'figures/figure-cd34.png']);
+  assert.ok(!files.some((f) => f.path === 'paper.tex'));
+  assert.deepEqual(files.find((f) => f.path === 'logo.png'), { path: 'logo.png', content: 'AAAA', base64: true });
+  assert.equal(files.find((f) => f.path === 'references.bib').content, model().bibtex, 'NEO\'s references, not the template\'s');
+  assert.equal(files.find((f) => f.path === 'figures/figure-cd34.png').content, 'AAAA');
+  assert.equal(files.find((f) => f.path === 'math_commands.tex').content, templateFiles('iclr').find((f) => f.path === 'math_commands.tex').text);
+  const tex = files.find((f) => f.path === 'iclr2025_conference.tex').content;
+  assert.match(tex, /^% Filled by NEO from ICLR 2025's template/);
+  assert.match(tex, /\\title\{Balance \\& control in 100\\% of cortex\}/);
+  assert.match(tex, /\\texttt\{ada@example\.org\}\n {2}\\And\n {2}Charles Babbage \\\\\n {2}University of Cambridge/);
+  assert.match(tex, /\\iclrfinalcopy % the named version/);
+  assert.match(tex, /\\begin\{abstract\}\nWe ask \\\(x_1\\\)\.\n\\end\{abstract\}\n\n\\section\{Introduction\}\\label\{sec:ab12\}/);
+  assert.match(tex, /Costs \\\$5 \\& rise\\_\\emph\{fast\} \\citep\[p\.~4\]\{smith2020\}/, 'the same body as NEO\'s own preamble takes');
+  assert.match(tex, /\\@ifpackageloaded\{graphicx\}\{\}\{\\usepackage\{graphicx\}\}/);
+  assert.match(tex, /\\bibliographystyle\{plainnat\}\n\\bibliography\{references\}\n\n\\end\{document\}\n$/);
+  assert.match(files.find((f) => f.path === 'README.txt').content, /ICLR 2025's own template, filled by NEO[\s\S]*example text[\s\S]*pdflatex iclr2025_conference, bibtex iclr2025_conference/);
+  // anonymous for review: the window says so, the template hides the names
+  const anon = X.latex({ ...m, anonymous: true }).find((f) => f.path === 'iclr2025_conference.tex').content;
+  assert.doesNotMatch(anon, /^\\iclrfinalcopy/m);
+  assert.doesNotMatch(anon, /Lovelace/);
+  // the body is NEO's own, under either preamble
+  const own = X.latex(model()).find((f) => f.path === 'paper.tex').content;
+  const body = (s) => s.slice(s.indexOf('\\section{Introduction}'), s.indexOf('\\bibliographystyle'));
+  assert.equal(body(tex), body(own));
+  // a template that isn't one: NEO's own preamble
+  assert.ok(X.latex({ ...model(), template: { info: NT.read([]), files: [] } }).some((f) => f.path === 'paper.tex'));
+});
+
+test('LaTeX in each venue\'s template compiles, anonymous and named', { skip: !tectonic && 'tectonic is not installed' }, () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+  for (const kind of ['neurips', 'icml', 'iclr', 'acl']) {
+    for (const anonymous of [true, false]) {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), `neo-${kind}-`));
+      try {
+        // the lot: symbols, lists, citations, an equation, a table, a figure and one of panels
+        const m = symbolModel();
+        m.blocks.push(...model().blocks.slice(1), { type: 'figure', id: 'fig-p4', num: '2', caption: [T('Both')], name: 'figure-d.png', mime: 'image/png',
+          panels: [{ name: 'figure-d.png', mime: 'image/png', sub: [T('Before')] }, { name: 'figure-e.png', mime: 'image/png', sub: [T('After')] }] });
+        for (const b of m.blocks) if (b.type === 'figure') for (const p of [b, ...(b.panels || [])]) p.base64 = png;
+        const files = X.latex({ ...withTemplate(m, kind), anonymous });
+        for (const f of files) {
+          fs.mkdirSync(path.dirname(path.join(dir, f.path)), { recursive: true });
+          fs.writeFileSync(path.join(dir, f.path), f.base64 ? Buffer.from(f.content, 'base64') : f.content);
+        }
+        const main = NT.layout(NT.read(templateFiles(kind)), templateFiles(kind)).main;
+        execFileSync('tectonic', ['-X', 'compile', main], { cwd: dir, stdio: 'ignore' });
+        assert.ok(fs.existsSync(path.join(dir, main.replace(/\.tex$/, '.pdf'))), `${kind}${anonymous ? ', anonymous,' : ''} compiles`);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }
+});

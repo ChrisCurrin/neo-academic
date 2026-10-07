@@ -781,6 +781,49 @@ test('editing, asked for: the pass and its fixes, first and last sentences, anon
   })()`);
 });
 
+test('the command palette: any menu command, what / inserts, and the sections, by a few letters', async () => {
+  const rows = () => js(`[...document.querySelectorAll('.palette-row')].map((r) => r.querySelector('.palette-where').textContent + ' › ' + r.querySelector('.palette-what').textContent)`);
+  await caretAtEnd();
+  await js(`openPalette()`);
+  await tick(300);
+  assert.equal(await js(`document.activeElement.closest('.palette') !== null`), true, 'the field takes the keys');
+  // read from the menus themselves: a paper's Edit → Editing Pass, by a few letters
+  await type('ex');
+  await snap('command-palette');
+  for (let i = 0; i < 2; i++) await key('Backspace');
+  await type('edit pass');
+  assert.match((await rows())[0], /Editing Pass$/);
+  await key('Enter');
+  await tick(500);
+  assert.equal(await js(`editingOn`), true, 'run as the menu runs it');
+  await js(`paperEditing(false)`);
+  // what / inserts that no menu has: a list, on the line the caret was on
+  await key('Enter');
+  await js(`openPalette()`);
+  await tick(300);
+  await type('bulleted');
+  await key('Enter');
+  await tick(300);
+  assert.equal(await js(`document.querySelector('.chapter-body').lastElementChild.className`), 'li');
+  await key('Backspace'); // a paragraph again
+  // and a section, by its name: the caret goes there
+  await js(`openPalette()`);
+  await tick(300);
+  await type('methods');
+  assert.ok((await rows()).some((r) => /Go to › 2 Methods/.test(r)), (await rows()).join(' | '));
+  await js(`(() => { const i = [...document.querySelectorAll('.palette-row')].findIndex((r) => /Methods/.test(r.textContent) && /Go to/.test(r.textContent)); for (let k = 0; k < i; k++) document.querySelector('.palette input').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); })()`);
+  await key('Enter');
+  await tick(300);
+  assert.equal(await js(`getSelection().anchorNode.parentElement.closest('p').textContent`), 'Methods');
+  // Esc: back where the writer was, nothing run
+  await js(`openPalette()`);
+  await tick(200);
+  await key('Escape');
+  assert.equal(await js(`!!document.querySelector('.palette')`), false);
+  assert.equal(await js(`document.activeElement.classList.contains('chapter-body')`), true);
+  await js(`(() => { const b = document.querySelector('.chapter-body'); if (!b.lastElementChild.textContent) b.lastElementChild.remove(); syncChapter(b, b.closest('.chapter').dataset.id); })()`);
+});
+
 test('the authors dialog and the pane of sections', async () => {
   await js(`paperEditAuthors()`);
   await tick(200);
@@ -1104,6 +1147,61 @@ test('every way out', async () => {
     assert.ok(fs.existsSync(path.join(dir, 'paper.pdf')), 'paper.tex compiles');
   }
   if (SHOTS) for (const f of files) fs.copyFileSync(path.join(OUT, f), path.join(SHOTS, f));
+});
+
+test('a venue’s LaTeX template: imported, filled by the LaTeX export, anonymous or named, removed', async () => {
+  const { execFileSync } = require('child_process');
+  const JSZip = require('jszip');
+  const fixture = path.join(__dirname, 'fixtures', 'templates', 'neurips');
+  // the writer picks its loose files; the trash is the test's own
+  dialog.showOpenDialog = async () => ({ canceled: false, filePaths: fs.readdirSync(fixture).map((f) => path.join(fixture, f)) });
+  require('electron').shell.trashItem = async (p) => fs.rmSync(p, { force: true });
+  await js(`paperImportTemplate()`);
+  await tick(400);
+  const meta = await js(`paperMeta()`);
+  assert.equal(meta.journal, 'template');
+  assert.equal(meta.template.kind, 'neurips');
+  assert.match(meta.template.name, /NeurIPS 2025/);
+  const { dir } = await saved();
+  assert.ok(fs.existsSync(path.join(dir, 'template.zip')), 'kept beside the paper');
+  // the LaTeX export fills it: the venue's preamble and files, the paper's words
+  const exportTex = async () => {
+    for (const f of fs.readdirSync(OUT)) if (/-latex\.zip$/.test(f)) fs.rmSync(path.join(OUT, f));
+    await js(`paperExport('latex')`);
+    for (let i = 0; i < 50 && !fs.readdirSync(OUT).some((f) => /-latex\.zip$/.test(f)); i++) await tick(200);
+    const zip = await JSZip.loadAsync(fs.readFileSync(path.join(OUT, fs.readdirSync(OUT).find((f) => /-latex\.zip$/.test(f)))));
+    return { zip, main: await zip.file('neurips_2025.tex').async('string') };
+  };
+  let { zip, main } = await exportTex();
+  assert.ok(zip.file('neurips_2025.sty') && zip.file('references.bib'), Object.keys(zip.files).join(', '));
+  assert.match(main, /\\title\{Inhibition in cortical circuits/);
+  assert.match(main, /\\bibliography\{references\}/);
+  assert.doesNotMatch(main, /Submission of papers to NeurIPS/, 'the venue’s example text left out');
+  assert.match(main, /\\usepackage\[preprint\]\{neurips_2025\}/, 'named: the preprint version');
+  if ((() => { try { execFileSync('which', ['tectonic'], { stdio: 'ignore' }); return true; } catch { return false; } })()) {
+    const out = path.join(tmp, 'tex-neurips');
+    for (const [name, f] of Object.entries(zip.files)) {
+      if (f.dir) continue;
+      fs.mkdirSync(path.dirname(path.join(out, name)), { recursive: true });
+      fs.writeFileSync(path.join(out, name), await f.async('nodebuffer'));
+    }
+    execFileSync('tectonic', ['-X', 'compile', 'neurips_2025.tex'], { cwd: out, stdio: 'ignore' });
+    assert.ok(fs.existsSync(path.join(out, 'neurips_2025.pdf')), 'the filled template compiles');
+  }
+  // anonymous for review: the template's own submission mode
+  await js(`paperAnonymous(true)`);
+  ({ main } = await exportTex());
+  assert.match(main, /\\usepackage\{neurips_2025\}/);
+  assert.doesNotMatch(main, /Ada Lovelace/);
+  await js(`paperAnonymous(false)`);
+  // removed: to the trash, and NEO's own LaTeX again, in the venue's look
+  await js(`paperRemoveTemplate()`);
+  await tick(300);
+  assert.equal(await js(`paperMeta().journal`), 'neurips');
+  assert.equal(await js(`!!paperMeta().template`), false);
+  assert.equal(fs.existsSync(path.join(dir, 'template.zip')), false);
+  await js(`paperMenu({ command: 'journal', value: 'preprint' })`);
+  await tick(300);
 });
 
 test('the paper reopens as it was left', async () => {

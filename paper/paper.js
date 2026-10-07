@@ -630,7 +630,12 @@ function paperEditAuthors() {
   });
 }
 // the journal the paper is set for
-const paperJournal = () => NeoJournals.get((book && book.paper && book.paper.journal) || NeoJournals.DEFAULT);
+// the journal the paper is set for: a built-in one, or (journal 'template')
+// the venue whose LaTeX template it was given
+const paperJournal = () => {
+  const m = (book && book.paper) || {};
+  return (m.journal === 'template' && NeoJournals.templateLook(m.template)) || NeoJournals.get(m.journal || NeoJournals.DEFAULT);
+};
 
 // ORCID's own check digit (ISO 7064 11,2)
 function validOrcid(id) {
@@ -1894,6 +1899,24 @@ async function runInsertCommand(id, body) {
     paperRenumber();
   } else paperSetHeading(id, body);
 }
+// The command palette's share of a paper (app.js, COMMAND PALETTE): what /
+// inserts that no menu has, and the sections, to go to
+function paperPaletteCommands() {
+  const inserts = INSERT_COMMANDS.filter((c) => ['ul', 'ol', 'symbol', 'symbols'].includes(c.id)).map((c) => ({
+    id: 'insert:' + c.id, label: t(c.label), path: [t('Insert')], accel: '',
+    run: async () => { const body = paperCaretBody(); if (body) await runInsertCommand(c.id, body); }
+  }));
+  const sections = paperHeadings().map((h) => ({
+    id: 'goto:' + h.dataset.id, label: [h.dataset.num, h.textContent.trim()].filter(Boolean).join(' '), path: [t('Go to')], goto: true,
+    run: () => {
+      switchTab('manuscript');
+      h.closest('.chapter-body').focus({ preventScroll: true });
+      caretInto(h, true);
+      h.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
+    }
+  }));
+  return [...inserts, ...sections];
+}
 function pickerOpenOnSlash(e, body) {
   const sel = window.getSelection();
   if (!sel.rangeCount || !sel.isCollapsed) return false;
@@ -2966,6 +2989,63 @@ async function editingMenu(e, hit) {
     editingLeft.add(flagKey(flag, was));
     paperEditingScan();
   } else if (choice === 'next') paperEditingNext(1);
+}
+
+/* ---- a venue's LaTeX template ---- */
+
+// Format → Journal → From a LaTeX Template…: the venue's zip (or its .tex
+// and .sty files), kept beside the paper as template.zip. What NEO reads of
+// it (its name, kind, columns, review switch, page limit) goes in book.json;
+// the paper is then set for it: the LaTeX export fills the template, and
+// the page and Preview take the venue's look.
+const TEMPLATE_META = ['name', 'kind', 'look', 'cls', 'clsOpts', 'pkg', 'columns', 'fontSize', 'paper', 'pages', 'from'];
+// why a template won't do, in the writer's language (NeoTemplate's reasons)
+const TEMPLATE_WHY = {
+  [NeoTemplate.NO_FILES]: tk('there are no files in it'),
+  [NeoTemplate.NO_MAIN]: tk('none of its files is a main .tex, with \\documentclass and \\begin{document}')
+};
+const templateWhy = (error) => t(TEMPLATE_WHY[error] || error);
+async function paperImportTemplate() {
+  if (!window.neo.paperTemplateImport) { toast(t('Templates are imported in NEO on a computer')); return; }
+  let got;
+  try { got = await window.neo.paperTemplateImport(book.id); } catch (err) { toast(t('Couldn’t read that template: {error}', { error: plainError(err) }), 8000); return; }
+  if (!got) return;
+  const info = NeoTemplate.read(got.files);
+  if (!info.ok) {
+    // not a template NEO can fill: its copy goes back out (to the trash)
+    await window.neo.paperTemplateRemove(book.id);
+    toast(t('That isn’t a LaTeX template NEO can fill: {why}', { why: templateWhy(info.error) }), 9000);
+    return;
+  }
+  const m = paperMeta();
+  m.template = { from: got.from };
+  for (const k of TEMPLATE_META) if (info[k] !== undefined && info[k] !== null && k !== 'from') m.template[k] = info[k];
+  await paperMenu({ type: 'paper', command: 'journal', value: 'template' });
+  // its example text (instructions, a checklist) isn't kept: said once, here
+  toast(t('{name}: the LaTeX export fills the venue’s template, and the page and Preview take its look.', { name: info.name })
+    + (info.pages ? ' ' + t('The template asks for {n} pages at most.', { n: info.pages }) : '')
+    + ' ' + t('Its example text isn’t kept: copy into the paper anything the venue requires, such as a checklist.'), 12000);
+}
+async function paperRemoveTemplate() {
+  const m = paperMeta();
+  if (!m.template) return;
+  const look = m.template.look;
+  delete m.template;
+  if (m.journal === 'template') { if (look) m.journal = look; else delete m.journal; }
+  await window.neo.paperTemplateRemove(book.id);
+  await saveMeta();
+  paperRenumber();
+  renderNav();
+  paperReportState();
+  toast(t('The template is in your trash; the LaTeX export writes NEO’s own again'), 7000);
+}
+// its files, read again at export: what's beside the paper now
+async function paperTemplateFiles() {
+  const got = window.neo.paperTemplate ? await window.neo.paperTemplate(book.id) : null;
+  if (!got || !got.files.length) throw new Error(t('the template beside this paper is gone: import it again, or choose a journal'));
+  const info = NeoTemplate.read(got.files);
+  if (!info.ok) throw new Error(templateWhy(info.error));
+  return { info, files: got.files };
 }
 
 /* ---- anonymous for review ---- */
@@ -4190,7 +4270,7 @@ function paperReportState() {
   window.neo.paperState({
     on, style: m.style || null, custom: m.customStyleTitle || '', heading,
     numbered: m.numbered !== false, double: !!m.double, linked: !!paper.linkedPath, journal: m.journal || NeoJournals.DEFAULT,
-    editing: on && editingOn, skim: on && skimOn, anonymous: !!m.anonymous
+    editing: on && editingOn, skim: on && skimOn, anonymous: !!m.anonymous, template: m.template ? m.template.name : ''
   });
 }
 document.addEventListener('selectionchange', () => {
@@ -4207,9 +4287,11 @@ async function paperMenu(msg) {
   const c = msg.command;
   if (c === 'cite') paperPickAtCaret('cite');
   else if (c === 'xref') paperPickAtCaret('xref');
+  else if (c === 'templateImport') { await paperImportTemplate(); return; }
+  else if (c === 'templateRemove') { await paperRemoveTemplate(); return; }
   else if (c === 'journal') {
     // a journal brings its citation style along; the writer can still pick another
-    const j = NeoJournals.get(msg.value);
+    const j = msg.value === 'template' && m.template ? NeoJournals.templateLook(m.template) : NeoJournals.get(msg.value);
     if (j.id === NeoJournals.DEFAULT) delete m.journal; else m.journal = j.id;
     if (j.csl && m.style !== j.csl) {
       m.style = j.csl;
@@ -4490,7 +4572,7 @@ async function paperModel({ png = false, journal = null, style = null } = {}) {
   const bib = (aside ? aside.bibliography : paper.bibliography) || { entries: [] };
   model.bibliography = { ...bib, entries: bib.entries.map((e) => ({ id: e.id, html: paperSafe(e.html, { links: true }) })) };
   // the journal sets the page (and, for LaTeX, the class)
-  model.journal = NeoJournals.get(journal || m.journal || NeoJournals.DEFAULT);
+  model.journal = journal ? NeoJournals.get(journal) : paperJournal();
   model.references = paper.refs.filter((r) => cited.has(r.id));
   model.bibtex = NeoReferences.toBibtex(model.references);
   // the abstract's sentences by the move each makes (the talk outline's narrative)
@@ -4516,6 +4598,8 @@ async function paperExport(format) {
       payload = { format: 'epub', defaultName: name, zipEntries: NeoPaperExport.epub(model, { uuid: 'urn:neo:' + book.id }) };
     } else if (format === 'latex' || format === 'pandoc') {
       const model = await paperModel({ png: true });
+      // a venue's template: the LaTeX fills it, with its own files beside
+      if (format === 'latex' && paperMeta().journal === 'template') model.template = await paperTemplateFiles();
       payload = { format: 'zip', defaultName: name + (format === 'latex' ? '-latex' : '-markdown'), zipEntries: format === 'latex' ? NeoPaperExport.latex(model) : NeoPaperExport.pandoc(model) };
     } else if (format === 'docx') {
       const model = await paperModel({ png: true });

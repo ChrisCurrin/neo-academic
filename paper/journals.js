@@ -128,6 +128,39 @@
       latex: { cls: 'article', opts: '10pt', textwidth: '5.5in' },
       limits: { abstract: 250, note: 'Abstract one paragraph; main text up to nine pages' }
     },
+    // the machine-learning venues: their looks only. Their LaTeX comes from
+    // the venue's own template, imported with the paper (paper/template.js);
+    // without one, an article set to the same page
+    {
+      id: 'icml', name: 'ICML', csl: 'apa', page: 'letter', margin: '1in 0.875in', columns: 2, gap: '0.25in',
+      font: SERIF, size: '10pt', leading: 1.2, justify: true,
+      title: { size: '14pt', align: 'center', font: SERIF, weight: 700, rules: true },
+      abstract: 'indented', headings: { numbering: 'arabic', font: SERIF, upper: false },
+      captions: { figure: 'Figure', table: 'Table', sep: '.', font: SERIF, size: '9pt' },
+      keywords: '', refs: '9pt',
+      latex: { cls: 'article', opts: '10pt,twocolumn', textwidth: '6.75in' },
+      limits: { abstract: 250, note: 'Abstract one paragraph; main text up to eight pages' }
+    },
+    {
+      id: 'iclr', name: 'ICLR', csl: 'apa', page: 'letter', margin: '1in 1.5in', columns: 1,
+      font: SERIF, size: '10pt', leading: 1.25, justify: true,
+      title: { size: '17pt', align: 'left', font: SERIF, weight: 700 },
+      abstract: 'indented', headings: { numbering: 'arabic', font: SERIF, upper: true },
+      captions: { figure: 'Figure', table: 'Table', sep: ':', font: SERIF, size: '9pt' },
+      keywords: '', refs: '9pt',
+      latex: { cls: 'article', opts: '10pt', textwidth: '5.5in' },
+      limits: { abstract: 250, note: 'Abstract one paragraph; main text up to ten pages' }
+    },
+    {
+      id: 'acl', name: 'ACL', csl: 'apa', page: 'A4', margin: '2.5cm', columns: 2, gap: '0.6cm',
+      font: SERIF, size: '11pt', leading: 1.2, justify: true,
+      title: { size: '15pt', align: 'center', font: SERIF, weight: 700 },
+      abstract: 'narrow', headings: { numbering: 'arabic', font: SERIF, upper: false },
+      captions: { figure: 'Figure', table: 'Table', sep: ':', font: SERIF, size: '10pt' },
+      keywords: '', refs: '10pt',
+      latex: { cls: 'article', opts: '11pt,twocolumn,a4paper' },
+      limits: { abstract: 200, note: 'Long papers up to eight pages, short papers four' }
+    },
     {
       id: 'lncs', name: 'Springer LNCS', csl: 'springer-lecture-notes-in-computer-science', page: '152mm 235mm', margin: '20mm 15mm 22mm', columns: 1,
       font: SERIF, size: '10pt', leading: 1.2, justify: true,
@@ -269,5 +302,20 @@ th, td { padding: .2em .6em; text-align: left; vertical-align: top; }
     return kind === 'eq' ? `${refWord(j, 'eq')} (${num})` : `${refWord(j, kind)} ${num}`;
   }
 
-  return { JOURNALS, DEFAULT, get, headingNumber, css, captions, tableNumber, refWord, refLabel };
+  // The look for a paper written to a venue's LaTeX template: the venue's
+  // own when NEO knows it, else the preprint's set to the template's
+  // columns, type size and paper. Its name is the template's.
+  function templateLook(info) {
+    if (!info) return null;
+    const known = info.look && JOURNALS.find((j) => j.id === info.look);
+    const two = info.columns === 2;
+    const base = known || {
+      ...JOURNALS[0], columns: two ? 2 : 1, gap: '0.25in', margin: two ? '0.75in' : '1in',
+      size: /^(9|10|11|12)pt$/.test(info.fontSize || '') ? info.fontSize : '10pt',
+      page: info.paper === 'a4' ? 'A4' : 'letter', limits: null
+    };
+    return { ...base, id: 'template', name: info.name || base.name, latex: { cls: info.cls || 'article', opts: info.clsOpts || '' } };
+  }
+
+  return { JOURNALS, DEFAULT, get, headingNumber, css, captions, tableNumber, refWord, refLabel, templateLook };
 });

@@ -4,7 +4,8 @@
 // paperModel in paper/paper.js) and returns what export:save writes:
 //
 //   latex(model)   → zip entries: paper.tex, references.bib, figures/, README
-//                    (pdflatex + bibtex, natbib: what Overleaf and journals take)
+//                    (pdflatex + bibtex, natbib: what Overleaf and journals take);
+//                    with a venue's template, its files and its main .tex filled
 //   pandoc(model)  → zip entries: paper.md (Pandoc Markdown, pandoc-crossref
 //                    labels), references.bib, the citation style, figures/
 //   html(model)    → one self-contained page (also what the PDF is printed from)
@@ -24,7 +25,9 @@
 //             | { type: 'item', list: 'ul' | 'ol', level: 1–3, runs }
 //             | { type: 'symbols', kind, rows: [{ id, tex, meaning, unit, value, kind, svg, png, mml, cite }] } ],
 //     symbols: [{ id, tex }],
-//     moves: [{ move: 'status' | 'problem' | 'solution' | 'did' | 'found' | 'impact', text }] }
+//     moves: [{ move: 'status' | 'problem' | 'solution' | 'did' | 'found' | 'impact', text }],
+//     template: { info: NeoTemplate.read's analysis, files: [{ path, text | base64 }] },
+//     anonymous }
 //   runs: [ { text, b, i, u, s, sup, sub } | { cite: [{ id, locator, label, prefix, suffix }], narrative, html }
 //         | { xref, kind, num, label } | { math, svg, png, mml } | { sym, math, svg, png, mml } ]
 // png is { base64, w, h } (pixels at 2x) where a picture had to be drawn for Word.
@@ -44,6 +47,7 @@
   const Journals = () => root.NeoJournals || (typeof require === 'function' ? require('./journals.js') : null);
   const Omml = () => root.NeoOmml || (typeof require === 'function' ? require('./omml.js') : null);
   const Symbols = () => root.NeoSymbols || (typeof require === 'function' ? require('./symbols.js') : null);
+  const Template = () => root.NeoTemplate || (typeof require === 'function' ? require('./template.js') : null);
   // CSS lengths (in, mm, pt) as Word's twentieths of a point
   const twips = (v) => {
     const m = /^([\d.]+)(in|mm|cm|pt)?$/.exec(String(v).trim());
@@ -190,92 +194,38 @@
   }
   const opt = (pre, post) => (pre ? `[${pre}][${post || ''}]` : post ? `[${post}]` : '');
 
-  function latex(m) {
-    const numeric = m.style && m.style.numeric;
-    const L = (m.journal && m.journal.latex) || { cls: 'article', opts: '11pt' };
-    const cls = L.cls;
+  // What the paper's content asks of LaTeX, the same under a journal's
+  // preamble or a venue's template: the packages its blocks need, the
+  // paper's own symbols as commands, and the body from the first section to
+  // the last list.
+  function texParts(m) {
     const used = (test) => m.blocks.some(test);
-    const panels = used((b) => b.type === 'figure' && b.panels && b.panels.length > 1);
-    const pinned = used((b) => (b.type === 'figure' || b.type === 'table') && b.place === 'H');
-    const wrapped = used((b) => b.type === 'figure' && b.wrap);
-    const symTable = used((b) => b.type === 'symbols' && b.rows.length);
+    const needs = {
+      panels: used((b) => b.type === 'figure' && b.panels && b.panels.length > 1),
+      pinned: used((b) => (b.type === 'figure' || b.type === 'table') && b.place === 'H'),
+      wrapped: used((b) => b.type === 'figure' && b.wrap),
+      symTable: used((b) => b.type === 'symbols' && b.rows.length),
+      figures: used((b) => b.type === 'figure'),
+      tables: used((b) => b.type === 'table')
+    };
     // the paper's own symbols, each a command (robust, so a name LaTeX
     // already has can't stop the compile), with any the text uses
     const defs = new Map();
     for (const s of m.symbols || []) if (macroName(s.id)) defs.set(s.id, s.tex);
     for (const b of m.blocks) if (b.type === 'symbols') for (const r of b.rows) if (macroName(r.id) && !defs.has(r.id)) defs.set(r.id, r.tex);
     for (const r of allRuns(m)) if (r.sym && macroName(r.sym) && !defs.has(r.sym)) defs.set(r.sym, r.math);
-    const article = cls === 'article';
-    const opts = [L.opts, cls === 'elsarticle' && !numeric ? 'authoryear' : ''].filter(Boolean).join(',');
-    // the classes that bring natbib (and acmart, hyperref) with them
-    const ownNatbib = ['acmart', 'elsarticle', 'revtex4-2'].includes(cls);
+    return {
+      needs,
+      defs: [...defs].map(([id, tex]) => `\\DeclareRobustCommand{\\${id}}{\\ensuremath{${String(tex || '').replace(/#/g, '##')}}}`),
+      abstract: m.abstract && m.abstract.length ? m.abstract.map((p) => texRuns(p, m.journal)).join('\n\n') : '',
+      keywords: (m.keywords || []).map(texEsc),
+      body: texBody(m)
+    };
+  }
+
+  // the sections, paragraphs, lists, equations, figures and tables, as lines
+  function texBody(m) {
     const lines = [];
-    lines.push(`% Written in NEO${m.journal ? ` for ${m.journal.name}` : ''}. Compile with pdflatex and bibtex (Overleaf does both).`,
-      '% The citations are natbib\'s (\\citep, \\citet), so a journal\'s .bst sets them in its style.',
-      `\\documentclass${opts ? `[${opts}]` : ''}{${cls}}`,
-      '\\usepackage[utf8]{inputenc}', '\\usepackage[T1]{fontenc}',
-      ...(article ? ['\\usepackage{lmodern}'] : []),
-      // acmart brings its own maths fonts and symbols
-      cls === 'acmart' ? '\\usepackage{amsmath}' : '\\usepackage{amsmath,amssymb}', '\\usepackage{graphicx}', '\\usepackage{booktabs}',
-      ...(article ? ['\\usepackage{authblk}', L.textwidth ? `\\usepackage[textwidth=${L.textwidth},top=1in,bottom=1in]{geometry}` : '\\usepackage[margin=1in]{geometry}',
-        '\\usepackage[skip=6pt]{caption}', '\\captionsetup[table]{position=top}'] : []),
-      ...(panels ? ['\\usepackage{subcaption}'] : []),
-      ...(pinned ? ['\\usepackage{float}'] : []),
-      ...(wrapped ? ['\\usepackage{wrapfig}'] : []),
-      ...(symTable ? ['\\usepackage{tabularx}'] : []),
-      ...(ownNatbib ? [] : [numeric || !article ? '\\usepackage[numbers,square,sort&compress]{natbib}' : '\\usepackage[round]{natbib}']),
-      ...(m.double && article ? ['\\usepackage{setspace}', '\\doublespacing'] : []),
-      ...(cls === 'acmart' ? ['\\settopmatter{printacmref=false}', '\\setcopyright{none}', '\\renewcommand\\footnotetextcopyrightpermission[1]{}'] : ['\\usepackage[hidelinks]{hyperref}']),
-      ...(defs.size ? ['', '% The paper\'s symbols', ...[...defs].map(([id, tex]) => `\\DeclareRobustCommand{\\${id}}{\\ensuremath{${String(tex || '').replace(/#/g, '##')}}}`)] : []),
-      '');
-    const title = `\\title{${texEsc(m.title || '')}${m.subtitle ? (article ? `\\\\[0.4em]\\large ${texEsc(m.subtitle)}` : `: ${texEsc(m.subtitle)}`) : ''}}`;
-    const abstract = m.abstract && m.abstract.length ? ['\\begin{abstract}', m.abstract.map(texRuns).join('\n\n'), '\\end{abstract}'] : [];
-    const kw = (m.keywords || []).map(texEsc);
-    const affil = (a) => (a.affiliations || []).map((n) => texEsc(m.affiliations[n]));
-    // each class takes its authors, affiliations and keywords its own way
-    if (cls === 'IEEEtran') {
-      lines.push(title, '\\author{' + m.authors.map((a) => `\\IEEEauthorblockN{${texEsc(a.name)}}\\IEEEauthorblockA{${[...affil(a).map((f) => `\\textit{${f}}`), a.email ? texEsc(a.email) : ''].filter(Boolean).join(' \\\\ ')}}`).join('\n\\and\n') + '}',
-        '', '\\begin{document}', '\\maketitle', ...abstract, ...(kw.length ? ['\\begin{IEEEkeywords}', kw.join(', '), '\\end{IEEEkeywords}'] : []), '');
-    } else if (cls === 'acmart') {
-      lines.push(title);
-      for (const a of m.authors) {
-        lines.push(`\\author{${texEsc(a.name)}}`);
-        for (const f of affil(a).length ? affil(a) : ['']) lines.push(`\\affiliation{\\institution{${f}}\\country{}}`);
-        if (a.email) lines.push(`\\email{${texEsc(a.email)}}`);
-        if (a.orcid) lines.push(`\\orcid{${a.orcid}}`);
-      }
-      lines.push('', '\\begin{document}', ...abstract, ...(kw.length ? [`\\keywords{${kw.join(', ')}}`] : []), '\\maketitle', '');
-    } else if (cls === 'llncs') {
-      lines.push(title, '\\author{' + m.authors.map((a) => `${texEsc(a.name)}${a.affiliations.length ? `\\inst{${a.affiliations.map((n) => n + 1).join(',')}}` : ''}${a.orcid ? `\\orcidID{${a.orcid}}` : ''}`).join(' \\and ') + '}',
-        '\\authorrunning{' + texEsc(m.authors.length > 2 ? m.authors[0].name + ' et al.' : m.authors.map((a) => a.name).join(' and ')) + '}',
-        '\\institute{' + (m.affiliations.map((f) => texEsc(f)).join(' \\and ') || ' ') + '}',
-        '', '\\begin{document}', '\\maketitle',
-        ...(abstract.length ? [abstract[0], abstract[1], ...(kw.length ? [`\\keywords{${kw.join(' \\and ')}}`] : []), abstract[2]] : []), '');
-    } else if (cls === 'elsarticle') {
-      lines.push('', '\\begin{document}', '\\begin{frontmatter}', title);
-      for (const a of m.authors) lines.push(`\\author[${a.affiliations.map((n) => 'a' + (n + 1)).join(',') || 'a0'}]{${texEsc(a.name)}}${a.email ? `\\ead{${texEsc(a.email)}}` : ''}`);
-      m.affiliations.forEach((f, i) => lines.push(`\\affiliation[a${i + 1}]{organization={${texEsc(f)}}}`));
-      lines.push(...abstract, ...(kw.length ? ['\\begin{keyword}', kw.join(' \\sep '), '\\end{keyword}'] : []), '\\end{frontmatter}', '');
-    } else if (cls === 'revtex4-2') {
-      lines.push('', '\\begin{document}', title);
-      for (const a of m.authors) {
-        lines.push(`\\author{${texEsc(a.name)}}`);
-        if (a.email) lines.push(`\\email{${texEsc(a.email)}}`);
-        for (const f of affil(a)) lines.push(`\\affiliation{${f}}`);
-      }
-      lines.push('', ...abstract, '\\maketitle', '');
-    } else {
-      lines.push(title);
-      m.authors.forEach((a) => {
-        const marks = (a.affiliations || []).map((n) => n + 1).join(',');
-        const extra = [a.corresponding && a.email ? `\\thanks{Correspondence: \\href{mailto:${a.email}}{${texEsc(a.email)}}}` : '',
-          a.orcid ? `\\thanks{ORCID: \\href{https://orcid.org/${a.orcid}}{${a.orcid}}}` : ''].join('');
-        lines.push(`\\author${marks ? `[${marks}]` : ''}{${texEsc(a.name)}${extra}}`);
-      });
-      m.affiliations.forEach((f, i) => lines.push(`\\affil[${i + 1}]{${texEsc(f)}}`));
-      lines.push('\\date{}', '', '\\begin{document}', '\\maketitle', '', ...abstract, '');
-      if (kw.length) lines.push(`\\noindent\\textbf{Keywords:} ${kw.join(', ')}`, '');
-    }
     const star = m.numbered === false ? '*' : '';
     const list = lister();
     const ENV = { ul: 'itemize', ol: 'enumerate' };
@@ -351,6 +301,89 @@
     const end = list(null);
     closeLists(end);
     if (end.close.length) lines.push('');
+    return lines;
+  }
+
+  function latex(m) {
+    // a venue's own template, imported with the paper: filled instead
+    if (m.template && m.template.info && m.template.info.ok && Template()) return latexTemplate(m);
+    const numeric = m.style && m.style.numeric;
+    const L = (m.journal && m.journal.latex) || { cls: 'article', opts: '11pt' };
+    const cls = L.cls;
+    const parts = texParts(m);
+    const { panels, pinned, wrapped, symTable } = parts.needs;
+    const article = cls === 'article';
+    const opts = [L.opts, cls === 'elsarticle' && !numeric ? 'authoryear' : ''].filter(Boolean).join(',');
+    // the classes that bring natbib (and acmart, hyperref) with them
+    const ownNatbib = ['acmart', 'elsarticle', 'revtex4-2'].includes(cls);
+    const lines = [];
+    lines.push(`% Written in NEO${m.journal ? ` for ${m.journal.name}` : ''}. Compile with pdflatex and bibtex (Overleaf does both).`,
+      '% The citations are natbib\'s (\\citep, \\citet), so a journal\'s .bst sets them in its style.',
+      `\\documentclass${opts ? `[${opts}]` : ''}{${cls}}`,
+      '\\usepackage[utf8]{inputenc}', '\\usepackage[T1]{fontenc}',
+      ...(article ? ['\\usepackage{lmodern}'] : []),
+      // acmart brings its own maths fonts and symbols
+      cls === 'acmart' ? '\\usepackage{amsmath}' : '\\usepackage{amsmath,amssymb}', '\\usepackage{graphicx}', '\\usepackage{booktabs}',
+      ...(article ? ['\\usepackage{authblk}', L.textwidth ? `\\usepackage[textwidth=${L.textwidth},top=1in,bottom=1in]{geometry}` : '\\usepackage[margin=1in]{geometry}',
+        '\\usepackage[skip=6pt]{caption}', '\\captionsetup[table]{position=top}'] : []),
+      ...(panels ? ['\\usepackage{subcaption}'] : []),
+      ...(pinned ? ['\\usepackage{float}'] : []),
+      ...(wrapped ? ['\\usepackage{wrapfig}'] : []),
+      ...(symTable ? ['\\usepackage{tabularx}'] : []),
+      ...(ownNatbib ? [] : [numeric || !article ? '\\usepackage[numbers,square,sort&compress]{natbib}' : '\\usepackage[round]{natbib}']),
+      ...(m.double && article ? ['\\usepackage{setspace}', '\\doublespacing'] : []),
+      ...(cls === 'acmart' ? ['\\settopmatter{printacmref=false}', '\\setcopyright{none}', '\\renewcommand\\footnotetextcopyrightpermission[1]{}'] : ['\\usepackage[hidelinks]{hyperref}']),
+      ...(parts.defs.length ? ['', '% The paper\'s symbols', ...parts.defs] : []),
+      '');
+    const title = `\\title{${texEsc(m.title || '')}${m.subtitle ? (article ? `\\\\[0.4em]\\large ${texEsc(m.subtitle)}` : `: ${texEsc(m.subtitle)}`) : ''}}`;
+    const abstract = parts.abstract ? ['\\begin{abstract}', parts.abstract, '\\end{abstract}'] : [];
+    const kw = parts.keywords;
+    const affil = (a) => (a.affiliations || []).map((n) => texEsc(m.affiliations[n]));
+    // each class takes its authors, affiliations and keywords its own way
+    if (cls === 'IEEEtran') {
+      lines.push(title, '\\author{' + m.authors.map((a) => `\\IEEEauthorblockN{${texEsc(a.name)}}\\IEEEauthorblockA{${[...affil(a).map((f) => `\\textit{${f}}`), a.email ? texEsc(a.email) : ''].filter(Boolean).join(' \\\\ ')}}`).join('\n\\and\n') + '}',
+        '', '\\begin{document}', '\\maketitle', ...abstract, ...(kw.length ? ['\\begin{IEEEkeywords}', kw.join(', '), '\\end{IEEEkeywords}'] : []), '');
+    } else if (cls === 'acmart') {
+      lines.push(title);
+      for (const a of m.authors) {
+        lines.push(`\\author{${texEsc(a.name)}}`);
+        for (const f of affil(a).length ? affil(a) : ['']) lines.push(`\\affiliation{\\institution{${f}}\\country{}}`);
+        if (a.email) lines.push(`\\email{${texEsc(a.email)}}`);
+        if (a.orcid) lines.push(`\\orcid{${a.orcid}}`);
+      }
+      lines.push('', '\\begin{document}', ...abstract, ...(kw.length ? [`\\keywords{${kw.join(', ')}}`] : []), '\\maketitle', '');
+    } else if (cls === 'llncs') {
+      lines.push(title, '\\author{' + m.authors.map((a) => `${texEsc(a.name)}${a.affiliations.length ? `\\inst{${a.affiliations.map((n) => n + 1).join(',')}}` : ''}${a.orcid ? `\\orcidID{${a.orcid}}` : ''}`).join(' \\and ') + '}',
+        '\\authorrunning{' + texEsc(m.authors.length > 2 ? m.authors[0].name + ' et al.' : m.authors.map((a) => a.name).join(' and ')) + '}',
+        '\\institute{' + (m.affiliations.map((f) => texEsc(f)).join(' \\and ') || ' ') + '}',
+        '', '\\begin{document}', '\\maketitle',
+        ...(abstract.length ? [abstract[0], abstract[1], ...(kw.length ? [`\\keywords{${kw.join(' \\and ')}}`] : []), abstract[2]] : []), '');
+    } else if (cls === 'elsarticle') {
+      lines.push('', '\\begin{document}', '\\begin{frontmatter}', title);
+      for (const a of m.authors) lines.push(`\\author[${a.affiliations.map((n) => 'a' + (n + 1)).join(',') || 'a0'}]{${texEsc(a.name)}}${a.email ? `\\ead{${texEsc(a.email)}}` : ''}`);
+      m.affiliations.forEach((f, i) => lines.push(`\\affiliation[a${i + 1}]{organization={${texEsc(f)}}}`));
+      lines.push(...abstract, ...(kw.length ? ['\\begin{keyword}', kw.join(' \\sep '), '\\end{keyword}'] : []), '\\end{frontmatter}', '');
+    } else if (cls === 'revtex4-2') {
+      lines.push('', '\\begin{document}', title);
+      for (const a of m.authors) {
+        lines.push(`\\author{${texEsc(a.name)}}`);
+        if (a.email) lines.push(`\\email{${texEsc(a.email)}}`);
+        for (const f of affil(a)) lines.push(`\\affiliation{${f}}`);
+      }
+      lines.push('', ...abstract, '\\maketitle', '');
+    } else {
+      lines.push(title);
+      m.authors.forEach((a) => {
+        const marks = (a.affiliations || []).map((n) => n + 1).join(',');
+        const extra = [a.corresponding && a.email ? `\\thanks{Correspondence: \\href{mailto:${a.email}}{${texEsc(a.email)}}}` : '',
+          a.orcid ? `\\thanks{ORCID: \\href{https://orcid.org/${a.orcid}}{${a.orcid}}}` : ''].join('');
+        lines.push(`\\author${marks ? `[${marks}]` : ''}{${texEsc(a.name)}${extra}}`);
+      });
+      m.affiliations.forEach((f, i) => lines.push(`\\affil[${i + 1}]{${texEsc(f)}}`));
+      lines.push('\\date{}', '', '\\begin{document}', '\\maketitle', '', ...abstract, '');
+      if (kw.length) lines.push(`\\noindent\\textbf{Keywords:} ${kw.join(', ')}`, '');
+    }
+    lines.push(...parts.body);
     const bst = L.bst !== undefined ? L.bst : numeric ? 'unsrtnat' : 'plainnat';
     const style = cls === 'elsarticle' ? (numeric ? 'elsarticle-num' : 'elsarticle-harv') : bst;
     lines.push(...(style ? [`\\bibliographystyle{${style}}`] : []), '\\bibliography{references}', '', '\\end{document}', '');
@@ -361,6 +394,33 @@
     ];
     entries.push(...pictureFiles(m));
     return entries;
+  }
+
+  // A venue's template filled with the paper: the template's files as they
+  // came, its main .tex filled (NeoTemplate.fill), then the references and
+  // the figures. None of the template's files takes the place of NEO's.
+  function latexTemplate(m) {
+    const { info, files } = m.template;
+    const parts = texParts(m);
+    const n = parts.needs;
+    const filled = Template().fill(info, files, {
+      title: texEsc(m.title || ''), subtitle: m.subtitle ? texEsc(m.subtitle) : '',
+      authors: m.authors.map((a) => ({ ...a, name: texEsc(a.name), email: a.email ? texEsc(a.email) : '' })),
+      affiliations: m.affiliations.map((f) => texEsc(f)),
+      abstract: parts.abstract, keywords: parts.keywords, preamble: parts.defs, body: parts.body.join('\n'),
+      needs: { graphicx: n.figures, booktabs: n.tables || n.symTable, subcaption: n.panels, float: n.pinned, wrapfig: n.wrapped, tabularx: n.symTable },
+      numeric: !!(m.style && m.style.numeric)
+    }, { anonymous: !!m.anonymous });
+    const { main, files: own } = Template().layout(info, files);
+    // compared in lowercase: Figures/ is figures/ on a Mac's disk
+    const ours = (p) => { const l = p.toLowerCase(); return l === main.toLowerCase() || l === 'references.bib' || l === 'readme.txt' || l.startsWith('figures/'); };
+    return [
+      ...own.filter((f) => !ours(f.path)).map((f) => (f.base64 ? { path: f.path, content: f.base64, base64: true } : { path: f.path, content: f.text })),
+      { path: main, content: filled },
+      { path: 'references.bib', content: m.bibtex || '' },
+      { path: 'README.txt', content: readme('template', m, { main, name: info.name || 'the venue' }) },
+      ...pictureFiles(m)
+    ];
   }
 
   // ---------------------------------------------------------------------
@@ -465,7 +525,29 @@
     return entries;
   }
 
-  function readme(kind, m) {
+  function readme(kind, m, tpl) {
+    if (kind === 'template') {
+      const job = tpl.main.replace(/^.*\//, '').replace(/\.tex$/i, '');
+      return `${m.title || 'Paper'} — LaTeX in ${tpl.name}'s template, filled by NEO
+
+${tpl.main.padEnd(19)}the paper, in the venue's template
+references.bib     the references it cites, keyed as in NEO
+figures/           the figures
+and the rest of the template's files, as they came.
+
+This is ${tpl.name}'s own template, filled by NEO: its preamble and style
+files are as they came, and the paper takes the place of its example text
+(the venue's instructions), which is left out. If the venue asks for
+something that was in that text, a checklist or a statement, copy it in
+from the template you imported.${m.anonymous ? `
+
+This is the anonymous version, for review: no names, no affiliations.` : ''}
+
+Upload the folder (or this zip) to Overleaf and it compiles as it is. On your
+own machine, with pdflatex and bibtex: pdflatex ${job}, bibtex ${job},
+pdflatex ${job}, pdflatex ${job}.
+`;
+    }
     if (kind === 'talk') {
       return `${m.title || 'Paper'} — a talk outline, written in NEO
 

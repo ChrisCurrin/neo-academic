@@ -12204,6 +12204,7 @@ function bookShortcutSections() {
     ] },
     { title: tk('App & files'), rows: [
       [KHELP, tk('Keyboard shortcuts')],
+      [K('⌘⇧P', 'Ctrl+Shift+P'), tk('Command palette: any command, chapter or section, by name')],
       [K('⌘,', 'Ctrl+,'), tk('Goals and writing sprints')],
       [K('⌘⇧I', 'Ctrl+Shift+I'), tk('Import manuscripts')],
       [K('⌘E', 'Ctrl+E'), tk('Email a draft to yourself')]
@@ -13752,6 +13753,7 @@ window.neo.onMenu(async (msg) => {
     return;
   }
   if (msg.type === 'help') showHelp();
+  if (msg.type === 'palette') openPalette();
   if (msg.type === 'about') showAbout();
   if (msg.type === 'checkUpdate') checkForUpdate();
   if (msg.type === 'update') updateMessage(msg);
@@ -14088,6 +14090,145 @@ $('#nav-list').addEventListener('keydown', (e) => {
   const i = rows.indexOf(e.target) + (e.key === 'ArrowDown' ? 1 : -1);
   if (rows[i]) rows[i].focus();
 });
+
+/* ================================================================== */
+/*  COMMAND PALETTE                                                    */
+/* ================================================================== */
+
+/* View → Command Palette… (⌘⇧P): every command the menus offer right now,
+   found by typing a few letters of it, with its menu and its shortcut, and
+   (in a paper) what / inserts; then, once something's typed, the chapters
+   or sections to go to. Its commands are read from the menu itself
+   (commands:list in main.js), so nothing here can drift from the menus;
+   labels arrive in the writer's language, the menu's or paperPaletteCommands'.
+   Invoked, never shown on its own; Esc goes back to where the writer was. */
+const paletteUsed = []; // ids, the most recent first: this session's habits
+let paletteEl = null;
+const accelText = (a) => (!a ? '' : a.split(/\+|-(?=\w)/).map((k) => ({
+  CmdOrCtrl: IS_MAC ? '⌘' : 'Ctrl', CommandOrControl: IS_MAC ? '⌘' : 'Ctrl', Cmd: '⌘', Command: '⌘', Ctrl: IS_MAC ? '⌃' : 'Ctrl', Control: IS_MAC ? '⌃' : 'Ctrl',
+  Alt: IS_MAC ? '⌥' : 'Alt', Option: '⌥', Shift: IS_MAC ? '⇧' : 'Shift', Plus: '+', Minus: '−', Up: '↑', Down: '↓', Left: '←', Right: '→', Enter: '↵', Return: '↵'
+}[k] || k)).join(IS_MAC ? '' : '+'));
+// how well a command answers what's typed: every word of it in the command
+// (its start or a word's start counting most, then anywhere, then its
+// letters in order), and the ones used lately first among equals
+function paletteScore(c, q) {
+  if (!q) return 1;
+  const label = c.label.toLowerCase();
+  const hay = (c.path.join(' ') + ' ' + c.label).toLowerCase();
+  let score = 0;
+  for (const w of q.toLowerCase().split(/\s+/).filter(Boolean)) {
+    if (label.startsWith(w)) score += 4;
+    else if (new RegExp('(^|[\\s(/-])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(label)) score += 3;
+    else if (label.includes(w)) score += 2;
+    else if (hay.includes(w)) score += 1;
+    else {
+      let at = 0;
+      for (const ch of w) { at = label.indexOf(ch, at) + 1; if (!at) return 0; }
+      score += 0.5;
+    }
+  }
+  return score;
+}
+async function openPalette() {
+  if (paletteEl) { paletteEl.querySelector('input').focus(); return; }
+  // where the writer was, to go back to (and run the command there)
+  const back = document.activeElement;
+  const sel = window.getSelection();
+  const range = sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+  const restore = () => {
+    if (back && back.isConnected && back.focus) back.focus({ preventScroll: true });
+    if (range && range.startContainer.isConnected) { sel.removeAllRanges(); sel.addRange(range); }
+  };
+  let menuCommands = [];
+  try { menuCommands = window.neo.commands ? await window.neo.commands() : []; } catch { /* the menu, unread */ }
+  const extras = book && isPaper() && typeof paperPaletteCommands === 'function' ? paperPaletteCommands() : [];
+  const commands = [...menuCommands.map((c) => ({ ...c, run: () => window.neo.runCommand(c.id) })), ...extras.filter((x) => !x.goto)];
+  const places = [...extras.filter((x) => x.goto), ...(book && !isPaper() ? (book.chapterOrder || []).map((chId) => ({
+    id: 'goto:' + chId, label: chapterName(chId), path: [t('Go to')], goto: true, run: () => { switchTab('manuscript'); focusChapter(chId); }
+  })) : [])];
+  const bd = document.createElement('div');
+  bd.className = 'palette-backdrop';
+  bd.innerHTML = '<div class="palette" role="dialog" aria-modal="true"><input type="text" spellcheck="false" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="palette-list"><div class="palette-list" id="palette-list" role="listbox"></div></div>';
+  const input = bd.querySelector('input');
+  const list = bd.querySelector('.palette-list');
+  input.placeholder = t('Type a command, or a chapter or section to go to');
+  input.setAttribute('aria-label', t('Command Palette'));
+  document.body.appendChild(bd);
+  paletteEl = bd;
+  let shown = [];
+  let idx = 0;
+  const draw = () => {
+    const q = input.value.trim();
+    const pool = q ? [...commands, ...places] : commands;
+    shown = pool.map((c) => ({ c, s: paletteScore(c, q) })).filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s || (paletteUsed.indexOf(a.c.id) + 1 || 1e9) - (paletteUsed.indexOf(b.c.id) + 1 || 1e9))
+      .slice(0, 60).map((x) => x.c);
+    // with nothing typed: what was used lately, then the menus in their order
+    if (!q) shown.sort((a, b) => (paletteUsed.indexOf(a.id) + 1 || 1e9) - (paletteUsed.indexOf(b.id) + 1 || 1e9));
+    idx = Math.min(idx, Math.max(0, shown.length - 1));
+    list.innerHTML = '';
+    shown.forEach((c, i) => {
+      const row = document.createElement('div');
+      row.className = 'palette-row' + (i === idx ? ' active' : '');
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-selected', String(i === idx));
+      row.id = 'palette-' + i;
+      const where = document.createElement('span');
+      where.className = 'palette-where';
+      where.textContent = c.path.join(' › ');
+      const what = document.createElement('span');
+      what.className = 'palette-what';
+      what.textContent = (c.checked === true ? '✓ ' : '') + c.label;
+      const keys = document.createElement('span');
+      keys.className = 'palette-keys';
+      keys.textContent = accelText(c.accel);
+      row.append(where, what, keys);
+      row.addEventListener('mousedown', (e) => e.preventDefault());
+      row.addEventListener('click', () => { idx = i; choose(); });
+      list.appendChild(row);
+    });
+    if (!shown.length) {
+      const none = document.createElement('div');
+      none.className = 'palette-none';
+      none.textContent = t('Nothing matches “{q}”', { q });
+      list.appendChild(none);
+    }
+    input.setAttribute('aria-activedescendant', shown.length ? 'palette-' + idx : '');
+    const active = list.children[idx];
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+  };
+  const close = () => {
+    if (!paletteEl) return;
+    bd.remove();
+    paletteEl = null;
+    restore();
+  };
+  const choose = async () => {
+    const c = shown[idx];
+    if (!c) return;
+    const at = paletteUsed.indexOf(c.id);
+    if (at >= 0) paletteUsed.splice(at, 1);
+    paletteUsed.unshift(c.id);
+    close();
+    try { await c.run(); } catch (err) { window.neo.logError('palette: ' + (err && err.stack || err)); }
+  };
+  input.addEventListener('input', () => { idx = 0; draw(); });
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+    else if (e.key === 'Enter') { e.preventDefault(); choose(); }
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || (e.ctrlKey && (e.key === 'n' || e.key === 'p'))) {
+      e.preventDefault();
+      if (!shown.length) return;
+      idx = (idx + (e.key === 'ArrowDown' || e.key === 'n' ? 1 : shown.length - 1)) % shown.length;
+      draw();
+    }
+  });
+  bd.addEventListener('mousedown', (e) => { if (e.target === bd) { e.preventDefault(); close(); } });
+  window.addEventListener('blur', close, { once: true });
+  draw();
+  input.focus();
+}
 
 /* ================================================================== */
 

@@ -59,6 +59,11 @@ contextBridge.exposeInMainWorld('neo', {
   flushState: (on) => ipcRenderer.send('flush:state', on),
   scriptState: (st) => ipcRenderer.send('script:state', st),
   paperState: (st) => ipcRenderer.send('paper:state', st),
+  commands: () => ipcRenderer.invoke('commands:list'),
+  runCommand: (id) => ipcRenderer.invoke('commands:run', id),
+  paperTemplateImport: (bookId) => ipcRenderer.invoke('paper:template-import', bookId),
+  paperTemplate: (bookId) => ipcRenderer.invoke('paper:template', bookId),
+  paperTemplateRemove: (bookId) => ipcRenderer.invoke('paper:template-remove', bookId),
   // sent (and waited for) as a script line is right-clicked, so the menu
   // that opens next can offer Page Break Here
   scriptContext: (st) => ipcRenderer.sendSync('script:context', st),
