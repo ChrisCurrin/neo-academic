@@ -1,10 +1,15 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('neo', {
+  platform: process.platform,
+  // macOS: the system dictionary panel for the selected word (#179)
+  lookUpText: () => ipcRenderer.invoke('app:lookUp'),
+
   readLibrary: () => ipcRenderer.invoke('library:read'),
   writeLibrary: (data) => ipcRenderer.invoke('library:write', data),
 
   createBook: (meta) => ipcRenderer.invoke('book:create', meta),
+  duplicateBook: (bookId, title) => ipcRenderer.invoke('book:duplicate', bookId, title),
   listBooks: () => ipcRenderer.invoke('library:listBooks'),
   readBookMeta: (bookId) => ipcRenderer.invoke('book:readMeta', bookId),
   writeBookMeta: (bookId, meta) => ipcRenderer.invoke('book:writeMeta', bookId, meta),
@@ -64,6 +69,7 @@ contextBridge.exposeInMainWorld('neo', {
   paperTemplateImport: (bookId) => ipcRenderer.invoke('paper:template-import', bookId),
   paperTemplate: (bookId) => ipcRenderer.invoke('paper:template', bookId),
   paperTemplateRemove: (bookId) => ipcRenderer.invoke('paper:template-remove', bookId),
+  printPaperback: (job) => ipcRenderer.invoke('print:paperback', job),
   // sent (and waited for) as a script line is right-clicked, so the menu
   // that opens next can offer Page Break Here
   scriptContext: (st) => ipcRenderer.sendSync('script:context', st),
